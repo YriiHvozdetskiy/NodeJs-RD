@@ -147,3 +147,9 @@ vite.config.ts.timestamp-*
 
 .claude
 .mcp.json
+
+# TLS certs & private keys — НІКОЛИ не комітимо.
+# Відтворюються скриптом лекції: npm run certs
+certs/
+*.pem
+*.key
