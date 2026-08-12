@@ -1,0 +1,15 @@
+{
+  "name": "hw-03-http-tls",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ДЗ #3 — raw HTTP на net + HTTPS на tls, без модулів http/https",
+  "type": "module",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "start:https": "node src/https-server.js",
+    "certs": "mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout certs/key.pem -out certs/cert.pem -subj \"/CN=localhost\" -addext \"subjectAltName=DNS:localhost\""
+  }
+}
