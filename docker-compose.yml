@@ -1,0 +1,44 @@
+# База. Те, що однакове і в dev, і в CI, і в проді.
+# Свідомо НЕ містить ані bind-mount на код, ані відкритих портів api —
+# усе це живе в docker-compose.override.yml, якого в CI просто немає.
+
+services:
+  api:
+    build:
+      context: .
+    image: hw05-api
+    environment:
+      # Хост «db» — це ІМʼЯ СЕРВІСУ нижче. DNS усередині мережі compose.
+      # Ніякого localhost: localhost у контейнері — це сам контейнер.
+      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-secret}@db:5432/${POSTGRES_DB:-app}
+    depends_on:
+      db:
+        # ОСЬ ГОЛОВНЕ. Без condition depends_on чекає лише СТАРТУ процесу
+        # Postgres, а не готовності приймати запити — і api падає на
+        # першому ж SELECT. HEALTHCHECK для самого api приїжджає з Dockerfile.
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+    volumes:
+      # Іменований том: без нього дані живуть у шарі контейнера
+      # і зникають разом із docker compose down.
+      - pgdata:/var/lib/postgresql/data
+      # Виконається РІВНО ОДИН РАЗ — при першій ініціалізації порожнього тому.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-app}']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+    # Портів немає навмисно: база доступна лише всередині мережі compose.
+    # Опублікувати 5432 назовні — типова діра в дев-оточенні.
+
+volumes:
+  pgdata:

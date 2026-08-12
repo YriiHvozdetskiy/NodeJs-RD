@@ -1,0 +1,29 @@
+# Dev-надбудова. Compose підхоплює цей файл САМ, без прапорців.
+# У CI його немає — там працює лише базовий docker-compose.yml.
+
+services:
+  api:
+    # Порт назовні відкриваємо тільки в dev.
+    ports:
+      - '${PORT:-3000}:3000'
+
+    environment:
+      NODE_ENV: development
+
+    # Hot-reload без жодної додаткової залежності: Node 24 сам зрізає типи
+    # з .ts, а --watch перезапускає процес на зміну файлу. Ні tsx, ні nodemon,
+    # ні навіть typescript у контейнері не потрібні — усе це лишилось у builder.
+    #
+    # Викликаємо node НАПРЯМУ, а не через `npm run dev`: npm став би PID 1
+    # і не передав би SIGTERM у свій дочірній node — та сама проблема, від якої
+    # у Dockerfile рятує exec-форма CMD, лише заїхала б через override.
+    command: ['node', '--watch', 'src/server.ts']
+
+    volumes:
+      # Монтуємо ТІЛЬКИ src: правки видно без перезбірки образу.
+      # Саме цього рядка не має бути в базовому файлі — його перевіряє
+      # `docker compose -f docker-compose.yml config | grep -c 'source: ./src'`.
+      #
+      # Монтувати весь ./ було б помилкою: хостовий node_modules зібраний
+      # під macOS/arm64 і затер би linux-збірки з образу.
+      - ./src:/app/src

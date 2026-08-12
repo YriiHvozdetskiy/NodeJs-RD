@@ -1,0 +1,26 @@
+{
+  "name": "hw-05-docker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Лекція 5 — Express + Postgres у контейнері: multi-stage, non-root, healthcheck",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "node --watch src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.0",
+    "@types/pg": "^8.21.0",
+    "typescript": "^5.9.0"
+  }
+}
