@@ -21,14 +21,31 @@ curl http://localhost:3000/         # діагностика: uid процесу
 | Команда | Що робить |
 |---|---|
 | `docker compose up -d` | підняти стек у dev-режимі (bind mount + hot-reload + порт 3000) |
-| `docker compose -f docker-compose.yml up -d` | режим CI: без bind-mount, без відкритих портів |
 | `docker compose logs -f api` | логи застосунку |
 | `docker compose down` | зупинити, **дані зберегти** |
 | `docker compose down -v` | зупинити і **знищити том** із даними |
 
-Порт можна перевизначити: `PORT=8080 docker compose up -d`.
-Креденшели бази — теж (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`), у compose стоять
-дефолти для локальної розробки.
+Порт можна перевизначити: `PORT=8080 docker compose up -d` — його читає і сервер,
+і `HEALTHCHECK`, тож контейнер лишається `healthy`.
+
+### Запуск без override (CI, прод)
+
+Базовий `docker-compose.yml` не містить жодного пароля, тому сам по собі він
+**навмисно не підніметься** — Postgres відмовиться ініціалізуватись із порожнім
+`POSTGRES_PASSWORD`. Креденшели треба передати явно:
+
+```bash
+cp .env.example .env          # і замінити пароль на справжній
+docker compose -f docker-compose.yml up -d
+```
+
+У CI те саме роблять секрети раннера — `.env` не потрібен. Перевірити, що база
+дійсно не стартує без пароля:
+
+```bash
+docker compose -f docker-compose.yml up -d
+# db-1 | Error: Database is uninitialized and superuser password is not specified.
+```
 
 ## Ендпойнти
 
@@ -45,12 +62,15 @@ curl http://localhost:3000/         # діагностика: uid процесу
 | `hw05-api` | `Dockerfile` — multi-stage, `node:24-slim`, `npm ci --omit=dev` | **252 MB** |
 | `hw05-naive` | `Dockerfile.naive` — одна стадія, повний `node:24`, `npm install` | **1.17 GB** |
 
+Заміряно на `linux/arm64` (Apple Silicon). На `linux/amd64` обидва числа помітно більші —
+близько 338 MB проти 1.68 GB, — але співвідношення тримається те саме, ~4.6×.
+
 Відтворити заміри:
 
 ```bash
-docker build -t hw05-api .
-docker build -f Dockerfile.naive -t hw05-naive .
-docker images hw05-api hw05-naive --format '{{.Repository}} {{.Size}}'
+docker build -t hw05-api:local .
+docker build -f Dockerfile.naive -t hw05-naive:local .
+docker images hw05-api:local hw05-naive:local --format '{{.Repository}} {{.Size}}'
 ```
 
 **Чому різниця в 4.6 разу:** одностадійний образ назавжди тягне в собі те, що потрібно було
@@ -61,13 +81,13 @@ docker images hw05-api hw05-naive --format '{{.Repository}} {{.Size}}'
 Перевірити, що у фінальний образ справді нічого зайвого не потрапило:
 
 ```bash
-docker run --rm hw05-api ls /app
+docker run --rm hw05-api:local ls /app
 # dist  node_modules  package-lock.json  package.json   ← жодного .ts, жодного tsconfig
 
-docker run --rm hw05-api ls node_modules | grep -E '^typescript$|^@types$'
-# порожньо
+docker run --rm hw05-api:local ls node_modules | grep -E '^typescript$|^@types$'
+# порожньо (у фіналі 77 пакетів проти повного дерева з dev-залежностями)
 
-docker run --rm hw05-api id -u
+docker run --rm hw05-api:local id -u
 # 1000 — процес працює не від root
 ```
 
@@ -108,8 +128,9 @@ docker compose exec -T db psql -U app -d app -c "select * from persistence_check
 | `Dockerfile` | multi-stage (`builder` → `runner`), non-root, `HEALTHCHECK` |
 | `Dockerfile.naive` | навмисно поганий, одностадійний — потрібен лише для порівняння розмірів |
 | `.dockerignore` | ріже `node_modules`, `.git`, `dist`, `*.md`, `.env` з контексту збірки |
-| `docker-compose.yml` | база: api + postgres, іменований том, `condition: service_healthy` |
-| `docker-compose.override.yml` | dev: bind mount на `./src`, hot-reload, порт назовні |
+| `docker-compose.yml` | база: api + postgres, іменований том, `condition: service_healthy`, **без креденшелів** |
+| `docker-compose.override.yml` | dev: bind mount на `./src`, hot-reload, порт назовні, локальні креденшели |
+| `.env.example` | перелік змінних для запуску без override (CI/прод) |
 | `db/init.sql` | схема `users` + сід, виконується при першій ініціалізації тому |
 | `src/server.ts` | Express 5: роути, лог у stdout, graceful shutdown |
 | `src/db.ts` | пул `pg`, конфіг із `DATABASE_URL` |
@@ -136,7 +157,21 @@ docker compose exec -T db psql -U app -d app -c "select * from persistence_check
 а не `npm run dev`. Фактичний час `docker compose down` — **0.66 с**.
 
 **Чому `HEALTHCHECK` б'є через `node -e`.** У `node:24-slim` немає ні `curl`, ні `wget`;
-єдиний гарантовано присутній інструмент — сам Node, і його вбудований `fetch`.
+єдиний гарантовано присутній інструмент — сам Node, і його вбудований `fetch`. Порт при
+цьому береться з `process.env.PORT`, а не константою: інакше `-e PORT=8080` лишив би
+контейнер `unhealthy` назавжди — перевірка стукала б у порт, якого ніхто не слухає.
+
+**Чому образ має тег.** `image: ${IMAGE:-hw05-api}:${TAG:-local}` — без тега docker
+підставляє `:latest`, і на спільному раннері, де вже лежить чужий `hw05-api:latest`,
+compose узяв би його замість щойно зібраного. Змінні дозволяють CI підставити свій
+реєстр і SHA коміту.
+
+**Чому в базовому файлі немає паролів.** `${POSTGRES_PASSWORD:-}` дає порожній рядок,
+а не робочий дефолт: на ньому Postgres свідомо відмовляється стартувати, тож CI падає
+голосно замість того, щоб тихо піднятись із паролем, який лежить у git. Dev-креденшели
+живуть в `docker-compose.override.yml`, якого в CI немає. Healthcheck бази при цьому
+читає `"$$POSTGRES_USER"` — подвійний `$` екранує змінну від compose, тож її підставляє
+shell усередині контейнера, і перевірка працює однаково, звідки б не прийшли значення.
 
 **Чому в `docker-compose.yml` немає портів і bind-mount.** Базовий файл має лишатися придатним
 для CI. Усе, що потрібно тільки розробнику, винесене в `docker-compose.override.yml`,

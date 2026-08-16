@@ -59,14 +59,20 @@ COPY --from=builder --chown=node:node /app/dist ./dist
 # Усе, що нижче цього рядка, і сам процес контейнера працюють від нього, не від root.
 USER node
 
+# Один порт за замовчуванням на весь образ: його читає і сервер (src/server.ts),
+# і HEALTHCHECK нижче. Задасте PORT ззовні — обидва поїдуть за ним разом.
+ENV PORT=3000
+
 # Суто документація: порт назовні відкриває compose, а не ця інструкція.
 EXPOSE 3000
 
 # curl і wget у slim-образі відсутні — б'ємо власним node, який тут точно є.
+# Порт беремо з оточення, а не константою: інакше запуск із -e PORT=8080 лишив би
+# контейнер unhealthy назавжди — перевірка стукала б у порт, якого ніхто не слухає.
 # start-period дає процесу піднятись, і невдачі в цьому вікні не рахуються
 # в retries; далі перевірка кожні 10 с, тож healthy настає значно раніше за 30 с.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  CMD node -e "const p = process.env.PORT || 3000; fetch('http://127.0.0.1:' + p + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 # Exec-форма (JSON-масив): node стає PID 1 і отримує SIGTERM напряму.
 # Shell-форма (CMD npm start) підсунула б туди /bin/sh, який сигнал не передає,

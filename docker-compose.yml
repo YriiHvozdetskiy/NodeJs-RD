@@ -6,11 +6,18 @@ services:
   api:
     build:
       context: .
-    image: hw05-api
+    # Ім'я З ТЕГОМ. Без тега docker підставляє :latest — і на спільному раннері,
+    # де вже лежить чужий hw05-api:latest, compose візьме його замість щойно
+    # зібраного. Змінні дають CI підставити свій реєстр і тег збірки.
+    image: ${IMAGE:-hw05-api}:${TAG:-local}
     environment:
       # Хост «db» — це ІМʼЯ СЕРВІСУ нижче. DNS усередині мережі compose.
       # Ніякого localhost: localhost у контейнері — це сам контейнер.
-      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-secret}@db:5432/${POSTGRES_DB:-app}
+      #
+      # Дефолту НЕМАЄ навмисно (`:-` дає порожній рядок, а не робочий пароль):
+      # цей файл їде в CI, і зашитий сюди пароль став би відомим паролем у проді.
+      # Значення приходить із секретів раннера, а в dev — з override-файлу.
+      DATABASE_URL: ${DATABASE_URL:-}
     depends_on:
       db:
         # ОСЬ ГОЛОВНЕ. Без condition depends_on чекає лише СТАРТУ процесу
@@ -22,9 +29,13 @@ services:
   db:
     image: postgres:17
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-app}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
-      POSTGRES_DB: ${POSTGRES_DB:-app}
+      # Так само без дефолтів. Порожній POSTGRES_PASSWORD — не недогляд:
+      # Postgres на ньому свідомо відмовляється ініціалізуватись
+      # («superuser password is not specified»), тож CI впаде голосно
+      # замість того, щоб тихо піднятись із паролем, відомим усім.
+      POSTGRES_USER: ${POSTGRES_USER:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-}
     volumes:
       # Іменований том: без нього дані живуть у шарі контейнера
       # і зникають разом із docker compose down.
@@ -32,7 +43,10 @@ services:
       # Виконається РІВНО ОДИН РАЗ — при першій ініціалізації порожнього тому.
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-app}']
+      # $$ екранує долар ВІД compose, тож змінну підставляє shell усередині
+      # контейнера — з оточення самого контейнера. Перевірка тому працює
+      # однаково, звідки б не прийшли креденшели: .env, секрети CI чи override.
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
       interval: 2s
       timeout: 3s
       retries: 15

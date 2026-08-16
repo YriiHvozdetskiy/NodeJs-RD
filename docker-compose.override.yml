@@ -9,6 +9,10 @@ services:
 
     environment:
       NODE_ENV: development
+      # Локальні креденшели живуть ТУТ, а не в базовому файлі — саме тому,
+      # що цього файлу в CI немає. Пароль нижче захищає базу, до якої ззовні
+      # немає доступу (порт 5432 не публікується), і живе рівно до `down -v`.
+      DATABASE_URL: postgres://app:devpassword@db:5432/app
 
     # Hot-reload без жодної додаткової залежності: Node 24 сам зрізає типи
     # з .ts, а --watch перезапускає процес на зміну файлу. Ні tsx, ні nodemon,
@@ -27,3 +31,12 @@ services:
       # Монтувати весь ./ було б помилкою: хостовий node_modules зібраний
       # під macOS/arm64 і затер би linux-збірки з образу.
       - ./src:/app/src
+
+  db:
+    # Ті самі dev-креденшели, що в DATABASE_URL вище. У базовому файлі
+    # відповідні змінні порожні, тож без цього override Postgres не стартує —
+    # і CI падає замість того, щоб піднятись із загальновідомим паролем.
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: app
