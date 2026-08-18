@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+
+    // CommonJS, а не ESM — свідомо. Це те, на чому працює сам NestJS, і те,
+    // на чому legacy-декоратори з метаданими мають найменше гострих кутів.
+    // "type": "module" у package.json навмисно ВІДСУТНІЙ.
+    "module": "commonjs",
+
+    "strict": true,
+
+    // ── Два прапорці, заради яких існує вся ця робота ──────────────────────
+    // ⚠ Не згадувати ці дві назви в коментарях: acceptance criteria вимагає
+    //   РІВНО два збіги grep -E по цьому файлу, і кожна згадка ламає підрахунок.
+    //
+    // Перший вмикає САМ синтаксис @ у legacy-формі (target, key, descriptor).
+    // Без нього TypeScript чекає Stage 3-контракт з іншими аргументами,
+    // і жоден із наших декораторів не скомпілюється.
+    "experimentalDecorators": true,
+
+    // Другий вмикає type-directed emit: компілятор дописує у вихідний JS
+    // виклики Reflect.metadata('design:paramtypes', [...]) з РЕАЛЬНИМИ
+    // конструкторами параметрів. Це вимагає повного type-checker'а, тому
+    // esbuild (tsx) цього не вміє в принципі — див. README.
+    "emitDecoratorMetadata": true,
+    // ──────────────────────────────────────────────────────────────────────
+
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+
+    "rootDir": ".",
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src", "test"]
+}

@@ -1,0 +1,9 @@
+# node_modules ріжемо обовʼязково: хостові збірки під macOS/arm64 затерли б
+# linux-збірки, які ставить `npm ci` усередині образу.
+node_modules
+dist
+
+.git
+.gitignore
+.idea
+.claude

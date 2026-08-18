@@ -1,0 +1,21 @@
+{
+  "name": "mini-nest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Лекція 6 — власний IoC-контейнер: декоратори, design:paramtypes, скоупи, детекція циклів",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^6.0.3"
+  }
+}
