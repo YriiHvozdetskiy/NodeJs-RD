@@ -37,11 +37,11 @@ docker compose run --rm api npm test
 |---|---|
 | `src/decorators/injectable.ts` | `@Injectable()` — наліпка «цей клас створює контейнер» + скоуп |
 | `src/decorators/inject.ts` | `@Inject(token)` — явний токен там, де типу недостатньо |
-| `src/container.ts` | контейнер: реєстрація, рекурсивний резолв, кеш, детекція циклів |
+| `src/container.ts` | контейнер: `register` (useValue), `registerClass` (useClass), рекурсивний резолв, кеш, детекція циклів |
 | `src/tokens.ts` | символи: ключі метаданих + прикладні токени |
 | `src/types.ts` | `Constructor`, `Token`, `Scope`, `ForwardRef` |
 | `src/forward-ref.ts` | `forwardRef()` — відкладене посилання на клас, оголошений нижче |
-| `test/container.test.ts` | тести на `node:test` (16 шт.) |
+| `test/container.test.ts` | тести на `node:test` (25 шт.) |
 
 ## Як це працює
 
@@ -92,6 +92,20 @@ docker compose run --rm api npm test
 Це не «дозвіл на циклічні залежності» — контейнер усе одно падає, але з
 `CircularDependencyError: Circular dependency detected: A -> B -> A`
 замість `RangeError` чи краху на завантаженні модуля.
+
+## Реєстрація провайдерів
+
+```ts
+container.register(CONFIG, { url: '...' });        // useValue — готове значення
+container.registerClass(USER_REPO, PgUserRepo);    // useClass — контейнер створить сам
+```
+
+`registerClass` потрібен там, де споживач залежить від інтерфейсу, а реалізацію
+обирають зовні: сервіс пише `@Inject(USER_REPO)` і не змінюється, а складання
+застосунку підставляє `PgUserRepo`, тест — фейк. Токен працює як аліас: скоуп
+і залежності беруться з `@Injectable()` на класі, тож `resolve(USER_REPO)` і
+`resolve(PgUserRepo)` віддають один і той самий синглтон. `useValue` має
+пріоритет над `useClass` для того самого токена.
 
 ## Обмеження
 

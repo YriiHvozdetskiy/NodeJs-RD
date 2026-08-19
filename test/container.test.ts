@@ -172,3 +172,109 @@ describe('Container', () => {
     });
   });
 });
+
+describe('правки після рев\'ю', () => {
+  describe('path не в публічній сигнатурі', () => {
+    test('resolve приймає рівно один аргумент — фальшивий цикл ізвні неможливий', () => {
+      // resolve(Foo, [Foo]) давав би «Foo -> Foo» на здоровому графі.
+      // Рекурсія переїхала в приватний resolveNode.
+      assert.equal(Container.prototype.resolve.length, 1);
+    });
+
+    test('той самий токен у двох незалежних гілках графа не приймається за цикл', () => {
+      @Injectable() class Shared {}
+      @Injectable() class Left { constructor(readonly s: Shared) {} }
+      @Injectable() class Right { constructor(readonly s: Shared) {} }
+      @Injectable() class Root { constructor(readonly l: Left, readonly r: Right) {} }
+
+      const root = new Container().resolve(Root);
+      assert.equal(root.l.s, root.r.s, 'ромб має зійтися в один синглтон');
+    });
+  });
+
+  describe('помилка називає шлях резолву', () => {
+    const MISSING = Symbol.for('MISSING_DEP');
+
+    @Injectable() class Deep { constructor(@Inject(MISSING) readonly missing: unknown) {} }
+    @Injectable() class Mid { constructor(readonly deep: Deep) {} }
+    @Injectable() class Top { constructor(readonly mid: Mid) {} }
+
+    test('незареєстрований токен на глибині 3 — видно всіх, хто його просив', () => {
+      assert.throws(
+        () => new Container().resolve(Top),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, /Top -> Mid -> Deep -> Symbol\(MISSING_DEP\)/);
+          return true;
+        },
+      );
+    });
+
+    test('клас без @Injectable() на глибині теж показує шлях', () => {
+      class Undecorated {}
+      @Injectable() class Holder { constructor(readonly u: Undecorated) {} }
+
+      assert.throws(() => new Container().resolve(Holder), /Шлях резолву: Holder -> Undecorated/);
+    });
+  });
+
+  describe('registerClass — useClass', () => {
+    interface Repo { find(): string }
+    const USER_REPO = Symbol.for('USER_REPO');
+
+    @Injectable() class PgUserRepo { find() { return 'pg'; } }
+    @Injectable() class FakeUserRepo { find() { return 'fake'; } }
+    @Injectable() class UserService { constructor(@Inject(USER_REPO) readonly repo: Repo) {} }
+
+    test('токен прив\'язується до класу, і контейнер створює його сам', () => {
+      const container = new Container();
+      container.registerClass<Repo>(USER_REPO, PgUserRepo);
+
+      const service = container.resolve(UserService);
+      assert.ok(service.repo instanceof PgUserRepo, 'має бути ЕКЗЕМПЛЯР, не сам клас');
+      assert.equal(service.repo.find(), 'pg');
+    });
+
+    test('той самий сервіс отримує фейк, якщо токен вказує на інший клас', () => {
+      const container = new Container();
+      container.registerClass<Repo>(USER_REPO, FakeUserRepo);
+
+      assert.equal(container.resolve(UserService).repo.find(), 'fake');
+    });
+
+    test('аліас і клас віддають той самий синглтон', () => {
+      const container = new Container();
+      container.registerClass<Repo>(USER_REPO, PgUserRepo);
+
+      assert.equal(container.resolve<Repo>(USER_REPO), container.resolve(PgUserRepo));
+    });
+
+    test('useValue має пріоритет над useClass для того самого токена', () => {
+      const container = new Container();
+      const stub: Repo = { find: () => 'stub' };
+      container.registerClass<Repo>(USER_REPO, PgUserRepo);
+      container.register<Repo>(USER_REPO, stub);
+
+      assert.equal(container.resolve<Repo>(USER_REPO), stub);
+    });
+
+    test('цикл через аліас ловиться, і токен видно в ланцюгу', () => {
+      const ALIAS_B = Symbol.for('ALIAS_B');
+
+      @Injectable() class AliasA { constructor(@Inject(ALIAS_B) readonly b: unknown) {} }
+      @Injectable() class AliasB { constructor(readonly a: AliasA) {} }
+
+      const container = new Container();
+      container.registerClass(ALIAS_B, AliasB);
+
+      assert.throws(
+        () => container.resolve(AliasA),
+        (error: unknown) => {
+          assert.ok(error instanceof CircularDependencyError);
+          assert.deepEqual(error.chain, ['AliasA', 'Symbol(ALIAS_B)', 'AliasB', 'AliasA']);
+          return true;
+        },
+      );
+    });
+  });
+});
