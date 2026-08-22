@@ -52,3 +52,52 @@ export type MaybeForwardRef<T = unknown> = Token<T> | ForwardRef<T>;
 export interface InjectableOptions {
   scope?: Scope;
 }
+
+// ── Частина 2: HTTP-шар ────────────────────────────────────────────────────
+
+/** Обмежуємось тим, що вимагає ДЗ. Розширюється додаванням декоратора в methods.ts. */
+export type HttpMethod = 'GET' | 'POST';
+
+/** Те, що @Get/@Post кладуть у метадані методу. Шлях тут ще БЕЗ префікса. */
+export interface RouteMetadata {
+  method: HttpMethod;
+  path: string;
+}
+
+/** Звідки диспетчер бере значення для аргументу. */
+export type ParamSource = 'body' | 'param' | 'query';
+
+/**
+ * Опис одного аргументу хендлера.
+ * `name` порожнє для @Body() — тіло віддається цілком.
+ */
+export interface ParamMetadata {
+  source: ParamSource;
+  name?: string;
+}
+
+/**
+ * Розріджена мапа: ключі є лише там, де стоїть декоратор.
+ * Аргумент без декоратора отримає `undefined` — це не помилка, а вибір хендлера.
+ */
+export type ParamMap = Record<number, ParamMetadata>;
+
+/**
+ * Один рядок таблиці маршрутів — те, що router збирає з метаданих
+ * і чим користується dispatcher. Тут шлях уже ПОВНИЙ, із префіксом.
+ */
+export interface Route {
+  method: HttpMethod;
+  /** Повний шаблон: `/users/:id`. Потрібен для помилок і дебагу. */
+  path: string;
+  /** Той самий шлях, розрізаний на сегменти — щоб не різати його на кожен запит. */
+  segments: string[];
+  /** Клас контролера. Екземпляр дістається з контейнера, а не створюється тут. */
+  controller: Constructor;
+  /** Імʼя методу на прототипі. */
+  handlerName: string;
+  /** Мапа аргументів цього хендлера. */
+  params: ParamMap;
+  /** Типи параметрів хендлера з design:paramtypes — потрібні пайпу для DTO. */
+  paramTypes: Constructor[];
+}

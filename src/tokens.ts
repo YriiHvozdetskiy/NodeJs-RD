@@ -33,3 +33,25 @@ export const DESIGN_PARAMTYPES = 'design:paramtypes';
  * Symbol.for('CONFIG') і резолвиться саме за токеном, а не за типом».
  */
 export const CONFIG = Symbol.for('CONFIG');
+
+// ── Ключі частини 2: HTTP-шар ──────────────────────────────────────────────
+
+/** Префікс шляху контролера. Ставить @Controller(prefix) — на КЛАСІ. */
+export const CONTROLLER_PREFIX = Symbol.for('mini-nest:controller-prefix');
+
+/**
+ * Маршрут одного хендлера: { method, path }. Ставлять @Get / @Post.
+ *
+ * Пишеться на пару (prototype, imʼя методу) — саме так у Reflect працює
+ * метадата методу. Тому шукати маршрути треба не на класі, а обходом
+ * `Object.getOwnPropertyNames(Ctor.prototype)`.
+ */
+export const ROUTE = Symbol.for('mini-nest:route');
+
+/**
+ * Мапа «індекс аргументу → звідки брати значення». Ставлять @Body/@Param/@Query.
+ *
+ * Та сама механіка, що в INJECT_TOKENS, з однією відмінністю: там мапа лежала
+ * на КЛАСІ (бо декорували параметри конструктора), тут — на МЕТОДІ.
+ */
+export const PARAMS = Symbol.for('mini-nest:params');
