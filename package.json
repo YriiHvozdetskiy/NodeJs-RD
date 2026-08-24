@@ -1,0 +1,20 @@
+{
+  "name": "marketplace-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні (варіант Б).",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "lint:spec": "redocly lint openapi/openapi.yaml",
+    "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
+    "check:scope": "npm run bundle:spec && node scripts/check-scope.js"
+  },
+  "dependencies": {
+    "express": "4.22.2",
+    "express-openapi-validator": "5.6.2"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.46.0"
+  }
+}

@@ -147,3 +147,5 @@ vite.config.ts.timestamp-*
 
 .claude
 .mcp.json
+# Згенерований bundle спеки (створює `redocly bundle` у перевірках ДЗ)
+spec.json

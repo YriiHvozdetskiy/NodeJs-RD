@@ -1,0 +1,464 @@
+openapi: 3.0.3
+
+info:
+  title: Marketplace API
+  version: 1.0.0
+  description: |
+    Курсовий проєкт (Node.js PRO). Каталог товарів і замовлення.
+
+    Домовленості, які діють на весь API:
+      * усі гроші — цілі копійки в полі `*_cents` (integer). Жодних рядків-decimal
+        і жодних float: `"2600.00"` неможливо додати без втрати точності;
+      * будь-яка помилка 4xx/5xx — `application/problem+json` за RFC 9457.
+        Клієнт розрізняє класи помилок по стабільному URI в полі `type`,
+        а не по тексту в `detail`;
+      * спискові операції — тільки cursor-пагінація (keyset). Offset не
+        підтримується свідомо: під вставками він дублює й губить елементи;
+      * версія API живе в `servers.url` (`/v1`), а не в шляхах. v1 і v2 у шляхах
+        поруч зʼявляться тільки тоді, коли обидві реально працюватимуть.
+
+# Авторизації в API поки свідомо немає — порожній масив закриває redocly-правило
+# security-defined і водночас документує це рішення явно.
+security: []
+
+servers:
+  - url: https://api.marketplace.example/v1
+    description: Production
+  - url: http://localhost:3000/v1
+    description: Локальний запуск (npm start)
+
+tags:
+  - name: products
+    description: Каталог товарів — тільки читання в v1
+  - name: orders
+    description: Замовлення покупця
+
+paths:
+  /products:
+    get:
+      operationId: listProducts
+      tags: [products]
+      summary: Список товарів каталогу
+      description: |
+        Сторінка товарів у порядку від найновішого. Пагінація — cursor (keyset).
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Сторінка товарів
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /products/{productId}:
+    get:
+      operationId: getProduct
+      tags: [products]
+      summary: Один товар за ідентифікатором
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Товар знайдено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /orders:
+    get:
+      operationId: listOrders
+      tags: [orders]
+      summary: Список замовлень
+      description: |
+        Сторінка замовлень у порядку від найновішого. Пагінація — cursor (keyset).
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Сторінка замовлень
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+    post:
+      operationId: createOrder
+      tags: [orders]
+      summary: Створити замовлення
+      description: |
+        Створює замовлення з позицій кошика. Операція НЕ ідемпотентна за природою
+        HTTP, тому безпечність повтору забезпечує заголовок `Idempotency-Key`.
+      parameters:
+        # Оголошено ІНЛАЙНОМ, а не через $ref, свідомо: `redocly bundle` не
+        # розкриває внутрішні $ref, а перевірка з acceptance criteria читає
+        # paths./orders.post.parameters[].in напряму — через $ref вона побачила б
+        # лише {"$ref": "..."} і дала б `required = undefined`.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 255
+          example: 7f3c1d2e-8a44-4b90-9c11-5e6d7a8b9c01
+          description: |
+            Ключ безпечного повтору POST. Генерує КЛІЄНТ — UUIDv4 на одну спробу
+            оформлення, а не на кожен HTTP-запит: усі retry цієї спроби мусять
+            піти з тим самим ключем, інакше сенсу немає.
+
+            Сервер зберігає під ключем відпечаток тіла запиту й готову відповідь
+            на 24 години. Поведінка повтору:
+
+            * той самий ключ + те саме тіло → той самий `201` із тим самим `id`
+              плюс заголовок `Idempotency-Replay: true`. Обробник повторно НЕ
+              виконується: другого замовлення й другого списання не буде;
+            * той самий ключ + інше тіло → `422`. Тіло при цьому може бути цілком
+              валідним — помилка не в ньому, а в реюзі ключа. Віддати попередню
+              відповідь було б брехнею: клієнт просив інше, ніж отримав би;
+            * ключ ще «в польоті» (перший запит із ним не завершився) → `409`.
+              Повторити пізніше з ТИМ САМИМ ключем; новий ключ створить друге
+              замовлення, тобто рівно те, від чого ключ і захищає.
+
+            Через 24 години ключ забувається — той самий ключ створить НОВЕ
+            замовлення. Некоректне тіло саме по собі (без реюзу ключа) — це `400`,
+            а не `422`: там відмовляє валідація, а не сховище ключів.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrder'
+      responses:
+        '201':
+          description: |
+            Замовлення створено. За повторного запиту з тим самим ключем і тим
+            самим тілом повертається ЦЕЙ САМИЙ ресурс із `Idempotency-Replay: true`.
+          headers:
+            Location:
+              description: Шлях до створеного замовлення
+              schema:
+                type: string
+                example: /v1/orders/3
+            Idempotency-Replay:
+              description: |
+                Присутній зі значенням `true`, якщо відповідь відтворена зі
+                сховища ключів, а обробник повторно не виконувався.
+              schema:
+                type: string
+                enum: ['true']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /orders/{orderId}:
+    get:
+      operationId: getOrder
+      tags: [orders]
+      summary: Одне замовлення за ідентифікатором
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Замовлення знайдено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+components:
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Скільки елементів віддати на сторінці.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Непрозорий (opaque) токен позиції, який видав сервер у `next_cursor`
+        попередньої сторінки. Клієнт НЕ розбирає, не конструює і не змінює його:
+        формат є деталлю реалізації сервера й може змінитись без версії API.
+        Відсутній параметр = перша сторінка.
+      schema:
+        type: string
+      example: eyJjIjoiMjAyNi0wOC0yMFQwOToxMjowMC4wMDBaIiwiaWQiOjI1fQ
+
+    ProductId:
+      name: productId
+      in: path
+      required: true
+      description: Ідентифікатор товару.
+      schema:
+        type: integer
+        minimum: 1
+
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      description: Ідентифікатор замовлення.
+      schema:
+        type: integer
+        minimum: 1
+
+  schemas:
+
+    Problem:
+      type: object
+      description: |
+        Єдина форма всіх помилок API — RFC 9457 (problem+json).
+        Клієнт матчить помилку по `type` (стабільний URI), людина читає `detail`.
+      required: [type, title, status, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Стабільний URI класу проблеми — саме по ньому матчить клієнт.
+          example: https://api.marketplace.example/problems/not-found
+        title:
+          type: string
+          description: Коротка назва класу проблеми, однакова для всіх випадків цього типу.
+          example: Ресурс не знайдено
+        status:
+          type: integer
+          description: HTTP-код відповіді, продубльований у тілі.
+          example: 404
+        detail:
+          type: string
+          description: Що саме пішло не так у цьому конкретному випадку.
+          example: замовлення 99 не знайдено
+        instance:
+          type: string
+          description: Посилання на конкретний випадок — URI запиту, що породив помилку.
+          example: /v1/orders/99
+        errors:
+          type: array
+          description: |
+            Розширення (RFC 9457 дозволяє): подробиці валідації тіла чи параметрів.
+          items:
+            type: object
+            required: [pointer, detail]
+            properties:
+              pointer:
+                type: string
+                description: |
+                  JSON Pointer на місце проблеми в запиті. Префікс показує, ЯКА
+                  частина запиту не пройшла: `/body/...`, `/query/...`, `/headers/...`.
+                example: /body/items
+              detail:
+                type: string
+                description: Що саме не так у цьому місці — текст від валідатора.
+                example: must NOT have fewer than 1 items
+
+    Product:
+      type: object
+      required: [id, title, price_cents, currency, created_at]
+      properties:
+        id:
+          type: integer
+          example: 25
+        title:
+          type: string
+          example: Клавіатура Keychron K2
+        price_cents:
+          type: integer
+          description: Ціна в копійках. Ціле число, не рядок і не float.
+          example: 260000
+        currency:
+          type: string
+          enum: [UAH]
+          example: UAH
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-20T09:12:00.000Z'
+
+    ProductPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Токен наступної сторінки. `null` означає, що сторінок більше немає.
+          example: eyJjIjoiMjAyNi0wOC0yMFQwOToxMjowMC4wMDBaIiwiaWQiOjI1fQ
+
+    OrderItem:
+      type: object
+      required: [product_id, qty]
+      properties:
+        product_id:
+          type: integer
+          minimum: 1
+          example: 25
+        qty:
+          type: integer
+          minimum: 1
+          maximum: 999
+          example: 2
+
+    OrderLine:
+      allOf:
+        - $ref: '#/components/schemas/OrderItem'
+        - type: object
+          required: [unit_price_cents]
+          properties:
+            unit_price_cents:
+              type: integer
+              description: |
+                Ціна товару в копійках на МОМЕНТ створення замовлення. Копіюється
+                в замовлення, а не читається з каталогу: інакше зміна ціни
+                перепише історію вже оплачених замовлень.
+              example: 260000
+
+    Order:
+      type: object
+      required: [id, items, total_cents, currency, status, created_at]
+      properties:
+        id:
+          type: integer
+          example: 3
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderLine'
+        total_cents:
+          type: integer
+          description: Сума замовлення в копійках. Порахована сервером, не приймається від клієнта.
+          example: 520000
+        currency:
+          type: string
+          enum: [UAH]
+          example: UAH
+        status:
+          type: string
+          enum: [pending, paid, cancelled]
+          description: v1 створює замовлення тільки в статусі `pending`.
+          example: pending
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-20T09:12:00.000Z'
+
+    OrderPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Токен наступної сторінки. `null` означає, що сторінок більше немає.
+          example: eyJjIjoiMjAyNi0wOC0yMFQwOToxMjowMC4wMDBaIiwiaWQiOjN9
+
+    CreateOrder:
+      type: object
+      description: |
+        Тіло створення замовлення. Ні суми, ні цін клієнт не надсилає — інакше
+        він міг би призначити собі власну ціну.
+      required: [items]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Позиції кошика. Порожній масив — помилка валідації.
+          items:
+            $ref: '#/components/schemas/OrderItem'
+
+  responses:
+    BadRequest:
+      description: Запит не відповідає контракту — параметри, заголовки або тіло.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    NotFound:
+      description: Ресурс із таким ідентифікатором не існує.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Conflict:
+      description: |
+        Запит із цим `Idempotency-Key` ще опрацьовується. Клієнту слід повторити
+        пізніше — це не помилка в його даних.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    UnprocessableEntity:
+      description: |
+        Тіло синтаксично валідне, але опрацювати його не можна. Два випадки:
+        `Idempotency-Key` уже використано з ІНШИМ тілом (віддати попередню
+        відповідь було б брехнею), або в позиціях є `product_id`, якого немає
+        в каталозі. Клієнт розрізняє їх по полю `type`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Unexpected:
+      description: |
+        Будь-яка інша помилка — у тій самій формі problem+json. Оголошено як
+        `default` свідомо: інакше `validateResponses: true` відкидав би власну
+        500-у відповідь сервера як незадекларовану й ховав першопричину.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
