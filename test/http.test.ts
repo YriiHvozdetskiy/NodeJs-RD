@@ -9,7 +9,7 @@ import { Controller } from '../src/decorators/controller';
 import { Injectable } from '../src/decorators/injectable';
 import { Get, Post } from '../src/decorators/methods';
 import { Body, Param, Query } from '../src/decorators/params';
-import { createApp } from '../src/dispatcher';
+import { compose, type ExecutionContext, type Stage, createApp } from '../src/dispatcher';
 import { CreateUserDto } from '../src/dto/create-user.dto';
 import { collectRoutes, matchSegments, toSegments } from '../src/router';
 
@@ -50,6 +50,16 @@ class ProbeController {
   @Get('nested/:group/:id')
   nested(@Param('group') group: string, @Param('id') id: string): { group: string; id: string } {
     return { group, id };
+  }
+
+  @Get('typed/:id')
+  typed(
+    // `: number` обовʼязковий — emitDecoratorMetadata читає анотацію, не виведений тип
+    @Param('id') id: number,
+    @Query('limit') limit: number = 7,
+    @Query('debug') debug: boolean = false,
+  ): { id: number; idType: string; limit: number; debug: boolean } {
+    return { id, idType: typeof id, limit, debug };
   }
 
   @Post()
@@ -156,6 +166,7 @@ describe('collectRoutes', () => {
       'GET /probe/:id',
       'GET /probe/hit',
       'GET /probe/nested/:group/:id',
+      'GET /probe/typed/:id',
       'POST /probe',
       'POST /probe/raw',
     ]);
@@ -359,5 +370,145 @@ describe('серіалізація відповіді', () => {
   it('віддає JSON із charset', async () => {
     const response = await fetch(`${base}/probe/1`);
     assert.match(response.headers.get('content-type') ?? '', /application\/json/);
+  });
+});
+
+// ── Правки після рев'ю ─────────────────────────────────────────────────────
+
+describe('битий percent-encoding (не 500, а 400)', () => {
+  it('/%zz дає 400 з поясненням, а не 500', async () => {
+    // decodeURIComponent кидає URIError на будь-якому битому кодуванні.
+    // Без try/catch у matchSegments чуже сміття виглядало б як наша поломка.
+    const { status, body } = await call('/probe/%zz');
+    assert.equal(status, 400);
+    assert.match(body.message, /percent-кодування/);
+  });
+
+  it('обірвана послідовність теж 400', async () => {
+    const { status } = await call('/probe/%E0%A4%A');
+    assert.equal(status, 400);
+  });
+
+  it('коректне кодування далі працює', async () => {
+    const { status, body } = await call(`/probe/${encodeURIComponent('джон доу')}`);
+    assert.equal(status, 200);
+    assert.deepEqual(body, { id: 'джон доу' });
+  });
+});
+
+describe('пайп приведення для @Param і @Query', () => {
+  it('@Param(): number приходить числом, а не рядком', async () => {
+    const { body } = await call('/probe/typed/42');
+    assert.equal(body.id, 42);
+    assert.equal(body.idType, 'number');
+  });
+
+  it('@Query(): number приходить числом', async () => {
+    const { body } = await call('/probe/typed/1?limit=5');
+    assert.equal(body.limit, 5);
+  });
+
+  it('нечислове значення дає 400 на межі, а не NaN у хендлері', async () => {
+    const { status, body } = await call('/probe/typed/1?limit=abc');
+    assert.equal(status, 400);
+    assert.match(body.message, /limit/);
+  });
+
+  it('Number(), а не parseInt: "12abc" не стає 12', async () => {
+    // parseInt мовчки зʼїв би хвіст, і опечатка перетворилась би на валідне число.
+    const { status } = await call('/probe/typed/1?limit=12abc');
+    assert.equal(status, 400);
+  });
+
+  it('відсутній query лишає дефолт із сигнатури', async () => {
+    const { body } = await call('/probe/typed/1');
+    assert.equal(body.limit, 7);
+  });
+
+  it('@Query(): boolean розуміє порожній прапорець', async () => {
+    // '?debug' без значення прийде як '' — і це «увімкнено», а не хиба.
+    const { body } = await call('/probe/typed/1?debug');
+    assert.equal(body.debug, true);
+  });
+
+  it('@Query(): boolean розуміє false і 0', async () => {
+    assert.equal((await call('/probe/typed/1?debug=false')).body.debug, false);
+    assert.equal((await call('/probe/typed/1?debug=0')).body.debug, false);
+  });
+});
+
+describe('compose — ланцюг стадій', () => {
+  const emptyCtx = (): ExecutionContext => ({}) as ExecutionContext;
+
+  it('виконує стадії по черзі й повертається назад', async () => {
+    const log: string[] = [];
+    const stage = (name: string): Stage => async (_ctx, next) => {
+      log.push(`${name}:before`);
+      await next();
+      log.push(`${name}:after`);
+    };
+
+    await compose([stage('a'), stage('b')])(emptyCtx());
+
+    // Саме цей «сендвіч» і робить interceptor'и з Лекції 8 можливими:
+    // стадія бачить момент до виклику хендлера і момент після.
+    assert.deepEqual(log, ['a:before', 'b:before', 'b:after', 'a:after']);
+  });
+
+  it('стадія, що не кличе next, обриває ланцюг', async () => {
+    // Так працюватиме guard: не пустив — хвіст не виконується.
+    const log: string[] = [];
+    const guard: Stage = async () => {
+      log.push('guard');
+    };
+    const never: Stage = async () => {
+      log.push('never');
+    };
+
+    await compose([guard, never])(emptyCtx());
+    assert.deepEqual(log, ['guard']);
+  });
+
+  it('подвійний next() кидає помилку, а не виконує хвіст двічі', async () => {
+    let calls = 0;
+    const broken: Stage = async (_ctx, next) => {
+      await next();
+      await next();
+    };
+    const counter: Stage = async () => {
+      calls += 1;
+    };
+
+    await assert.rejects(compose([broken, counter])(emptyCtx()), /next\(\) викликано двічі/);
+    assert.equal(calls, 1, 'хендлер не має відпрацювати двічі на один запит');
+  });
+
+  it('порожній ланцюг просто завершується', async () => {
+    await compose([])(emptyCtx());
+  });
+});
+
+describe('emitDecoratorMetadata читає анотацію, а не виведений тип', () => {
+  it('параметр без `: type` дає Object і пайп його не приводить', () => {
+    class Probe {
+      @Get('a')
+      // eslint-disable-next-line @typescript-eslint/no-inferrable-types
+      withDefault(@Query('n') n = 10): number {
+        return n;
+      }
+
+      @Get('b')
+      annotated(@Query('n') n: number = 10): number {
+        return n;
+      }
+    }
+
+    const withDefault = Reflect.getMetadata('design:paramtypes', Probe.prototype, 'withDefault');
+    const annotated = Reflect.getMetadata('design:paramtypes', Probe.prototype, 'annotated');
+
+    // Обидва — number для type-checker'а, але в метадані їде різне.
+    // Це та сама пастка, що вже коштувала нам одного «чому limit рядок».
+    assert.deepEqual(withDefault, [Object]);
+    assert.deepEqual(annotated, [Number]);
   });
 });

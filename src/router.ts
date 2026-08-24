@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 
+import { BadRequestError } from './errors';
 import { CONTROLLER_PREFIX, DESIGN_PARAMTYPES, PARAMS, ROUTE } from './tokens';
 import type { Constructor, ParamMap, Route, RouteMetadata } from './types';
 
@@ -133,7 +134,17 @@ export function matchSegments(pattern: string[], actual: string[]): Record<strin
       // пробіл в імені, а не роздільник. Розкодувати ДО розрізання на сегменти
       // не можна — закодований '%2F' перетворився б на зайвий '/' і зʼїхала б
       // уся структура шляху.
-      params[expected.slice(1)] = decodeURIComponent(actual[i]);
+      //
+      // try обовʼязковий: decodeURIComponent кидає URIError на будь-якому
+      // битому percent-encoding ('%zz', обірваний '%E0%A4'). Без нього
+      // `curl /users/%zz` клав би запит у 500 зі стектрейсом у логах —
+      // тобто чуже сміття виглядало б як наша поломка. Це помилка КЛІЄНТА,
+      // тож 400, і жодного стектрейсу.
+      try {
+        params[expected.slice(1)] = decodeURIComponent(actual[i]);
+      } catch {
+        throw new BadRequestError(`Сегмент шляху '${actual[i]}' містить некоректне percent-кодування`);
+      }
       continue;
     }
 

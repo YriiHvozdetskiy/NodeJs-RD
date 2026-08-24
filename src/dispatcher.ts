@@ -3,7 +3,9 @@ import 'reflect-metadata';
 import * as http from 'node:http';
 
 import type { Container } from './container';
-import { ValidationFailedError, validateBody } from './pipes/validation.pipe';
+import { BadRequestError, HttpError, NotFoundError } from './errors';
+import { parseScalar } from './pipes/parse.pipe';
+import { validateBody } from './pipes/validation.pipe';
 import { collectRoutes, matchRoute } from './router';
 import type { Constructor, Route } from './types';
 
@@ -22,12 +24,63 @@ function isDtoClass(type: unknown): type is Constructor<object> {
   return typeof type === 'function' && !NON_DTO_TYPES.includes(type);
 }
 
-/** Тіло прийшло невалідним JSON — це помилка клієнта, не сервера. */
-export class BadRequestError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'BadRequestError';
-  }
+/**
+ * Усе, що стадії знають про поточний запит, і все, що вони одна одній передають.
+ *
+ * Мутабельний навмисно: кожна стадія дописує своє поле (`body` → `args` →
+ * `result`), наступна його бачить. Це той самий контракт, що в `ExecutionContext`
+ * у Nest — саме через нього на Лекції 8 guard'и й interceptor'и отримають
+ * доступ до запиту, не чіпаючи сигнатуру хендлера.
+ */
+export interface ExecutionContext {
+  readonly req: http.IncomingMessage;
+  readonly res: http.ServerResponse;
+  readonly route: Route;
+  readonly params: Record<string, string>;
+  readonly query: URLSearchParams;
+  body: unknown;
+  args: unknown[];
+  result: unknown;
+}
+
+/**
+ * Одна стадія обробки запиту.
+ *
+ * Сигнатура `(ctx, next)` — не випадкова: це рівно контракт Redux middleware
+ * і koa. Він дає те, чого не дає плоский список кроків: стадія бачить момент
+ * ДО `next()` і момент ПІСЛЯ. Без цього interceptor з Лекції 8 (який має
+ * заміряти час навколо хендлера або підмінити відповідь) написати неможливо —
+ * довелось би різати його на дві окремі стадії й самому стежити за порядком.
+ */
+export type Stage = (ctx: ExecutionContext, next: () => Promise<void>) => Promise<void>;
+
+/**
+ * Склеює стадії в один ланцюг.
+ *
+ * `index` стереже подвійний виклик `next()`: без цієї перевірки стадія, що
+ * випадково викликала `next()` двічі, тихо виконала б увесь хвіст ланцюга
+ * повторно — хендлер відпрацював би два рази на один запит.
+ */
+export function compose(stages: Stage[]): (ctx: ExecutionContext) => Promise<void> {
+  return (ctx) => {
+    let index = -1;
+
+    const dispatch = async (i: number): Promise<void> => {
+      if (i <= index) {
+        throw new Error('next() викликано двічі в одній стадії');
+      }
+      index = i;
+
+      const stage = stages[i];
+      if (stage === undefined) {
+        return;
+      }
+
+      await stage(ctx, () => dispatch(i + 1));
+    };
+
+    return dispatch(0);
+  };
 }
 
 /**
@@ -77,12 +130,18 @@ function readBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
-/** Усе, що диспетчер знає про поточний запит, коли будує аргументи. */
-interface RequestContext {
-  params: Record<string, string>;
-  query: URLSearchParams;
-  body: unknown;
-}
+// ── Стадії ─────────────────────────────────────────────────────────────────
+
+/**
+ * Тіло читаємо лише там, де воно буває. На GET його немає, а зайва
+ * підписка на 'data' просто ніколи б не спрацювала.
+ */
+const bodyStage: Stage = async (ctx, next) => {
+  if (ctx.req.method === 'POST') {
+    ctx.body = await readBody(ctx.req);
+  }
+  await next();
+};
 
 /**
  * Будує масив аргументів хендлера за мапою параметр-декораторів.
@@ -91,11 +150,16 @@ interface RequestContext {
  * із її ключів, аргумент без декоратора просто зникне, а всі наступні зʼїдуть
  * на позицію вліво. Кількість аргументів задає `design:paramtypes`.
  *
- * Функція асинхронна — і це головна відмінність від `resolve` з частини 1.
+ * Стадія асинхронна — і це головна відмінність від `resolve` з частини 1.
  * Там граф збирався синхронно, бо всі залежності вже були в памʼяті. Тут
  * посередині стоїть валідація DTO, а вона повертає проміс.
+ *
+ * Пайп викликається для КОЖНОГО джерела, не лише для тіла: `@Query('limit')
+ * limit: number` має прийти числом, інакше приведення тікає в хендлер, а
+ * помилка «limit=abc» вилазить десь глибше замість межі запиту.
  */
-async function buildArgs(route: Route, ctx: RequestContext): Promise<unknown[]> {
+const argsStage: Stage = async (ctx, next) => {
+  const { route } = ctx;
   const indexes = Object.keys(route.params).map(Number);
   const arity = Math.max(route.paramTypes.length, ...indexes.map((i) => i + 1), 0);
 
@@ -109,29 +173,63 @@ async function buildArgs(route: Route, ctx: RequestContext): Promise<unknown[]> 
       continue;
     }
 
+    const declared = route.paramTypes[index];
+
     switch (meta.source) {
       case 'param':
-        args[index] = meta.name === undefined ? ctx.params : ctx.params[meta.name];
+        args[index] =
+          meta.name === undefined
+            ? ctx.params
+            : parseScalar(ctx.params[meta.name], declared, `Параметр шляху '${meta.name}'`);
         break;
 
       case 'query':
         // `?? undefined` навмисно: URLSearchParams.get віддає null, а
         // дефолтне значення аргументу (`limit = 10`) спрацьовує лише на undefined.
-        args[index] = meta.name === undefined ? ctx.query : (ctx.query.get(meta.name) ?? undefined);
+        args[index] =
+          meta.name === undefined
+            ? ctx.query
+            : parseScalar(ctx.query.get(meta.name) ?? undefined, declared, `Query-параметр '${meta.name}'`);
         break;
 
-      case 'body': {
-        const declared = route.paramTypes[index];
+      case 'body':
         // Пайп вмикається САМ, якщо тип аргументу — клас DTO. Це те, що в Nest
         // робить глобальний ValidationPipe: окремо його тут вішати не треба.
         args[index] = isDtoClass(declared) ? await validateBody(declared, ctx.body) : ctx.body;
         break;
-      }
     }
   }
 
-  return args;
+  ctx.args = args;
+  await next();
+};
+
+/**
+ * Дістає контролер із контейнера і викликає хендлер.
+ *
+ * Остання стадія ланцюга: `next()` не кличе, бо далі нічого немає.
+ * На Лекції 8 усе, що обгортає виклик (interceptor'и), стане стадіями ПЕРЕД
+ * нею, а guard'и — ще раніше, до `argsStage`.
+ */
+function createHandlerStage(container: Container): Stage {
+  return async (ctx) => {
+    // Ось тут задіяний контейнер із частини 1: екземпляр контролера не
+    // створюється через `new`, а резолвиться з усім графом залежностей.
+    // Контролер — singleton, тож на другому запиті прийде той самий обʼєкт.
+    const instance = container.resolve(ctx.route.controller) as Record<string, unknown>;
+    const handler = instance[ctx.route.handlerName];
+
+    if (typeof handler !== 'function') {
+      throw new Error(`${ctx.route.controller.name}.${ctx.route.handlerName} не є методом`);
+    }
+
+    // await навіть на синхронному результаті: хендлер може бути async,
+    // і без await у відповідь пішов би серіалізований Promise ({}).
+    ctx.result = await handler.apply(instance, ctx.args);
+  };
 }
+
+// ── Транспорт ──────────────────────────────────────────────────────────────
 
 function sendJson(res: http.ServerResponse, statusCode: number, payload: unknown): void {
   const body = Buffer.from(JSON.stringify(payload ?? null), 'utf8');
@@ -147,80 +245,83 @@ function sendJson(res: http.ServerResponse, statusCode: number, payload: unknown
 /**
  * Робить із таблиці маршрутів обробник для `http.createServer`.
  *
- * Порядок кроків — це і є «request flow», який на Лекції 8 обросте
- * middleware, guard'ами та interceptor'ами. Зараз він короткий:
- * розібрати URL → знайти маршрут → прочитати тіло → зібрати аргументи
- * (з валідацією всередині) → дістати контролер із контейнера → викликати →
- * серіалізувати.
+ * Ланцюг стадій будується ОДИН раз, на старті, а не на кожен запит: склеювати
+ * замикання 10 000 разів на секунду немає жодного сенсу — контекст усе одно
+ * свій у кожного запиту.
  */
 export function createRequestListener(container: Container, routes: Route[]): http.RequestListener {
+  const pipeline = compose([bodyStage, argsStage, createHandlerStage(container)]);
+
   return (req, res) => {
-    void handle(container, routes, req, res);
+    void handle(routes, pipeline, req, res);
   };
 }
 
-async function handle(
-  container: Container,
+/**
+ * Успішний шлях: знайти маршрут, прогнати ланцюг, відповісти.
+ *
+ * Винесено з `handle` навмисно. Кидати помилку, щоб самому ж її зловити
+ * двома рядками нижче, — гак, який до того ж заважає читати: незрозуміло,
+ * чи це «наш» throw, чи чужий. Тепер розподіл однозначний: тут — що робимо,
+ * у `handle` — що робимо, коли не вийшло.
+ */
+async function execute(
   routes: Route[],
+  pipeline: (ctx: ExecutionContext) => Promise<void>,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  // `req.url` — це шлях без схеми й хоста ('/users?limit=5'), тому URL
+  // потрібна база. Вона фіктивна: нас цікавлять лише pathname і searchParams.
+  const url = new URL(req.url ?? '/', 'http://localhost');
+
+  const match = matchRoute(routes, req.method ?? 'GET', url.pathname);
+  if (match === undefined) {
+    throw new NotFoundError(`Cannot ${req.method} ${url.pathname}`);
+  }
+
+  const ctx: ExecutionContext = {
+    req,
+    res,
+    route: match.route,
+    params: match.params,
+    query: url.searchParams,
+    body: undefined,
+    args: [],
+    result: undefined,
+  };
+
+  await pipeline(ctx);
+
+  // 204, бо тіла немає. Віддавати 200 із 'null' — брехати клієнту,
+  // що щось повернули.
+  if (ctx.result === undefined) {
+    res.writeHead(204).end();
+    return;
+  }
+
+  // POST створює ресурс → 201, решта → 200. Так само поводиться Nest.
+  sendJson(res, req.method === 'POST' ? 201 : 200, ctx.result);
+}
+
+/**
+ * Межа, за яку жодна помилка не проходить.
+ *
+ * Це єдине місце у всьому шарі, де вирішується, що клієнт побачить після
+ * збою. На Лекції 8 сюди стане exception filter.
+ */
+async function handle(
+  routes: Route[],
+  pipeline: (ctx: ExecutionContext) => Promise<void>,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
   try {
-    // `req.url` — це шлях без схеми й хоста ('/users?limit=5'), тому URL
-    // потрібна база. Вона фіктивна: нас цікавлять лише pathname і searchParams.
-    const url = new URL(req.url ?? '/', 'http://localhost');
-
-    const match = matchRoute(routes, req.method ?? 'GET', url.pathname);
-    if (match === undefined) {
-      sendJson(res, 404, { statusCode: 404, message: `Cannot ${req.method} ${url.pathname}` });
-      return;
-    }
-
-    // Тіло читаємо лише там, де воно буває. На GET його немає, а зайва
-    // підписка на 'data' просто ніколи б не спрацювала.
-    const body = req.method === 'POST' ? await readBody(req) : undefined;
-
-    const args = await buildArgs(match.route, { params: match.params, query: url.searchParams, body });
-
-    // Ось тут задіяний контейнер із частини 1: екземпляр контролера не
-    // створюється тут через `new`, а резолвиться з усім графом залежностей.
-    // Контролер — singleton, тож на другому запиті прийде той самий обʼєкт.
-    const instance = container.resolve(match.route.controller) as Record<string, unknown>;
-    const handler = instance[match.route.handlerName];
-
-    if (typeof handler !== 'function') {
-      // Сюди можна потрапити лише зламавши сам фреймворк — маршрут зібрано
-      // з метаданих методу, який щойно існував. Тому 500 напряму, без throw:
-      // кидати виняток, щоб самому ж його зловити двома рядками нижче, —
-      // зайвий гак, і IDE справедливо на нього лається.
-      console.error(`[dispatcher] ${match.route.controller.name}.${match.route.handlerName} не є методом`);
-      sendJson(res, 500, { statusCode: 500, message: 'Internal Server Error' });
-      return;
-    }
-
-    // await навіть на синхронному результаті: хендлер може бути async,
-    // і без await у відповідь пішов би серіалізований Promise ({}).
-    const result: unknown = await handler.apply(instance, args);
-
-    // 204, бо тіла немає. Віддавати 200 із 'null' — брехати клієнту,
-    // що щось повернули.
-    if (result === undefined) {
-      res.writeHead(204).end();
-      return;
-    }
-
-    // POST створює ресурс → 201, решта → 200. Так само поводиться Nest.
-    sendJson(res, req.method === 'POST' ? 201 : 200, result);
+    await execute(routes, pipeline, req, res);
   } catch (error) {
-    if (error instanceof ValidationFailedError) {
-      // Список ПОВНІСТЮ, а не перше поле: інакше клієнт лагодить форму
-      // по одному полю за запит.
-      sendJson(res, 400, { statusCode: 400, message: 'Validation failed', errors: error.errors });
-      return;
-    }
-
-    if (error instanceof BadRequestError) {
-      sendJson(res, 400, { statusCode: 400, message: error.message });
+    // Одна гілка на всі очікувані помилки: кожна знає свій статус і своє тіло.
+    if (error instanceof HttpError) {
+      sendJson(res, error.statusCode, error.toResponse());
       return;
     }
 

@@ -3,6 +3,7 @@ import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import { validate, type ValidationError as ClassValidatorError } from 'class-validator';
 
+import { HttpError } from '../errors';
 import type { Constructor } from '../types';
 
 /** Одне поле, що не пройшло перевірку, і всі причини — списком. */
@@ -14,15 +15,19 @@ export interface FieldError {
 /**
  * Помилка валідації тіла запиту.
  *
- * Окремий клас, а не голий Error: диспетчер має відрізнити «дані невалідні»
- * (це 400 і провина клієнта) від «хендлер упав» (це 500 і наша провина).
- * Без такого розрізнення будь-яка помилка всередині перетворилася б на 400,
- * і справжня поломка сервера виглядала б як помилка користувача.
+ * Успадковує HttpError, тож диспетчеру не треба знати про неї окремо — він
+ * ловить базовий тип і бере `statusCode`. Своє в ній лише одне: список полів
+ * у відповіді, заради якого й перевизначено `toResponse`.
  */
-export class ValidationFailedError extends Error {
+export class ValidationFailedError extends HttpError {
   constructor(public readonly errors: FieldError[]) {
-    super(`Validation failed: ${errors.map((e) => e.field).join(', ')}`);
-    this.name = 'ValidationFailedError';
+    super(400, 'Validation failed');
+  }
+
+  override toResponse(): Record<string, unknown> {
+    // Список ПОВНІСТЮ, а не перше поле: інакше клієнт лагодить форму
+    // по одному полю за запит.
+    return { statusCode: this.statusCode, message: this.message, errors: this.errors };
   }
 }
 
