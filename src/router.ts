@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 
 import { BadRequestError } from './errors';
-import { CONTROLLER_PREFIX, DESIGN_PARAMTYPES, PARAMS, ROUTE } from './tokens';
+import { CONTROLLER_PREFIX, DESIGN_PARAMTYPES, GUARDS, INTERCEPTORS, PARAMS, ROUTE } from './tokens';
 import type { Constructor, ParamMap, Route, RouteMetadata } from './types';
 
 /** Результат матчингу: сам маршрут + витягнуті зі шляху значення `:param`. */
@@ -87,6 +87,20 @@ export function collectRoutes(controllers: Constructor[]): Route[] {
       // який клас DTO створювати з тіла запиту.
       const paramTypes: Constructor[] = Reflect.getMetadata(DESIGN_PARAMTYPES, prototype, handlerName) ?? [];
 
+      // Guard'и й interceptor'и СКЛАДАЮТЬСЯ, а не перекриваються: те, що
+      // висить на контролері, застосовується до всіх його маршрутів, а те, що
+      // на методі, — додається зверху. Так само поводиться Nest. Перекриття
+      // було б небезпечним: @UseGuards на методі мовчки зняв би захист класу.
+      const guards: Constructor[] = [
+        ...(Reflect.getMetadata(GUARDS, controller) ?? []),
+        ...(Reflect.getMetadata(GUARDS, prototype, handlerName) ?? []),
+      ];
+
+      const interceptors: Constructor[] = [
+        ...(Reflect.getMetadata(INTERCEPTORS, controller) ?? []),
+        ...(Reflect.getMetadata(INTERCEPTORS, prototype, handlerName) ?? []),
+      ];
+
       // Склейка префікса зі шляхом методу. Обидва вже нормалізовані
       // декораторами до вигляду '' або '/щось', тож конкатенації досить.
       // Порожній результат — це корінь '/'.
@@ -100,6 +114,8 @@ export function collectRoutes(controllers: Constructor[]): Route[] {
         handlerName,
         params,
         paramTypes,
+        guards,
+        interceptors,
       });
     }
   }

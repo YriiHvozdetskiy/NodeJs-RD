@@ -55,3 +55,11 @@ export const ROUTE = Symbol.for('mini-nest:route');
  * на КЛАСІ (бо декорували параметри конструктора), тут — на МЕТОДІ.
  */
 export const PARAMS = Symbol.for('mini-nest:params');
+
+// ── Ключі частини 3: життєвий цикл ─────────────────────────────────────────
+
+/** Масив класів guard'ів. Ставить @UseGuards() — на класі АБО на методі. */
+export const GUARDS = Symbol.for('mini-nest:guards');
+
+/** Масив класів interceptor'ів. Ставить @UseInterceptors(). */
+export const INTERCEPTORS = Symbol.for('mini-nest:interceptors');

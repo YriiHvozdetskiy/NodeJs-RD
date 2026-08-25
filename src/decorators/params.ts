@@ -1,5 +1,7 @@
 import 'reflect-metadata';
 
+import type { ZodType } from 'zod';
+
 import { PARAMS } from '../tokens';
 import type { ParamMap, ParamSource } from '../types';
 
@@ -18,7 +20,7 @@ import type { ParamMap, ParamSource } from '../types';
  * той самий прийом, що в `@Inject` із частини 1.
  */
 function createParamDecorator(source: ParamSource) {
-  return (name?: string): ParameterDecorator =>
+  return (name?: string, schema?: ZodType): ParameterDecorator =>
     (target, propertyKey, parameterIndex) => {
       // Параметр КОНСТРУКТОРА дає propertyKey === undefined — так відрізняється
       // @Inject від @Body. Тут конструктор не підходить: тіло запиту в нього
@@ -39,14 +41,25 @@ function createParamDecorator(source: ParamSource) {
 
       // Дозапис, а не заміна: параметр-декоратори спрацьовують по одному,
       // у зворотному порядку індексів (n-1 → 0).
-      map[parameterIndex] = { source, name };
+      map[parameterIndex] = { source, name, schema };
 
       Reflect.defineMetadata(PARAMS, map, target, propertyKey);
     };
 }
 
-/** `@Body() dto: CreateUserDto` — усе розпарсене тіло запиту. */
-export const Body: () => ParameterDecorator = createParamDecorator('body');
+/**
+ * `@Body(createUserSchema) dto: CreateUserDto` — усе розпарсене тіло запиту.
+ *
+ * Схема передається ЗНАЧЕННЯМ, а не виводиться з типу, і це вимушено: у ДЗ#7
+ * DTO був класом, тож його конструктор потрапляв у `design:paramtypes`, і пайп
+ * знаходив правила сам. Zod-схема — це обʼєкт, а не тип; у метадані типів вона
+ * не потрапляє ніяк. Тому єдиний спосіб їх звести — передати схему в дужках.
+ *
+ * Без схеми (`@Body()`) тіло приходить сирим — валідації не буде.
+ */
+export function Body(schema?: ZodType): ParameterDecorator {
+  return createParamDecorator('body')(undefined, schema);
+}
 
 /** `@Param('id') id: string` — сегмент шляху зі шаблону `/users/:id`. */
 export const Param: (name: string) => ParameterDecorator = createParamDecorator('param');

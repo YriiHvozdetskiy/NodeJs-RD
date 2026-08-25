@@ -3,26 +3,17 @@ import 'reflect-metadata';
 import * as http from 'node:http';
 
 import type { Container } from './container';
-import { BadRequestError, HttpError, NotFoundError } from './errors';
+import { traceStage } from './context/lifecycle-trace';
+import { resolveRequestId, runWithContext } from './context/request-context';
+import { BadRequestError, ForbiddenError, NotFoundError } from './errors';
+import { exceptionFilter } from './filters/exception.filter';
 import { parseScalar } from './pipes/parse.pipe';
-import { validateBody } from './pipes/validation.pipe';
+import { zodValidationPipe } from './pipes/zod-validation.pipe';
 import { collectRoutes, matchRoute } from './router';
-import type { Constructor, Route } from './types';
+import type { CanActivate, Constructor, Interceptor, LifecycleContext, Route } from './types';
 
 /** Стеля розміру тіла. Без неї один клієнт кладе процес, надіславши потік без кінця. */
 const MAX_BODY_BYTES = 1_000_000;
-
-/**
- * Типи, які приходять у `design:paramtypes` для НЕ-DTO аргументів.
- *
- * `@Param('id') id: string` дасть `String`, а `@Body() body: unknown` — `Object`.
- * Валідувати за ними нема чого: правил на них ніхто не вішав.
- */
-const NON_DTO_TYPES: readonly unknown[] = [Object, String, Number, Boolean, Array, Function];
-
-function isDtoClass(type: unknown): type is Constructor<object> {
-  return typeof type === 'function' && !NON_DTO_TYPES.includes(type);
-}
 
 /**
  * Усе, що стадії знають про поточний запит, і все, що вони одна одній передають.
@@ -38,6 +29,12 @@ export interface ExecutionContext {
   readonly route: Route;
   readonly params: Record<string, string>;
   readonly query: URLSearchParams;
+  /** Вужчий зріз, який бачать guard та interceptor. */
+  readonly lifecycle: LifecycleContext;
+  /** Контейнер потрібен стадіям, щоб створити guard'и та interceptor'и. */
+  readonly container: Container;
+  /** Id цього запиту: клієнтський із X-Request-Id або згенерований. */
+  readonly requestId: string;
   body: unknown;
   args: unknown[];
   result: unknown;
@@ -133,14 +130,82 @@ function readBody(req: http.IncomingMessage): Promise<unknown> {
 // ── Стадії ─────────────────────────────────────────────────────────────────
 
 /**
- * Тіло читаємо лише там, де воно буває. На GET його немає, а зайва
- * підписка на 'data' просто ніколи б не спрацювала.
+ * 1. MIDDLEWARE — найширший шар, виконується для всього.
+ *
+ * Тут же читається тіло: воно потрібне і pipe'у, і потенційним guard'ам,
+ * тож дістати його треба до них обох. На GET тіла немає, і зайва підписка
+ * на 'data' просто ніколи б не спрацювала.
+ *
+ * Заголовок відповіді ставимо ЗАРАЗ, а не наприкінці: якщо запит упаде на
+ * guard'і чи в обробнику, X-Request-Id усе одно має піти клієнту — інакше
+ * саме там, де він найпотрібніший, його й не буде.
  */
-const bodyStage: Stage = async (ctx, next) => {
+const middlewareStage: Stage = async (ctx, next) => {
+  traceStage('middleware');
+
+  ctx.res.setHeader('x-request-id', ctx.requestId);
+
   if (ctx.req.method === 'POST') {
     ctx.body = await readBody(ctx.req);
   }
+
   await next();
+};
+
+/**
+ * 2. GUARD — «пускати чи ні», до всього іншого.
+ *
+ * Виконуються по черзі; перший, хто сказав `false`, обриває цикл. Хвіст
+ * ланцюга просто не викликається — саме тому guard реалізований як стадія,
+ * що НЕ кличе `next()`. Обробник при цьому не виконується взагалі: не
+ * «виконався і результат відкинули», а не запускався.
+ *
+ * Guard створює контейнер, тож у нього можна інжектити сервіси.
+ */
+const guardStage: Stage = async (ctx, next) => {
+  traceStage('guard');
+
+  for (const guardClass of ctx.route.guards) {
+    const guard = ctx.container.resolve(guardClass) as CanActivate;
+
+    // await навіть на синхронному результаті: реальний guard ходить у базу.
+    const allowed = await guard.canActivate(ctx.lifecycle);
+
+    if (!allowed) {
+      throw new ForbiddenError(`Доступ до ${ctx.lifecycle.method} ${ctx.lifecycle.path} заборонено`);
+    }
+  }
+
+  await next();
+};
+
+/**
+ * 3. INTERCEPTOR — обгортка навколо решти циклу.
+ *
+ * Складаються ЗСЕРЕДИНИ НАЗОВНІ через reduceRight: перший у списку має
+ * опинитись найзовнішнім, тобто його `before` спрацює першим, а `after` —
+ * останнім. Зібрати їх зліва направо означало б вивернути порядок навиворіт.
+ *
+ * Мітки `before`/`after` ставимо тут, а не всередині конкретного
+ * interceptor'а: вони описують сам цикл, а не поведінку окремого класу.
+ */
+const interceptorStage: Stage = async (ctx, next) => {
+  const chain = ctx.route.interceptors.reduceRight<() => Promise<void>>(
+    (rest, interceptorClass) => async () => {
+      const interceptor = ctx.container.resolve(interceptorClass) as Interceptor;
+      await interceptor.intercept(ctx.lifecycle, rest);
+    },
+    next,
+  );
+
+  traceStage('interceptor:before');
+  try {
+    await chain();
+  } finally {
+    // finally, а не після await: якщо обробник кинув, вихід із interceptor'а
+    // все одно стався — і в логах це має бути видно.
+    traceStage('interceptor:after');
+  }
 };
 
 /**
@@ -150,15 +215,18 @@ const bodyStage: Stage = async (ctx, next) => {
  * із її ключів, аргумент без декоратора просто зникне, а всі наступні зʼїдуть
  * на позицію вліво. Кількість аргументів задає `design:paramtypes`.
  *
- * Стадія асинхронна — і це головна відмінність від `resolve` з частини 1.
- * Там граф збирався синхронно, бо всі залежності вже були в памʼяті. Тут
- * посередині стоїть валідація DTO, а вона повертає проміс.
+ * 4. PIPE — трансформація й валідація аргументів безпосередньо перед викликом.
+ *
+ * Стоїть ПІСЛЯ guard'а навмисно: розбирати й перевіряти тіло запиту, який усе
+ * одно не пустять, — марна робота, та ще й найдорожча в циклі.
  *
  * Пайп викликається для КОЖНОГО джерела, не лише для тіла: `@Query('limit')
  * limit: number` має прийти числом, інакше приведення тікає в хендлер, а
  * помилка «limit=abc» вилазить десь глибше замість межі запиту.
  */
-const argsStage: Stage = async (ctx, next) => {
+const pipeStage: Stage = async (ctx, next) => {
+  traceStage('pipe');
+
   const { route } = ctx;
   const indexes = Object.keys(route.params).map(Number);
   const arity = Math.max(route.paramTypes.length, ...indexes.map((i) => i + 1), 0);
@@ -193,9 +261,9 @@ const argsStage: Stage = async (ctx, next) => {
         break;
 
       case 'body':
-        // Пайп вмикається САМ, якщо тип аргументу — клас DTO. Це те, що в Nest
-        // робить глобальний ValidationPipe: окремо його тут вішати не треба.
-        args[index] = isDtoClass(declared) ? await validateBody(declared, ctx.body) : ctx.body;
+        // Схема прийшла значенням у `@Body(createUserSchema)`. Без неї тіло
+        // йде сирим — це свідомий вибір автора маршруту, а не недогляд.
+        args[index] = meta.schema === undefined ? ctx.body : zodValidationPipe(meta.schema, ctx.body);
         break;
     }
   }
@@ -213,6 +281,8 @@ const argsStage: Stage = async (ctx, next) => {
  */
 function createHandlerStage(container: Container): Stage {
   return async (ctx) => {
+    traceStage('handler');
+
     // Ось тут задіяний контейнер із частини 1: екземпляр контролера не
     // створюється через `new`, а резолвиться з усім графом залежностей.
     // Контролер — singleton, тож на другому запиті прийде той самий обʼєкт.
@@ -250,34 +320,49 @@ function sendJson(res: http.ServerResponse, statusCode: number, payload: unknown
  * свій у кожного запиту.
  */
 export function createRequestListener(container: Container, routes: Route[]): http.RequestListener {
-  const pipeline = compose([bodyStage, argsStage, createHandlerStage(container)]);
+  // Ланцюг будується ОДИН раз, на старті: склеювати замикання на кожен запит
+  // немає сенсу, контекст усе одно свій у кожного.
+  //
+  // Порядок читається згори вниз як сам цикл:
+  //   middleware → guard → interceptor(before) → pipe → handler → interceptor(after)
+  // Exception filter у списку відсутній навмисно — він не етап, а межа,
+  // і живе рівнем вище, у handle().
+  const pipeline = compose([
+    middlewareStage,
+    guardStage,
+    interceptorStage,
+    pipeStage,
+    createHandlerStage(container),
+  ]);
 
   return (req, res) => {
-    void handle(routes, pipeline, req, res);
+    void handle(container, routes, pipeline, req, res);
   };
 }
 
 /**
- * Успішний шлях: знайти маршрут, прогнати ланцюг, відповісти.
+ * Успішний шлях: знайти маршрут, прогнати цикл, відповісти.
  *
  * Винесено з `handle` навмисно. Кидати помилку, щоб самому ж її зловити
- * двома рядками нижче, — гак, який до того ж заважає читати: незрозуміло,
- * чи це «наш» throw, чи чужий. Тепер розподіл однозначний: тут — що робимо,
- * у `handle` — що робимо, коли не вийшло.
+ * двома рядками нижче, — гак, який заважає читати. Розподіл однозначний:
+ * тут — що робимо, у `handle` — що робимо, коли не вийшло.
  */
 async function execute(
+  container: Container,
   routes: Route[],
   pipeline: (ctx: ExecutionContext) => Promise<void>,
+  requestId: string,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
   // `req.url` — це шлях без схеми й хоста ('/users?limit=5'), тому URL
   // потрібна база. Вона фіктивна: нас цікавлять лише pathname і searchParams.
   const url = new URL(req.url ?? '/', 'http://localhost');
+  const method = req.method ?? 'GET';
 
-  const match = matchRoute(routes, req.method ?? 'GET', url.pathname);
+  const match = matchRoute(routes, method, url.pathname);
   if (match === undefined) {
-    throw new NotFoundError(`Cannot ${req.method} ${url.pathname}`);
+    throw new NotFoundError(`Cannot ${method} ${url.pathname}`);
   }
 
   const ctx: ExecutionContext = {
@@ -286,6 +371,14 @@ async function execute(
     route: match.route,
     params: match.params,
     query: url.searchParams,
+    lifecycle: {
+      method,
+      path: url.pathname,
+      headers: req.headers,
+      route: match.route,
+    },
+    container,
+    requestId,
     body: undefined,
     args: [],
     result: undefined,
@@ -301,37 +394,38 @@ async function execute(
   }
 
   // POST створює ресурс → 201, решта → 200. Так само поводиться Nest.
-  sendJson(res, req.method === 'POST' ? 201 : 200, ctx.result);
+  sendJson(res, method === 'POST' ? 201 : 200, ctx.result);
 }
 
 /**
- * Межа, за яку жодна помилка не проходить.
+ * Межа, за яку жодна помилка не проходить, і корінь контексту запиту.
  *
- * Це єдине місце у всьому шарі, де вирішується, що клієнт побачить після
- * збою. На Лекції 8 сюди стане exception filter.
+ * ⚠ `runWithContext` обгортає І цикл, І `catch` — не навпаки. Якби ALS
+ * запускався всередині, exception filter опинився б ЗА межами контексту і
+ * `getRequestId()` повернув би undefined саме тоді, коли id найпотрібніший:
+ * у звіті про помилку.
+ *
+ * requestId рахуємо тут, до всього: він потрібен і заголовку відповіді, і
+ * логам, і filter'у — тобто трьом шарам, які не мають спільного предка нижче.
  */
 async function handle(
+  container: Container,
   routes: Route[],
   pipeline: (ctx: ExecutionContext) => Promise<void>,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
-  try {
-    await execute(routes, pipeline, req, res);
-  } catch (error) {
-    // Одна гілка на всі очікувані помилки: кожна знає свій статус і своє тіло.
-    if (error instanceof HttpError) {
-      sendJson(res, error.statusCode, error.toResponse());
-      return;
-    }
+  const requestId = resolveRequestId(req.headers['x-request-id']);
 
-    // Будь-що інше — це наша поломка. Текст назовні не віддаємо: у ньому
-    // бувають шляхи, SQL і імена таблиць.
-    console.error('[dispatcher] необроблена помилка:', error);
-    if (!res.headersSent) {
-      sendJson(res, 500, { statusCode: 500, message: 'Internal Server Error' });
+  await runWithContext({ requestId }, async () => {
+    try {
+      await execute(container, routes, pipeline, requestId, req, res);
+    } catch (error) {
+      // 6. EXCEPTION FILTER — останній у ланцюгу, ловить усе: обробник, pipe,
+      // guard і навіть interceptor.
+      exceptionFilter(res, error);
     }
-  }
+  });
 }
 
 /**

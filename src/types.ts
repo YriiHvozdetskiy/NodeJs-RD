@@ -53,6 +53,8 @@ export interface InjectableOptions {
   scope?: Scope;
 }
 
+import type { ZodType } from 'zod';
+
 // ── Частина 2: HTTP-шар ────────────────────────────────────────────────────
 
 /** Обмежуємось тим, що вимагає ДЗ. Розширюється додаванням декоратора в methods.ts. */
@@ -70,10 +72,12 @@ export type ParamSource = 'body' | 'param' | 'query';
 /**
  * Опис одного аргументу хендлера.
  * `name` порожнє для @Body() — тіло віддається цілком.
+ * `schema` є лише там, де параметру передали Zod-схему: `@Body(createUserSchema)`.
  */
 export interface ParamMetadata {
   source: ParamSource;
   name?: string;
+  schema?: ZodType;
 }
 
 /**
@@ -100,4 +104,48 @@ export interface Route {
   params: ParamMap;
   /** Типи параметрів хендлера з design:paramtypes — потрібні пайпу для DTO. */
   paramTypes: Constructor[];
+  /** Класи guard'ів: контролера + методу, у цьому порядку. */
+  guards: Constructor[];
+  /** Класи interceptor'ів: контролера + методу, у цьому порядку. */
+  interceptors: Constructor[];
+}
+
+// ── Частина 3: життєвий цикл ───────────────────────────────────────────────
+
+/**
+ * Guard: пускати запит далі чи ні.
+ *
+ * Повертає `boolean` — і це вся його влада. Він НЕ може змінити відповідь,
+ * НЕ бачить результату обробника і НЕ обгортає виклик. Саме цим він
+ * відрізняється від interceptor'а: той обгортає і бачить обидва кінці.
+ *
+ * Асинхронний навмисно: реальна перевірка ходить у базу або до auth-сервісу.
+ */
+export interface CanActivate {
+  canActivate(ctx: LifecycleContext): boolean | Promise<boolean>;
+}
+
+/**
+ * Interceptor: обгортка навколо решти циклу.
+ *
+ * `next()` — це «виконати все, що далі, включно з обробником». Код до нього
+ * бачить вхід, код після — вихід. Одна сутність замість двох окремих хуків
+ * «before» і «after», за якими довелося б стежити вручну.
+ */
+export interface Interceptor {
+  intercept(ctx: LifecycleContext, next: () => Promise<void>): Promise<void>;
+}
+
+/**
+ * Мінімум, який guard та interceptor знають про запит.
+ *
+ * Свідомо вужче за повний `ExecutionContext` диспетчера: guard'у нема чого
+ * знати про зібрані аргументи (їх на його етапі ще не існує), а interceptor'у —
+ * лізти в сокет. Вужчий інтерфейс — менше способів зламати цикл.
+ */
+export interface LifecycleContext {
+  readonly method: string;
+  readonly path: string;
+  readonly headers: Record<string, string | string[] | undefined>;
+  readonly route: Route;
 }

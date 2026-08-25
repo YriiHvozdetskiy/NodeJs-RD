@@ -10,7 +10,8 @@ import { Injectable } from '../src/decorators/injectable';
 import { Get, Post } from '../src/decorators/methods';
 import { Body, Param, Query } from '../src/decorators/params';
 import { compose, type ExecutionContext, type Stage, createApp } from '../src/dispatcher';
-import { CreateUserDto } from '../src/dto/create-user.dto';
+import type { CreateUserDto } from '../src/dto/create-user.dto';
+import { createUserSchema } from '../src/dto/create-user.dto';
 import { collectRoutes, matchSegments, toSegments } from '../src/router';
 
 // ── Тестові класи ──────────────────────────────────────────────────────────
@@ -63,13 +64,10 @@ class ProbeController {
   }
 
   @Post()
-  create(@Body() dto: CreateUserDto): { isInstance: boolean; className: string; email: string } {
-    return {
-      // Саме те, чого вимагає AC#8: у хендлер приходить ЕКЗЕМПЛЯР класу.
-      isInstance: dto instanceof CreateUserDto,
-      className: dto.constructor.name,
-      email: dto.email,
-    };
+  create(@Body(createUserSchema) dto: CreateUserDto): { keys: string[]; email: string; ageType: string } {
+    // Zod віддає plain-обʼєкт, тож перевіряти треба ФОРМУ даних, а не
+    // конструктор: `instanceof` тут не має сенсу й не мав би цінності.
+    return { keys: Object.keys(dto).sort(), email: dto.email, ageType: typeof dto.age };
   }
 
   @Post('raw')
@@ -220,6 +218,8 @@ describe('маршрутизація', () => {
     const { status, body } = await call('/nope');
     assert.equal(status, 404);
     assert.match(body.message, /Cannot GET \/nope/);
+    // Навіть 404 несе requestId — щоб клієнт міг назвати його підтримці.
+    assert.ok(typeof body.requestId === 'string');
   });
 
   it('той самий шлях іншим методом теж 404', async () => {
@@ -283,8 +283,8 @@ describe('@Body (AC#6)', () => {
   });
 });
 
-describe('валідація DTO', () => {
-  it('невалідне тіло дає 400 з назвою поля (AC#7)', async () => {
+describe('валідація через Zod', () => {
+  it('невалідне тіло дає 400 з назвою поля', async () => {
     const { status, body } = await call('/probe', {
       method: 'POST',
       body: JSON.stringify({ email: 'not-an-email' }),
@@ -304,30 +304,33 @@ describe('валідація DTO', () => {
     assert.deepEqual(fields, ['age', 'email', 'name']);
   });
 
-  it('валідне тіло проходить і приходить ЕКЗЕМПЛЯРОМ DTO (AC#8)', async () => {
+  it('валідне тіло проходить і доходить до обробника розібраним', async () => {
     const { status, body } = await call('/probe', {
       method: 'POST',
       body: JSON.stringify({ name: 'Ada', email: 'ada@example.com', age: 36 }),
     });
 
     assert.equal(status, 201);
-    assert.equal(body.isInstance, true);
-    assert.equal(body.className, 'CreateUserDto');
+    assert.deepEqual(body.keys, ['age', 'email', 'name']);
+    assert.equal(body.email, 'ada@example.com');
+    assert.equal(body.ageType, 'number');
   });
 
-  it('зайві поля вирізаються на вході (whitelist)', async () => {
-    const { status } = await call('/probe', {
+  it('зайве поле ВІДХИЛЯЄТЬСЯ, а не вирізається мовчки', async () => {
+    // .strict() у схемі. Це суворіше за whitelist із ДЗ#7: клієнт дізнається,
+    // що його `role: "admin"` не прийняли, а не гадає, чому воно не спрацювало.
+    const { status, body } = await call('/probe', {
       method: 'POST',
       body: JSON.stringify({ name: 'Bob', email: 'b@e.com', age: 20, role: 'admin' }),
     });
 
-    // Не 400: whitelist мовчки ріже, а не відхиляє (це був би forbidNonWhitelisted).
-    assert.equal(status, 201);
+    assert.equal(status, 400);
+    assert.match(JSON.stringify(body), /role/);
   });
 
   it('рядок замість числа НЕ коерситься', async () => {
-    // transform робить екземпляр класу, але типи не приводить.
-    // Це відрізняє Nest від Fastify, де ajv коерсить мовчки.
+    // z.int() не приводить типів. Коерсія в Zod вмикається явно —
+    // z.coerce.number(), — і не вмикати її тут свідомий вибір.
     const { status, body } = await call('/probe', {
       method: 'POST',
       body: JSON.stringify({ name: 'Ada', email: 'ada@example.com', age: '36' }),
@@ -335,6 +338,17 @@ describe('валідація DTO', () => {
 
     assert.equal(status, 400);
     assert.match(JSON.stringify(body), /age/);
+  });
+
+  it('@Body() без схеми лишає тіло сирим', async () => {
+    // Валідація — не автоматична магія, а явно передана схема.
+    const { status, body } = await call('/probe/raw', {
+      method: 'POST',
+      body: JSON.stringify({ anything: 'що завгодно', a: [1, 2] }),
+    });
+
+    assert.equal(status, 201);
+    assert.deepEqual(body.echoed, { anything: 'що завгодно', a: [1, 2] });
   });
 });
 

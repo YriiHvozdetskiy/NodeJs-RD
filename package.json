@@ -2,20 +2,19 @@
   "name": "mini-nest",
   "version": "1.0.0",
   "private": true,
-  "description": "Лекції 6-7 — власний mini-Nest: IoC-контейнер на метаданих + HTTP-шар на декораторах",
+  "description": "Лекції 6-8 — власний mini-Nest: IoC-контейнер, HTTP-шар на декораторах, повний lifecycle запиту",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "start": "npm run build && node dist/src/main.js",
     "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "class-transformer": "^0.5.1",
-    "class-validator": "^0.15.1",
-    "reflect-metadata": "^0.2.2"
+    "reflect-metadata": "^0.2.2",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

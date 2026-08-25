@@ -1,9 +1,9 @@
 import 'reflect-metadata';
 
 import { Container } from './container';
+import { UsersController } from './controllers/users.controller';
 import { createApp } from './dispatcher';
 import { collectRoutes } from './router';
-import { UsersController } from './users/users.controller';
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -15,10 +15,11 @@ const server = createApp(container, controllers);
 server.listen(PORT, () => {
   console.log(`mini-nest слухає http://localhost:${PORT}`);
 
-  // Список друкуємо з ТАБЛИЦІ, а не з рядків у коді. Так само, як його
-  // друкує Nest на старті — і це найдешевший спосіб побачити, що маршрути
-  // справді зібрані з декораторів, а не переписані руками.
+  // Список друкуємо з ТАБЛИЦІ, а не з рядків у коді — найдешевший спосіб
+  // побачити, що маршрути справді зібрані з декораторів.
   for (const route of collectRoutes(controllers)) {
-    console.log(`  ${route.method.padEnd(4)} ${route.path}`);
+    const guards = route.guards.map((g) => g.name).join(', ');
+    const marks = guards === '' ? '' : `  [${guards}]`;
+    console.log(`  ${route.method.padEnd(4)} ${route.path}${marks}`);
   }
 });

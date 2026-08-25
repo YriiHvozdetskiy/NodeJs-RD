@@ -37,3 +37,33 @@ export class NotFoundError extends HttpError {
     super(404, message);
   }
 }
+
+/** Одне поле, що не пройшло перевірку, і всі причини — списком. */
+export interface FieldError {
+  field: string;
+  constraints: string[];
+}
+
+/**
+ * 400 — тіло не відповідає контракту.
+ *
+ * Своє в ній лише одне: список полів у відповіді, заради якого й перевизначено
+ * `toResponse`. Клієнт має побачити ВСІ проблеми одразу, інакше лагодить форму
+ * по одному полю за запит.
+ */
+export class ValidationError extends HttpError {
+  constructor(public readonly errors: FieldError[]) {
+    super(400, 'Validation failed');
+  }
+
+  override toResponse(): Record<string, unknown> {
+    return { statusCode: this.statusCode, message: this.message, errors: this.errors };
+  }
+}
+
+/** 403 — guard не пустив. Не 401: тут не про «хто ви», а про «вам сюди не можна». */
+export class ForbiddenError extends HttpError {
+  constructor(message: string) {
+    super(403, message);
+  }
+}
