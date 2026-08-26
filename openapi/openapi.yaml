@@ -255,7 +255,22 @@ components:
         type:
           type: string
           format: uri
-          description: Стабільний URI класу проблеми — саме по ньому матчить клієнт.
+          description: |
+            Стабільний URI класу проблеми — саме по ньому матчить клієнт.
+            Перелік закритий: якщо сервер віддасть URI поза цим списком,
+            `validateResponses` відкине власну відповідь. Додавати новий тип
+            означає спершу дописати його тут.
+          enum:
+            - https://api.marketplace.example/problems/validation-error
+            - https://api.marketplace.example/problems/invalid-cursor
+            - https://api.marketplace.example/problems/bad-request
+            - https://api.marketplace.example/problems/not-found
+            - https://api.marketplace.example/problems/conflict
+            - https://api.marketplace.example/problems/idempotency-key-in-flight
+            - https://api.marketplace.example/problems/unprocessable-entity
+            - https://api.marketplace.example/problems/idempotency-key-reused
+            - https://api.marketplace.example/problems/unknown-product
+            - https://api.marketplace.example/problems/internal
           example: https://api.marketplace.example/problems/not-found
         title:
           type: string
@@ -295,6 +310,7 @@ components:
     Product:
       type: object
       required: [id, title, price_cents, currency, created_at]
+      additionalProperties: false
       properties:
         id:
           type: integer
@@ -318,6 +334,7 @@ components:
     ProductPage:
       type: object
       required: [items, next_cursor]
+      additionalProperties: false
       properties:
         items:
           type: array
@@ -332,7 +349,12 @@ components:
 
     OrderItem:
       type: object
+      description: Позиція кошика — те, що надсилає КЛІЄНТ.
       required: [product_id, qty]
+      # Закрито для зайвих полів. Без цього рядка {"product_id":1,"qty":1,
+      # "hack":true} проходив у 201: additionalProperties у CreateOrder
+      # стосується лише ВЕРХНЬОГО рівня тіла, а не вкладених обʼєктів.
+      additionalProperties: false
       properties:
         product_id:
           type: integer
@@ -345,22 +367,36 @@ components:
           example: 2
 
     OrderLine:
-      allOf:
-        - $ref: '#/components/schemas/OrderItem'
-        - type: object
-          required: [unit_price_cents]
-          properties:
-            unit_price_cents:
-              type: integer
-              description: |
-                Ціна товару в копійках на МОМЕНТ створення замовлення. Копіюється
-                в замовлення, а не читається з каталогу: інакше зміна ціни
-                перепише історію вже оплачених замовлень.
-              example: 260000
+      type: object
+      description: |
+        Позиція вже створеного замовлення — те, що ВІДДАЄ сервер.
+        Виписана повністю, а не через `allOf` з `OrderItem`: під `allOf` кожна
+        підсхема валідується окремо, тож `additionalProperties: false` у
+        `OrderItem` відкидав би `unit_price_cents` із сусідньої гілки.
+      required: [product_id, qty, unit_price_cents]
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          minimum: 1
+          example: 25
+        qty:
+          type: integer
+          minimum: 1
+          maximum: 999
+          example: 2
+        unit_price_cents:
+          type: integer
+          description: |
+            Ціна товару в копійках на МОМЕНТ створення замовлення. Копіюється
+            в замовлення, а не читається з каталогу: інакше зміна ціни
+            перепише історію вже оплачених замовлень.
+          example: 260000
 
     Order:
       type: object
       required: [id, items, total_cents, currency, status, created_at]
+      additionalProperties: false
       properties:
         id:
           type: integer
@@ -391,6 +427,7 @@ components:
     OrderPage:
       type: object
       required: [items, next_cursor]
+      additionalProperties: false
       properties:
         items:
           type: array
