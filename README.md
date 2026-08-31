@@ -2,40 +2,47 @@
 
 Курсовий проєкт, Node.js PRO. **ДЗ #9 — API design.**
 
-Спека — джерело правди цього сервісу. По її ресурсах далі проєктується схема БД
-(#12), entities (#13) і транзакційне оформлення замовлення (#14).
+Стек: **NestJS 11 + TypeScript**, Express 5 під капотом, `express-openapi-validator`
+на кордоні. Спека — джерело правди сервісу: по її ресурсах далі проєктується
+схема БД (#12), entities (#13) і транзакційне оформлення замовлення (#14).
 
 ## Обраний варіант: **Б — runtime-валідація на кордоні**
 
 `express-openapi-validator` читає `openapi/openapi.yaml` і фізично відхиляє все,
 що спеці суперечить — у **обидва** боки:
 
-* **на вході** — відсутній `Idempotency-Key`, порожній `items`, `limit > 100`,
-  незадеклароване поле в тілі. Жодного `if` у коді немає: вимогу тримає контракт;
+* **на вході** — відсутній `Idempotency-Key`, порожній `items`, `qty: "two"`,
+  `qty: -5`, `limit > 100`, незадеклароване поле на будь-якій глибині. Жодного
+  `if` у контролері немає: вимогу тримає контракт;
 * **на виході** — `validateResponses: true`. Якщо обробник віддасть не те, що
   обіцяє спека, клієнт отримає `500`, а не тихо зіпсовані дані.
 
-Помилки перекладає в `application/problem+json` (RFC 9457) один error-handler у
-`src/app.js`. Він же транслює `path`/`message` валідатора в `pointer`/`detail` —
-підполя названі як у прикладі RFC 9457 §3.
+Помилки перекладає в `application/problem+json` (RFC 9457) один
+`ProblemFilter` — глобальний `ExceptionFilter` Nest. Він же транслює
+`path`/`message` валідатора в `pointer`/`detail`: підполя названі як у прикладі
+RFC 9457 §3.
 
 ## Запуск
 
 ```bash
 npm install
-npm start                 # http://localhost:3000/v1
+npm start            # tsc → node dist/main.js, http://localhost:3000/v1
+npm run start:dev    # без білду, через ts-node
+npm run typecheck    # tsc --noEmit
 ```
 
 ## Структура
 
 | Файл | Що в ньому |
-|---|---|
+| --- | --- |
 | `openapi/openapi.yaml` | спека: 2 ресурси, 5 операцій, cursor-пагінація, `Idempotency-Key`, `problem+json` |
-| `src/app.js` | express + валідатор + 5 обробників + error-handler → problem+json |
-| `src/problem.js` | нормалізація будь-якої помилки в RFC 9457 |
-| `src/cursor.js` | keyset-курсор: `encode`/`decode`/`paginate` |
-| `src/idempotency.js` | сховище ключів у памʼяті + рішення про повтор |
-| `src/data.js` | in-memory каталог і замовлення (на #13 стане TypeORM) |
+| `src/main.ts` | bootstrap: `express.json()` → валідатор → глобальний `ProblemFilter` |
+| `src/app.module.ts` | модуль: контролери + провайдери |
+| `src/common/problem.filter.ts` | будь-яка помилка → RFC 9457 |
+| `src/common/http-problem.ts` | власна помилка з `code`, звіреним із `enum` у спеці |
+| `src/common/cursor.ts` | keyset-курсор: `encode` / `decode` / `paginate` |
+| `src/catalog/` | `CatalogService` (in-memory каталог) + `ProductsController` |
+| `src/orders/` | `OrdersService`, `IdempotencyService`, `OrdersController` |
 | `scripts/check-scope.js` | перевірка обсягу спеки з acceptance criteria, файлом |
 
 ## Acceptance criteria — команди
@@ -92,6 +99,16 @@ curl -i -X POST $B/orders -H 'content-type: application/json' \
 # HTTP/1.1 201 · Location: /v1/orders/6
 ```
 
+Валідатор рубає й те, чого в коді ніхто не передбачав:
+
+```
+{"items":[{"product_id":1,"qty":1,"hack":true}]} → 400 "request/body/items/0 must NOT have additional properties"
+{"items":[{"product_id":1,"qty":"two"}]}         → 400 "request/body/items/0/qty must be integer"
+{"items":[{"product_id":1,"qty":-5}]}            → 400 "request/body/items/0/qty must be >= 1"
+GET /v1/products?limit=999                        → 400 "request/query/limit must be <= 100"
+GET /v1/wat                                       → 404 problem+json, не HTML express
+```
+
 ## Додатковий виклик — повна семантика ключа
 
 ```bash
@@ -112,7 +129,8 @@ curl -X POST $B/orders -H 'content-type: application/json' -H "Idempotency-Key: 
 
 ```bash
 SLOW_MS=400 npm start
-# і два одночасні запити з тим самим ключем: A → 201, B → 409
+# два одночасні запити з тим самим ключем і тим самим тілом: A → 201, B → 409
+# з РІЗНИМ тілом:                                            A → 201, B → 422
 ```
 
 ## Cursor-пагінація
@@ -146,10 +164,13 @@ curl -s "$B/orders?limit=2"
 
 ## Свідомі рішення
 
+### Спека
+
 * **Версія в `servers.url`, а не в шляхах.** `/v1/products` у `paths` зробив би
   всі ресурси одним (`v1`) для будь-якого інструменту, що дивиться на перший
   сегмент. Версія — властивість розгортання; `v1`/`v2` у шляхах зʼявляться тоді,
-  коли обидві реально працюватимуть.
+  коли обидві реально працюватимуть. У коді їй відповідає
+  `app.setGlobalPrefix('v1')`.
 * **`security: []` на корені** — авторизації свідомо ще немає (приїде на #24).
   Порожній масив документує це явно й закриває redocly-правило `security-defined`.
 * **`default`-відповідь у кожній операції.** Без неї `validateResponses: true`
@@ -158,28 +179,42 @@ curl -s "$B/orders?limit=2"
   відповідях.** У `CreateOrder` воно стосується лише верхнього рівня тіла, тому
   `{"product_id":1,"qty":1,"hack":true}` проходив у `201`, поки те саме не
   зʼявилось в `OrderItem`. На схемах відповідей це дає те, що на L#4 робив
-  серіалізатор Fastify: віддати незадекларіване поле фізично не вийде —
-  `validateResponses` віддасть `500 "/response/items/0 must NOT have additional
-  properties"`.
+  серіалізатор Fastify: віддати незадеклароване поле фізично не вийде.
 * **`OrderLine` виписаний повністю, а не через `allOf` з `OrderItem`.** Під
   `allOf` кожна підсхема валідується окремо, тож `additionalProperties: false`
   в `OrderItem` відкидав би `unit_price_cents` із сусідньої гілки.
 * **`Problem.type` — закритий `enum` з усіх десяти URI.** Клієнт матчить помилку
-  по `type`, тож перелік має бути в контракті, а не тільки в голові. Побічний
-  ефект корисний: новий тип помилки неможливо віддати, не дописавши його у спеку
-  — інакше `validateResponses` відкине власну відповідь сервера.
-* **Сам `Problem` при цьому лишається відкритим** (без
-  `additionalProperties: false`) — RFC 9457 §3.2 прямо дозволяє розширення й
-  зобовʼязує клієнтів ігнорувати нерозпізнані. Закрити його означало б
-  заборонити те, що стандарт вимагає підтримувати.
+  по `type`, тож перелік має бути в контракті. Побічний ефект корисний: новий тип
+  помилки неможливо віддати, не дописавши його у спеку — інакше
+  `validateResponses` відкине власну відповідь сервера. У коді цьому відповідає
+  тип `ProblemCode` у `src/common/http-problem.ts`.
+* **Сам `Problem` лишається відкритим** (без `additionalProperties: false`) —
+  RFC 9457 §3.2 прямо дозволяє розширення й зобовʼязує клієнтів ігнорувати
+  нерозпізнані. Закрити його означало б заборонити те, що стандарт вимагає
+  підтримувати.
 * **Гроші — цілі копійки.** `total_cents: integer`. Ніяких `"2600.00"`.
 * **Ціна копіюється в замовлення** (`unit_price_cents`), а не читається з
   каталогу: інакше зміна цінника перепише історію оплачених замовлень.
-* **`in-flight` + інше тіло → `422`, а не `409`.** Порядок перевірок у
-  `decide()` не довільний: відпечаток тіла порівнюється **раніше** за стан. Це
-  можливо тільки тому, що `markInFlight()` пише fingerprint ДО запуску
-  обробника. «Тіло інше» — остаточний факт про клієнта, «ще в польоті» —
-  тимчасовий стан сервера; `409` наказав би повторити запит, який ніколи не
-  пройде.
+
+### Nest + валідатор
+
+* **`bodyParser: false` у `NestFactory.create`, далі `app.use(express.json())`
+  вручну.** Власний body-parser Nest реєструється не там, де треба: валідатор
+  бачив `request must have required property 'body'` на цілком валідному JSON,
+  бо тіло ще не було розпарсене. Тепер порядок заданий явно й видимий.
+* **Одна точка на всі помилки — `ExceptionFilter` Nest, без окремого
+  Express-обробника.** `express-openapi-validator` — це Express-middleware перед
+  роутером Nest, тож логічно було очікувати, що його помилки полетять у
+  Express-ланцюжок мимо фільтрів. Перевірено — вони доходять до
+  `useGlobalFilters`: і `400` від валідації запиту, і `500` від
+  `validateResponses`.
+* **Один інстанс express.** `@nestjs/platform-express@11` тягне `express@5.2.1`
+  своєю залежністю; поки в `package.json` стояв `express@4`, у дереві було
+  **дві** копії, і валідатор створював Router від express 4 всередині app
+  express 5. У `dependencies` тепер `express@5.2.1` — та сама версія, тож npm
+  зводить усе до однієї (`npm ls express` показує три `deduped`).
+* **`ts-node`, ніколи `tsx`.** esbuild викидає `emitDecoratorMetadata`, і DI
+  Nest перестає бачити типи конструктора.
 * **Сховище ключів у памʼяті** не переживає рестарт — після нього той самий ключ
-  створить замовлення вдруге. Спільне сховище (Redis) приїде на #23.
+  створить замовлення вдруге. Спільне сховище (Redis) приїде на #23;
+  `IdempotencyService` уже провайдер, тож заміна не торкнеться контролера.
