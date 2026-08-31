@@ -8,27 +8,27 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "npm run build && node dist/main.js",
+    "start": "tsc -p tsconfig.json && node dist/main.js",
     "start:dev": "ts-node -P tsconfig.json src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint:spec": "redocly lint openapi/openapi.yaml",
     "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
-    "check:scope": "npm run bundle:spec && node scripts/check-scope.js"
+    "check:scope": "redocly bundle openapi/openapi.yaml -o spec.json && node scripts/check-scope.js"
   },
   "dependencies": {
-    "@nestjs/common": "^11.2.3",
-    "@nestjs/core": "^11.2.3",
-    "@nestjs/platform-express": "^11.2.3",
-    "express": "^5.2.1",
+    "@nestjs/common": "11.2.1",
+    "@nestjs/core": "11.2.1",
+    "@nestjs/platform-express": "11.2.1",
+    "express": "5.2.1",
     "express-openapi-validator": "5.6.2",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2"
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
   },
   "devDependencies": {
     "@redocly/cli": "2.46.0",
-    "@types/express": "^5.0.6",
-    "@types/node": "^22.20.1",
-    "ts-node": "^10.9.2",
-    "typescript": "~5.9"
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.1",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
   }
 }

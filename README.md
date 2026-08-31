@@ -3,8 +3,9 @@
 Курсовий проєкт, Node.js PRO. **ДЗ #9 — API design.**
 
 Стек: **NestJS 11 + TypeScript**, Express 5 під капотом, `express-openapi-validator`
-на кордоні. Спека — джерело правди сервісу: по її ресурсах далі проєктується
-схема БД (#12), entities (#13) і транзакційне оформлення замовлення (#14).
+на кордоні, пакети — **pnpm 10**. Спека — джерело правди сервісу: по її ресурсах
+далі проєктується схема БД (#12), entities (#13) і транзакційне оформлення
+замовлення (#14).
 
 ## Обраний варіант: **Б — runtime-валідація на кордоні**
 
@@ -24,12 +25,37 @@ RFC 9457 §3.
 
 ## Запуск
 
+Проєкт розроблявся на **pnpm 10**, але `packageManager` свідомо не зафіксований —
+працює з будь-яким менеджером. Усі версії в `dependencies` запінені точно, тож
+`npm install` поставить рівно те саме.
+
 ```bash
-npm install
-npm start            # tsc → node dist/main.js, http://localhost:3000/v1
-npm run start:dev    # без білду, через ts-node
-npm run typecheck    # tsc --noEmit
+pnpm install               # або npm install / yarn
+pnpm start                 # tsc → node dist/main.js, http://localhost:3000/v1
+pnpm start:dev             # без білду, через ts-node
+pnpm typecheck             # tsc --noEmit
+pnpm lint:spec             # redocly lint
+pnpm check:scope           # bundle + перевірка обсягу спеки
 ```
+
+Скрипти не містять імені менеджера всередині, тому `npm start`, `pnpm start` і
+`yarn start` рівноцінні. У CI на pnpm — `pnpm install --frozen-lockfile`.
+
+Конфігурація pnpm живе в `pnpm-workspace.yaml` — там же, де налаштування
+захисту supply chain. Коротко, що воно змінює у щоденній роботі:
+
+| Налаштування | Що робить на практиці |
+| --- | --- |
+| `minimumReleaseAge: 10080` | пакет, опублікований менш ніж 7 днів тому, не встановиться. Саме тому в `dependencies` стоїть `@nestjs/* 11.2.1`, а не свіжіша `11.2.3` — на момент міграції їй було 6 днів |
+| `strictDepBuilds: true` + `allowBuilds: {}` | будь-який `postinstall` у залежностях завалить install, поки пакет не внесено в `allowBuilds` руками. У цьому дереві install-скриптів немає жодного |
+| `savePrefix: ''` | `pnpm add` пише точну версію, без `^` |
+| `verifyDepsBeforeRun: error` | `pnpm run` падає з `ERR_PNPM_VERIFY_DEPS_BEFORE_RUN`, якщо `package.json` розʼїхався з lockfile |
+| `blockExoticSubdeps` · `trustPolicy` · `verifyStoreIntegrity` | забороняють git/tarball-під-залежності, downgrade довіри та неперевірений стор |
+
+`pnpm-lock.yaml` **комітиться** — без нього `--frozen-lockfile` і весь пінінг
+не мають сенсу. Хто ставить через `npm`, отримає ті самі версії з точних пінів у
+`package.json`, але **без** цих гарантій: `pnpm-workspace.yaml` npm просто
+проігнорує.
 
 ## Структура
 
@@ -44,6 +70,7 @@ npm run typecheck    # tsc --noEmit
 | `src/catalog/` | `CatalogService` (in-memory каталог) + `ProductsController` |
 | `src/orders/` | `OrdersService`, `IdempotencyService`, `OrdersController` |
 | `scripts/check-scope.js` | перевірка обсягу спеки з acceptance criteria, файлом |
+| `pnpm-workspace.yaml` | вся конфігурація pnpm: карантин версій, контроль install-скриптів, пінінг |
 
 ## Acceptance criteria — команди
 
@@ -76,7 +103,7 @@ grep -c 'application/problem+json' openapi/openapi.yaml # 6
 
 ### 6. Contract-частина працює (варіант Б)
 
-`npm start` в одному терміналі, далі:
+`pnpm start` в одному терміналі, далі:
 
 ```bash
 B=http://localhost:3000/v1
@@ -128,7 +155,7 @@ curl -X POST $B/orders -H 'content-type: application/json' -H "Idempotency-Key: 
 затримка, яка імітує майбутню транзакцію в Postgres з #14:
 
 ```bash
-SLOW_MS=400 npm start
+SLOW_MS=400 pnpm start
 # два одночасні запити з тим самим ключем і тим самим тілом: A → 201, B → 409
 # з РІЗНИМ тілом:                                            A → 201, B → 422
 ```
@@ -153,7 +180,7 @@ curl -s "$B/products?limit=3&cursor=<той-самий-токен>"
 `currency`, **не чіпаючи спеку** — рантайм-аналог `contract/check.mjs` з лекції:
 
 ```bash
-DRIFT=1 npm start
+DRIFT=1 pnpm start
 curl -s $B/orders/1
 # 500 · detail: "/response must have required property 'total_cents'"
 curl -s "$B/orders?limit=2"
@@ -212,7 +239,21 @@ curl -s "$B/orders?limit=2"
   своєю залежністю; поки в `package.json` стояв `express@4`, у дереві було
   **дві** копії, і валідатор створював Router від express 4 всередині app
   express 5. У `dependencies` тепер `express@5.2.1` — та сама версія, тож npm
-  зводить усе до однієї (`npm ls express` показує три `deduped`).
+  зводить усе до однієї (`pnpm list express --depth 1` показує один `5.2.1` на
+  всіх трьох споживачів).
+* **pnpm замість npm, конфіг у `pnpm-workspace.yaml`.** У pnpm 10 налаштування
+  читаються саме звідти, тому файл є навіть без монорепо (`packages: ['.']`).
+  Головне, що воно дає: `minimumReleaseAge` (7-денний карантин на свіжі версії)
+  і `strictDepBuilds` — install падає, якщо у якоїсь залежності зʼявився
+  `postinstall`, поки його не внесли в `allowBuilds` свідомо.
+* **`allowBuilds` порожній НЕ від ліні.** У дереві цього проєкту жоден пакет не
+  має install-скрипта (`grep -c 'requiresBuild: true' pnpm-lock.yaml` → 0).
+  Записувати туди `msw`, `sharp`, `@parcel/watcher` наперед означало б дозволити
+  виконання коду, якого тут немає. Що додасться далі — перелічено коментарями в
+  самому `pnpm-workspace.yaml` (argon2 на #24, sharp на #26).
+* **`@nestjs/* 11.2.1`, а не `11.2.3`.** Карантин відхилив 11.2.3 як
+  опубліковану 6 днів тому. Це не обхід політики, а її робота: pnpm сам вибрав
+  найновішу зрілу версію з діапазону `^11`, після чого її запінили точно.
 * **`ts-node`, ніколи `tsx`.** esbuild викидає `emitDecoratorMetadata`, і DI
   Nest перестає бачити типи конструктора.
 * **Сховище ключів у памʼяті** не переживає рестарт — після нього той самий ключ
