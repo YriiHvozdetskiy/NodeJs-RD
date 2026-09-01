@@ -1,0 +1,39 @@
+# Локальна інфраструктура курсового проєкту. Поки що — лише Postgres:
+# застосунок на цьому етапі зручніше тримати на хості (`npm run start`),
+# бо ротація перевіряється через uptime процесу, а не контейнера.
+name: marketplace
+
+services:
+  db:
+    image: postgres:17-alpine
+    # Порт відкритий лише на loopback: база має бути доступна з хоста
+    # (застосунок запущений там), але не з мережі.
+    ports:
+      - '127.0.0.1:5432:5432'
+    environment:
+      # Адміністратор потрібен рівно для двох речей: ініціалізації та
+      # `ALTER ROLE` у rotate.sh. Застосунок ним НЕ ходить — він ходить
+      # роллю app_user, пароль якої лежить у файлі-секреті.
+      #
+      # Значення зашите у файл свідомо: це bootstrap-пароль локального
+      # контейнера, який живе рівно до `docker compose down -v` і нікуди за
+      # межі машини не їде. Секрет, який має ротуватись, — інший, і саме тому
+      # він тут не написаний.
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin-bootstrap-only
+      POSTGRES_DB: marketplace
+    volumes:
+      # Іменований том: без нього дані живуть у шарі контейнера і зникають
+      # разом із `docker compose down`.
+      - pgdata:/var/lib/postgresql/data
+      # Виконається РІВНО ОДИН РАЗ — при першій ініціалізації порожнього тому.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U admin -d marketplace']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+volumes:
+  pgdata:
