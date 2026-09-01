@@ -42,6 +42,8 @@ docker compose exec -T db psql -U admin -d marketplace -tA \
   -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '${DB_ROLE}';"
 
 echo
-echo "Готово: новий пароль ${NEW_PASSWORD:0:6}… уже і в БД, і у файлі."
+# У stdout НЕМАЄ жодного байта нового пароля — навіть префікса. Логи CI
+# зберігаються вічно, і «перші 6 символів» — це вже залишок секрета.
+echo "Готово: новий пароль уже і в БД, і у файлі ${SECRET_FILE}."
 echo "Застосунок НЕ рестартував — перевір, що uptime не обнулився:"
 echo "  curl -s localhost:3000/health/db"
