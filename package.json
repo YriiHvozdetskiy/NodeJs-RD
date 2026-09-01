@@ -2,7 +2,7 @@
   "name": "marketplace-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні (варіант Б).",
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту.",
   "engines": {
     "node": ">=20"
   },
@@ -13,21 +13,30 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint:spec": "redocly lint openapi/openapi.yaml",
     "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
-    "check:scope": "redocly bundle openapi/openapi.yaml -o spec.json && node scripts/check-scope.js"
+    "check:scope": "redocly bundle openapi/openapi.yaml -o spec.json && node scripts/check-scope.js",
+    "check:env": "tsc -p tsconfig.json && node scripts/check-env-example.mjs",
+    "db:up": "bash scripts/db-up.sh",
+    "db:down": "docker compose down",
+    "rotate": "bash rotate.sh"
   },
   "dependencies": {
     "@nestjs/common": "11.2.1",
+    "@nestjs/config": "4.0.4",
     "@nestjs/core": "11.2.1",
     "@nestjs/platform-express": "11.2.1",
     "express": "5.2.1",
     "express-openapi-validator": "5.6.2",
+    "pg": "8.23.0",
     "reflect-metadata": "0.2.2",
-    "rxjs": "7.8.2"
+    "rxjs": "7.8.2",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@redocly/cli": "2.46.0",
     "@types/express": "5.0.6",
     "@types/node": "22.20.1",
+    "@types/pg": "8.23.1",
+    "dotenv": "17.4.2",
     "ts-node": "10.9.2",
     "typescript": "5.9.3"
   }

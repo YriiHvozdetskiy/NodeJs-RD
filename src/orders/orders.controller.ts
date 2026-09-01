@@ -11,26 +11,31 @@ import {
   Query,
   Res,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
 import { OrdersService, type CreateOrderItem, type Order } from './orders.service';
 import { IdempotencyService } from './idempotency.service';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
-
-/** DRIFT=1 — «невинний рефакторинг»: camelCase замість snake_case, currency
- *  загубили, спеку не чіпали. Рівно те, що на лекції ловив contract/check.mjs. */
-function view(order: Order): unknown {
-  if (process.env.DRIFT !== '1') return order;
-  const { total_cents, currency, ...rest } = order;
-  return { ...rest, totalCents: total_cents };
-}
+import type { Env } from '../config/env.schema';
 
 @Controller('orders')
 export class OrdersController {
   constructor(
     private readonly orders: OrdersService,
     private readonly idempotency: IdempotencyService<Order>,
+    private readonly config: ConfigService<Env, true>,
   ) {}
+
+  /** DRIFT=1 — «невинний рефакторинг»: camelCase замість snake_case, currency
+   *  загубили, спеку не чіпали. Рівно те, що на лекції ловив contract/check.mjs.
+   *  Прапорець приходить із провалідованого конфігу, а не з сирого оточення:
+   *  схема вже перетворила рядок "1" на boolean, і робити це вдруге тут нічим. */
+  private view(order: Order): unknown {
+    if (!this.config.get('DRIFT', { infer: true })) return order;
+    const { total_cents, currency, ...rest } = order;
+    return { ...rest, totalCents: total_cents };
+  }
 
   @Get()
   list(
@@ -38,14 +43,14 @@ export class OrdersController {
     @Query('cursor') cursor?: string,
   ): Page<unknown> {
     const page = this.orders.page(limit, cursor);
-    return { ...page, items: page.items.map(view) };
+    return { ...page, items: page.items.map((order) => this.view(order)) };
   }
 
   @Get(':orderId')
   one(@Param('orderId', ParseIntPipe) orderId: number): unknown {
     const order = this.orders.find(orderId);
     if (!order) throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
-    return view(order);
+    return this.view(order);
   }
 
   /**
@@ -75,7 +80,7 @@ export class OrdersController {
         const stored = entry!.response!;
         res.setHeader('Idempotency-Replay', 'true');
         res.setHeader('Location', `/v1/orders/${stored.id}`);
-        return view(stored);
+        return this.view(stored);
       }
     }
 
@@ -85,13 +90,13 @@ export class OrdersController {
       // віддає event loop, і саме в цьому вікні другий запит із тим самим
       // ключем бачить стан 'in-flight'. Без затримки гілка 409 недосяжна
       // фізично — синхронний обробник ніколи не переривається.
-      const delay = Number(process.env.SLOW_MS ?? 0);
+      const delay = this.config.get('SLOW_MS', { infer: true });
       if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 
       const order = this.orders.create(body.items);
       this.idempotency.markDone(key, fingerprint, order);
       res.setHeader('Location', `/v1/orders/${order.id}`);
-      return view(order);
+      return this.view(order);
     } catch (err) {
       this.idempotency.forget(key);
       throw err;
