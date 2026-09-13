@@ -29,6 +29,9 @@ services:
       - pgdata:/var/lib/postgresql/data
       # Виконається РІВНО ОДИН РАЗ — при першій ініціалізації порожнього тому.
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Уся тека db/ видима всередині контейнера як /db: schema.sql, seed.sql,
+      # indexes.sql і queries/ запускаються через `psql -f /db/…` без копіювання.
+      - ./db:/db:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U admin -d marketplace']
       interval: 2s
