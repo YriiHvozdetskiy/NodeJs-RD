@@ -2,7 +2,7 @@
   "name": "marketplace-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту.",
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу.",
   "engines": {
     "node": ">=20"
   },
@@ -17,6 +17,8 @@
     "check:env": "tsc -p tsconfig.json && node scripts/check-env-example.mjs",
     "db:up": "bash scripts/db-up.sh",
     "db:down": "docker compose down",
+    "db:psql": "docker compose exec -w / db psql -U admin -d marketplace",
+    "db:bench": "bash scripts/db-bench.sh",
     "rotate": "bash rotate.sh"
   },
   "dependencies": {
