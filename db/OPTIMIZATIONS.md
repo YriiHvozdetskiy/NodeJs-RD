@@ -1,19 +1,37 @@
 # Оптимізація запитів: EXPLAIN до і після
 
-Середовище: PostgreSQL 17.11 (`postgres:17-alpine`, aarch64), Docker Desktop на
-Apple Silicon. Усі плани з одного прогону `scripts/db-bench.sh` на чистому томі
-в тому самому порядку, що й у грейдера: `schema.sql` → `seed.sql` → EXPLAIN «до»
-→ `indexes.sql` → `ANALYZE` → EXPLAIN «після». Для «після» кожен запит виконано
+Середовище — те, що віддав сам сервер на прогоні 2026-09-17, а не тег образу:
+
+```
+PostgreSQL 17.11 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+```
+
+Docker Desktop на Apple Silicon. `postgres:17-alpine` у `docker-compose.yml` —
+**плаваючий тег**: на іншій машині або через місяць той самий рядок дає інший
+патч — 17.9 замість 17.11, — тому число вище описує цей прогін, а не проєкт.
+`scripts/db-bench.sh` друкує `SELECT version()` у `version.txt` поруч із
+планами: рядок у шапці копіюється звідти, а не пишеться руками.
+
+Усі плани з одного прогону `scripts/db-bench.sh` на чистому томі в тому самому
+порядку, що й у грейдера: `schema.sql` → `seed.sql` → EXPLAIN «до» →
+`indexes.sql` → `ANALYZE` → EXPLAIN «після». Для «після» кожен запит виконано
 тричі й узято третій план: перший після `CREATE INDEX` іде по холодному кешу.
 
-Обсяг після `seed.sql`:
+Обсяг після `seed.sql` (~30 с):
 
-| Таблиця | Рядків | Heap | Перекіс |
+| Таблиця | Рядків | Heap | Перекіс і призначення |
 | --- | --- | --- | --- |
 | `orders` | 200 000 | 25 MB | статуси paid 90.0 % · pending 6.0 % · cancelled 4.0 %; регіони UA 80 % · EU 12 % · US 6 % · CN 2 % |
 | `products` | 120 000 | 91 MB | 40 іменників × 20 прикметників українською; q4 знаходить 149 рядків = 0.12 % |
+| `order_items` | 385 325 | 22 MB | половина замовлень з однією позицією, максимум чотири; 3 683 позиції з акцією |
+| `payments` | 179 958 | 19 MB | 1:1 з оплаченим замовленням |
+| `points_entries` | 179 091 | 16 MB | нарахування за оплачене замовлення, база — позиції без акції |
 | `users` | 50 000 | 6.9 MB | 5 admin · 2 000 seller · решта buyer; email у трьох варіантах регістру |
-| `order_items` | 386 399 | | половина замовлень з однією позицією, максимум чотири |
+| `promotions` | 12 040 | 1.5 MB | 12 000 на товари (60 % seasonal / 40 % quantity_tier) + 40 промокодів; 13 603 замовлення з кодом |
+
+Три останні таблиці планам q1–q4 не потрібні й жодного індексу не мають. Вони
+в сіді, щоб під обсягом були перевірені **всі десять** `FOREIGN KEY`: порожня
+таблиця не доводить нічого про зв'язок, який на неї посилається.
 
 Як читати плани. `Buffers: shared hit` — скільки сторінок по 8 КБ запит підняв
 із кешу, `read` — скільки довелось читати з диска. Мілісекунди залежать від
@@ -37,47 +55,47 @@ LIMIT 20
 ### До
 
 ```
- Limit  (cost=5809.88..5809.88 rows=2 width=33) (actual time=7.470..9.067 rows=4 loops=1)
-   Buffers: shared hit=3149
-   ->  Sort  (cost=5809.88..5809.88 rows=2 width=33) (actual time=7.469..9.064 rows=4 loops=1)
+ Limit  (cost=5822.88..5822.88 rows=2 width=33) (actual time=8.834..11.292 rows=2 loops=1)
+   Buffers: shared hit=3162
+   ->  Sort  (cost=5822.88..5822.88 rows=2 width=33) (actual time=8.833..11.290 rows=2 loops=1)
          Sort Key: created_at DESC, id DESC
          Sort Method: quicksort  Memory: 25kB
-         Buffers: shared hit=3149
-         ->  Gather  (cost=1000.00..5809.87 rows=2 width=33) (actual time=1.134..9.036 rows=4 loops=1)
+         Buffers: shared hit=3162
+         ->  Gather  (cost=1000.00..5822.87 rows=2 width=33) (actual time=3.961..11.263 rows=2 loops=1)
                Workers Planned: 2
                Workers Launched: 2
-               Buffers: shared hit=3143
-               ->  Parallel Seq Scan on orders  (cost=0.00..4809.67 rows=1 width=33) (actual time=2.022..5.615 rows=1 loops=3)
+               Buffers: shared hit=3156
+               ->  Parallel Seq Scan on orders  (cost=0.00..4822.67 rows=1 width=33) (actual time=4.457..6.824 rows=1 loops=3)
                      Filter: ((buyer_id = 137) AND (created_at >= (now() - '180 days'::interval)))
-                     Rows Removed by Filter: 66665
-                     Buffers: shared hit=3143
+                     Rows Removed by Filter: 66666
+                     Buffers: shared hit=3156
  Planning:
-   Buffers: shared hit=100 read=1 written=1
- Planning Time: 0.395 ms
- Execution Time: 9.107 ms
+   Buffers: shared hit=107
+ Planning Time: 0.402 ms
+ Execution Time: 11.335 ms
 ```
 
 ### Після
 
 ```
- Limit  (cost=0.42..12.46 rows=2 width=33) (actual time=0.032..0.046 rows=4 loops=1)
-   Buffers: shared hit=11
-   ->  Index Scan Backward using idx_orders_buyer_created on orders  (cost=0.42..12.46 rows=2 width=33) (actual time=0.031..0.044 rows=4 loops=1)
+ Limit  (cost=0.42..12.46 rows=2 width=33) (actual time=0.027..0.034 rows=2 loops=1)
+   Buffers: shared hit=9
+   ->  Index Scan Backward using idx_orders_buyer_created on orders  (cost=0.42..12.46 rows=2 width=33) (actual time=0.026..0.033 rows=2 loops=1)
          Index Cond: ((buyer_id = 137) AND (created_at >= (now() - '180 days'::interval)))
-         Buffers: shared hit=11
+         Buffers: shared hit=9
  Planning:
    Buffers: shared hit=141
- Planning Time: 0.515 ms
- Execution Time: 0.078 ms
+ Planning Time: 0.521 ms
+ Execution Time: 0.066 ms
 ```
 
 Індекс `idx_orders_buyer_created` `(buyer_id, created_at, id)` став вузлом
-`Index Scan Backward`. «До» три процеси читали всі 3 143 сторінки таблиці й
-відкидали по 66 665 рядків кожен, щоб лишити чотири; «після» обидві умови
-пішли в `Index Cond`, і запит торкнувся 11 сторінок. Зникли `Gather`, воркери
-й `Sort`: індекс уже впорядкований по `(created_at, id)` усередині одного
+`Index Scan Backward`. «До» три процеси читали всі 3 156 сторінок таблиці й
+відкидали по 66 666 рядків кожен, щоб лишити два; «після» обидві умови пішли
+в `Index Cond`, і запит торкнувся 9 сторінок. Зникли `Gather`, воркери й
+`Sort`: індекс уже впорядкований по `(created_at, id)` усередині одного
 `buyer_id`, тож читання задом наперед віддає рядки в порядку `ORDER BY`, і
-`LIMIT` зупиняє його після четвертого. Buffers 3 149 → 11, час 9.1 → 0.08 мс.
+`LIMIT` зупиняє його на другому. Buffers 3 162 → 9, час 11.3 → 0.07 мс.
 
 ## q2 — черга «зависших» pending
 
@@ -96,51 +114,51 @@ LIMIT 100
 ### До
 
 ```
- Limit  (cost=5995.47..6007.14 rows=100 width=32) (actual time=8.652..10.640 rows=100 loops=1)
-   Buffers: shared hit=3217
-   ->  Gather Merge  (cost=5995.47..7129.79 rows=9722 width=32) (actual time=8.651..10.631 rows=100 loops=1)
+ Limit  (cost=6018.45..6030.12 rows=100 width=32) (actual time=9.319..12.117 rows=100 loops=1)
+   Buffers: shared hit=3230
+   ->  Gather Merge  (cost=6018.45..7213.67 rows=10244 width=32) (actual time=9.318..12.098 rows=100 loops=1)
          Workers Planned: 2
          Workers Launched: 2
-         Buffers: shared hit=3217
-         ->  Sort  (cost=4995.45..5007.60 rows=4861 width=32) (actual time=6.914..6.919 rows=82 loops=3)
+         Buffers: shared hit=3230
+         ->  Sort  (cost=5018.43..5031.23 rows=5122 width=32) (actual time=7.360..7.368 rows=83 loops=3)
                Sort Key: created_at
-               Sort Method: top-N heapsort  Memory: 36kB
-               Buffers: shared hit=3217
-               Worker 0:  Sort Method: top-N heapsort  Memory: 37kB
+               Sort Method: top-N heapsort  Memory: 37kB
+               Buffers: shared hit=3230
+               Worker 0:  Sort Method: top-N heapsort  Memory: 36kB
                Worker 1:  Sort Method: top-N heapsort  Memory: 36kB
-               ->  Parallel Seq Scan on orders  (cost=0.00..4809.67 rows=4861 width=32) (actual time=0.007..6.386 rows=3994 loops=3)
+               ->  Parallel Seq Scan on orders  (cost=0.00..4822.67 rows=5122 width=32) (actual time=0.008..6.804 rows=3996 loops=3)
                      Filter: ((status = 'pending'::text) AND (created_at < (now() - '00:15:00'::interval)))
-                     Rows Removed by Filter: 62673
-                     Buffers: shared hit=3143
+                     Rows Removed by Filter: 62671
+                     Buffers: shared hit=3156
  Planning:
    Buffers: shared hit=92
- Planning Time: 0.355 ms
- Execution Time: 10.693 ms
+ Planning Time: 0.400 ms
+ Execution Time: 12.176 ms
 ```
 
 ### Після
 
 ```
- Limit  (cost=0.29..107.75 rows=100 width=32) (actual time=0.024..0.333 rows=100 loops=1)
+ Limit  (cost=0.29..109.26 rows=100 width=32) (actual time=0.022..0.367 rows=100 loops=1)
    Buffers: shared hit=102
-   ->  Index Scan using idx_orders_pending_created on orders  (cost=0.29..12922.73 rows=12025 width=32) (actual time=0.023..0.324 rows=100 loops=1)
+   ->  Index Scan using idx_orders_pending_created on orders  (cost=0.29..12972.58 rows=11905 width=32) (actual time=0.021..0.358 rows=100 loops=1)
          Index Cond: (created_at < (now() - '00:15:00'::interval))
          Buffers: shared hit=102
  Planning:
    Buffers: shared hit=132
- Planning Time: 0.475 ms
- Execution Time: 0.368 ms
+ Planning Time: 0.484 ms
+ Execution Time: 0.415 ms
 ```
 
 Partial-індекс `idx_orders_pending_created` `(created_at) WHERE status = 'pending'`
 став вузлом `Index Scan`. В `Index Cond` лишилась тільки умова по `created_at`:
 `status = 'pending'` планер довів із предиката індексу й більше не перевіряє
 на кожному рядку. Індекс упорядкований по `created_at`, тож `Sort` зник, а
-`LIMIT 100` зупинив читання після 100 рядків: 102 сторінки замість 3 217 і
+`LIMIT 100` зупинив читання після 100 рядків: 102 сторінки замість 3 230 і
 трьох паралельних сортувань. Ціна індексу — 280 кБ на 12 тисяч pending-рядків;
 повний індекс по `created_at` на всі 200 тисяч важив би близько 5.4 МБ
 (стільки займає `orders_pkey` з ключем того самого розміру), тобто в ~20 разів
-більше заради рядків, які запит не читає. Buffers 3 217 → 102, час 10.7 → 0.37 мс.
+більше заради рядків, які запит не читає. Buffers 3 230 → 102, час 12.2 → 0.42 мс.
 
 ## q3 — логін без урахування регістру
 
@@ -157,14 +175,14 @@ WHERE lower(email) = lower('User31337@Example.com')
 ### До
 
 ```
- Seq Scan on users  (cost=0.00..1613.00 rows=250 width=43) (actual time=9.759..15.679 rows=1 loops=1)
+ Seq Scan on users  (cost=0.00..1613.00 rows=250 width=43) (actual time=7.437..13.911 rows=1 loops=1)
    Filter: (lower(email) = 'user31337@example.com'::text)
    Rows Removed by Filter: 49999
-   Buffers: shared read=863 written=468
+   Buffers: shared hit=861 read=2
  Planning:
-   Buffers: shared hit=87
- Planning Time: 0.334 ms
- Execution Time: 15.718 ms
+   Buffers: shared hit=91
+ Planning Time: 0.385 ms
+ Execution Time: 13.939 ms
 ```
 
 ### Після
@@ -175,8 +193,8 @@ WHERE lower(email) = lower('User31337@Example.com')
    Buffers: shared hit=4
  Planning:
    Buffers: shared hit=107
- Planning Time: 0.443 ms
- Execution Time: 0.050 ms
+ Planning Time: 0.493 ms
+ Execution Time: 0.054 ms
 ```
 
 Expression-індекс `idx_users_email_lower` `((lower(email)))` став вузлом
@@ -186,7 +204,7 @@ Expression-індекс `idx_users_email_lower` `((lower(email)))` став ву
 немає. Після `CREATE INDEX` + `ANALYZE` статистика по виразу з'явилась разом з
 індексом (`rows=1`), і шлях став: корінь → лист → одна сторінка heap, 4 buffers.
 `UNIQUE (email)` зі схеми тут не допоміг би нічим: він по `email`, а не по
-`lower(email)`. Buffers 863 → 4, час 15.7 → 0.05 мс.
+`lower(email)`. Buffers 863 → 4, час 13.9 → 0.05 мс.
 
 ## q4 — пошук по каталогу
 
@@ -205,42 +223,42 @@ LIMIT 20
 ### До
 
 ```
- Limit  (cost=13174.19..13174.24 rows=20 width=64) (actual time=32.035..32.038 rows=20 loops=1)
-   Buffers: shared hit=8204 read=3475
-   ->  Sort  (cost=13174.19..13174.30 rows=41 width=64) (actual time=32.034..32.035 rows=20 loops=1)
+ Limit  (cost=13174.13..13174.18 rows=20 width=64) (actual time=38.788..38.791 rows=20 loops=1)
+   Buffers: shared hit=1561 read=10118
+   ->  Sort  (cost=13174.13..13174.23 rows=39 width=64) (actual time=38.786..38.788 rows=20 loops=1)
          Sort Key: (ts_rank(search_vector, '''шкіряні'' & ''кросівки'''::tsquery)) DESC, id
          Sort Method: top-N heapsort  Memory: 27kB
-         Buffers: shared hit=8204 read=3475
-         ->  Seq Scan on products  (cost=0.00..13173.10 rows=41 width=64) (actual time=1.284..31.965 rows=149 loops=1)
+         Buffers: shared hit=1561 read=10118
+         ->  Seq Scan on products  (cost=0.00..13173.10 rows=39 width=64) (actual time=2.961..38.684 rows=149 loops=1)
                Filter: (search_vector @@ '''шкіряні'' & ''кросівки'''::tsquery)
                Rows Removed by Filter: 119851
-               Buffers: shared hit=8198 read=3475
+               Buffers: shared hit=1555 read=10118
  Planning:
-   Buffers: shared hit=113 read=15
- Planning Time: 0.659 ms
- Execution Time: 32.077 ms
+   Buffers: shared hit=125 read=5
+ Planning Time: 0.747 ms
+ Execution Time: 38.832 ms
 ```
 
 ### Після
 
 ```
- Limit  (cost=176.37..176.42 rows=20 width=64) (actual time=0.644..0.647 rows=20 loops=1)
+ Limit  (cost=176.37..176.42 rows=20 width=64) (actual time=0.478..0.480 rows=20 loops=1)
    Buffers: shared hit=161
-   ->  Sort  (cost=176.37..176.47 rows=40 width=64) (actual time=0.643..0.644 rows=20 loops=1)
+   ->  Sort  (cost=176.37..176.47 rows=40 width=64) (actual time=0.477..0.478 rows=20 loops=1)
          Sort Key: (ts_rank(search_vector, '''шкіряні'' & ''кросівки'''::tsquery)) DESC, id
          Sort Method: top-N heapsort  Memory: 27kB
          Buffers: shared hit=161
-         ->  Bitmap Heap Scan on products  (cost=21.73..175.30 rows=40 width=64) (actual time=0.187..0.600 rows=149 loops=1)
+         ->  Bitmap Heap Scan on products  (cost=21.73..175.31 rows=40 width=64) (actual time=0.188..0.430 rows=149 loops=1)
                Recheck Cond: (search_vector @@ '''шкіряні'' & ''кросівки'''::tsquery)
                Heap Blocks: exact=148
                Buffers: shared hit=155
-               ->  Bitmap Index Scan on idx_products_search_vector  (cost=0.00..21.72 rows=40 width=0) (actual time=0.167..0.167 rows=149 loops=1)
+               ->  Bitmap Index Scan on idx_products_search_vector  (cost=0.00..21.72 rows=40 width=0) (actual time=0.171..0.171 rows=149 loops=1)
                      Index Cond: (search_vector @@ '''шкіряні'' & ''кросівки'''::tsquery)
                      Buffers: shared hit=7
  Planning:
    Buffers: shared hit=153
- Planning Time: 0.671 ms
- Execution Time: 0.717 ms
+ Planning Time: 0.678 ms
+ Execution Time: 0.527 ms
 ```
 
 GIN-індекс `idx_products_search_vector` став вузлом `Bitmap Index Scan`. «До»
@@ -254,7 +272,7 @@ exact=148`, товари розкидані по таблиці, тому май
 й не подінеться: індекс уміє відповісти «які рядки», але не «в якому порядку
 за релевантністю»; на 149 рядках це дешево, на 30 % каталогу було б дорого, і
 саме тому слова запиту підібрані так, щоб збігів було 0.12 %. Buffers
-11 679 → 161, час 32 → 0.7 мс.
+11 679 → 161, час 38.8 → 0.53 мс.
 
 ## Ціна tsvector-колонки
 

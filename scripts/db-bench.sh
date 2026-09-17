@@ -17,6 +17,11 @@ echo "== чистий том"
 docker compose down -v
 bash scripts/db-up.sh
 
+# Версію беремо з самого сервера, а не з тегу образу: postgres:17-alpine —
+# плаваючий тег, і на іншій машині той самий рядок у compose дає інший патч.
+# Саме цей рядок іде в шапку db/OPTIMIZATIONS.md.
+psql -Atc "SELECT version();" | tee "$OUT/version.txt"
+
 echo "== schema"
 psql -f db/schema.sql
 echo "== seed"
@@ -40,6 +45,10 @@ done
 
 echo "== мертві індекси (порожньо = добре)"
 psql -Atc "SELECT indexrelname FROM pg_stat_user_indexes WHERE schemaname='public' AND idx_scan = 0 AND indexrelid NOT IN (SELECT conindid FROM pg_constraint WHERE conindid <> 0);" | tee "$OUT/dead-indexes.txt"
+
+echo "== обсяг і розміри (для шапки звіту)"
+psql -c "SELECT relname, n_live_tup AS rows, pg_size_pretty(pg_relation_size(relid)) AS heap
+         FROM pg_stat_user_tables ORDER BY relname;" | tee "$OUT/volume.txt"
 
 echo "== морфологія"
 psql -Atc "SELECT 'кросівки', count(*) FROM products WHERE search_vector @@ plainto_tsquery('simple', 'кросівки')
