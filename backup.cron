@@ -1,0 +1,12 @@
+# Щонічний логічний бекап бази курсового. RPO такого розкладу — до 24 годин.
+#
+# Встановлення (додає рядок до наявного crontab, а не замінює його; шлях до
+# клону підставляє sed):
+#   (crontab -l 2>/dev/null; sed "s#/srv/marketplace#$PWD#" backup.cron | grep -v '^#') | crontab -
+#
+# cron стартує з мінімальним PATH (/usr/bin:/bin), де немає docker, тому PATH
+# задано явно. Час — за годинником системи, на якій працює cron.
+PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
+
+# хв  год  день  міс  дн.тижня  команда
+0     3    *     *    *         cd /srv/marketplace && mkdir -p backups && bash scripts/with-secrets.sh dev bash scripts/backup.sh >> backups/backup.log 2>&1
