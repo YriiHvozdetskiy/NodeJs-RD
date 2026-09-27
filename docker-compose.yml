@@ -11,18 +11,19 @@ services:
     ports:
       - '127.0.0.1:5432:5432'
     environment:
-      # Адміністратор потрібен рівно для двох речей: ініціалізації та
-      # `ALTER ROLE` у rotate.sh. Застосунок ним НЕ ходить — він ходить
-      # роллю app_user, пароль якої лежить у файлі-секреті.
+      # Адміністратор (власник схеми) потрібен для ініціалізації, міграцій
+      # TypeORM і `ALTER ROLE` у rotate.sh. Застосунок ним НЕ ходить — він
+      # ходить роллю app_user, пароль якої лежить у файлі-секреті.
       #
-      # Пароль приходить ФАЙЛОМ, не значенням: офіційний образ читає
-      # POSTGRES_PASSWORD_FILE при першій ініціалізації тому. У git лежить
-      # лише шлях; сам файл генерує scripts/db-up.sh у гітігнорному secrets/.
+      # Пароль адміна — дев-креденшел, а не секрет: порт відкритий лише на
+      # loopback, і свіжий клон має підніматися голим `docker compose up`,
+      # без жодного файла поза git. Дефолт працює рівно там, де PG_ADMIN_PASSWORD
+      # не задано (свіжий клон, CI); scripts/db-up.sh задає його зі
+      # згенерованого secrets/pg_admin_password, тож на робочій машині
+      # дефолт не використовується.
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD_FILE: /run/secrets/pg_admin_password
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:-marketplace-dev}
       POSTGRES_DB: marketplace
-    secrets:
-      - pg_admin_password
     volumes:
       # Іменований том: без нього дані живуть у шарі контейнера і зникають
       # разом із `docker compose down`.
@@ -42,10 +43,3 @@ services:
 volumes:
   pgdata:
 
-secrets:
-  # File-based secret: compose монтує вміст у /run/secrets/pg_admin_password
-  # усередині контейнера. Файл створює scripts/db-up.sh; без нього голий
-  # `docker compose up` впаде з зрозумілою помилкою про відсутній файл —
-  # це fail-fast, а не незручність.
-  pg_admin_password:
-    file: ./secrets/pg_admin_password

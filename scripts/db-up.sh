@@ -6,14 +6,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 APP_SECRET_FILE="${DB_PASSWORD_FILE:-./secrets/db_password}"
 ADMIN_SECRET_FILE='./secrets/pg_admin_password'
 
-# Обидва паролі ГЕНЕРУЮТЬСЯ, а не зашиті. Хардкоду більше немає ніде:
+# На робочій машині обидва паролі ГЕНЕРУЮТЬСЯ:
 #   • app_user  — db/init.sql створює роль без пароля, значення ставить ALTER нижче;
-#   • admin     — compose віддає його Postgres'у файлом (POSTGRES_PASSWORD_FILE),
-#     тож у git лежить лише ім'я файла, не значення.
+#   • admin     — compose бере його з PG_ADMIN_PASSWORD, яку ми експортуємо з файла.
+#     Дев-дефолт із compose лишається тільки для свіжого клону без цього скрипта.
 mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 [ -f "${APP_SECRET_FILE}" ] || printf 'app-%s' "$(openssl rand -hex 16)" > "${APP_SECRET_FILE}"
 [ -f "${ADMIN_SECRET_FILE}" ] || printf 'admin-%s' "$(openssl rand -hex 16)" > "${ADMIN_SECRET_FILE}"
 
+PG_ADMIN_PASSWORD="$(cat "${ADMIN_SECRET_FILE}")"
+export PG_ADMIN_PASSWORD
 docker compose up -d --wait
 
 # Вирівнюємо паролі ролей зі вмістом файлів. Потрібно у двох випадках:
@@ -32,3 +34,4 @@ echo "Далі:"
 echo "  npm run start                       # застосунок на :3000"
 echo "  curl -s localhost:3000/health/db    # запит через пул"
 echo "  npm run rotate                      # ротація пароля без рестарту"
+echo "  npm run build && npm run migrate    # схема через міграції TypeORM"

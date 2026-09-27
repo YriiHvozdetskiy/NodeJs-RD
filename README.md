@@ -48,19 +48,19 @@ User      ─< Notification   (інфраструктурний запис, не
 | Сутність | Ключові поля | Чому вона в домені |
 | --- | --- | --- |
 | `User` | `id`, `email`, `password_hash`, `role`, `created_at` | три ролі з різними правами: buyer · seller · admin (#24) |
-| `Product` | `id`, `seller_id`, `category`, `title`, `price` `NUMERIC(12,2)`, `stock`, `rating_avg`, `rating_count`, `image_keys[]`, `created_at` | `stock` — те, за що конкурують (#14); фото в S3 (#26); картка товару — гаряче читання (#23) |
+| `Product` | `id`, `seller_id`, `category`, `title`, `price_cents` `integer`, `stock`, `rating_avg`, `rating_count`, `image_keys[]`, `created_at` | `stock` — те, за що конкурують (#14); фото в S3 (#26); картка товару — гаряче читання (#23) |
 | `Promotion` | `id`, `product_id`, `kind`, `code`, `percent_off`, `min_qty`, `region`, `starts_local`/`ends_local` + `timezone`, `starts_at`/`ends_at` `timestamptz` | ціна стає результатом правил на момент оформлення, а не властивістю товару. `kind`: `seasonal` · `quantity_tier` · `promo_code`. `region` — акція для одного регіону; `*_local` + `timezone` це те, що ввів продавець, `*_at` — та сама мить в абсолюті, по ній працюють запити |
-| `Order` | `id`, `buyer_id`, `device_id`, `region`, `status`, `subtotal`, `discount`, `total` (усі `NUMERIC(12,2)`), `currency`, `promo_code_id`, `points_spent`, `created_at` | точка входу транзакції (#14). Три суми, а не одна — щоб підсумок був прозорий. `points_spent` окремо від `discount`: бали не змінюють ціну, вони покривають частину суми до сплати — і не більше, ніж сума позицій без акції |
-| `OrderItem` (у складі `Order`) | `order_id`, `product_id`, `qty`, `unit_price`, `discount`, `promotion_id` | знімок ціни **і** скидки: ні новий цінник, ні закінчена акція історію не переписують. Із `promotion_id` виводиться й право на бали — акційна позиція їх не дає й не приймає |
-| `Payment` | `id`, `order_id`, `amount`, `status`, `provider_ref`, `created_at` | незворотний ефект → outbox + idempotency (#22) |
+| `Order` | `id`, `buyer_id`, `device_id`, `region`, `status`, `subtotal_cents`, `discount_cents`, `total_cents` (усі `integer`, копійки), `currency`, `promo_code_id`, `points_spent`, `created_at` | точка входу транзакції (#14). Три суми, а не одна — щоб підсумок був прозорий. `points_spent` окремо від `discount`: бали не змінюють ціну, вони покривають частину суми до сплати — і не більше, ніж сума позицій без акції |
+| `OrderItem` (у складі `Order`) | `order_id`, `product_id`, `qty`, `unit_price_cents`, `discount_cents`, `promotion_id` | знімок ціни **і** скидки: ні новий цінник, ні закінчена акція історію не переписують. Із `promotion_id` виводиться й право на бали — акційна позиція їх не дає й не приймає |
+| `Payment` | `id`, `order_id`, `amount_cents`, `status`, `provider_ref`, `created_at` | незворотний ефект → outbox + idempotency (#22) |
 | `PointsEntry` | `id`, `user_id`, `order_id`, `kind`, `amount` `integer`, `status`, `matures_at`, `created_at` | бонусні бали як **append-only журнал**, а не колонка-баланс: баланс = `SUM`. `kind`: `earned` · `spent`; `status`: `pending` → `available` → `spent`. `matures_at` — коли нарахування дозріває (#19 · #23). База нарахування — позиції замовлення **без** акції |
 
 Поза шісткою, як інфраструктура: `Notification` — запис про доставку сповіщення,
 і `outbox` (#22). Обидва це проєкція доменних подій, а не доменний стан, тому в
 домен я їх не рахую, хоч таблицями вони й будуть.
 
-Схема цих сутностей — `db/schema.sql`: сім таблиць, десять `FOREIGN KEY`,
-інваріанти в `CHECK`, а не в коді (`total = subtotal - discount`, промокод не
+Схема цих сутностей — сім таблиць, десять `FOREIGN KEY`, інваріанти в `CHECK`,
+а не в коді (`total_cents = subtotal_cents - discount_cents`, промокод не
 має товару, нарахування балів має дату дозрівання). `Product.seller_id` і
 `Order.buyer_id` в ній є з першого дня як `NOT NULL`: без власника не працює
 ані каталог продавця, ані «мої замовлення за період» (`db/queries/q1.sql`);
@@ -72,11 +72,13 @@ books`. `Promotion`, `Payment` і `PointsEntry` уже і в схемі, і в �
 `rating_avg` — денормалізований агрегат, а не `JOIN` по відгуках, і `NULL`,
 поки відгуків нема; сама сутність `Review` зʼявиться, коли буде кому їх писати.
 
-`openapi/openapi.yaml` — це контракт **v1**, знімок на момент ДЗ#9: гроші в
-ньому ще `*_cents` цілими копійками, і немає ні `category`, ні `region`, ні
-фільтрів каталогу. Дані там лежать у памʼяті, тож `NUMERIC` і decimal-рядки
-переїдуть у спеку разом зі схемою БД на #12–#13 — до того їм нема на що
-опертися.
+Від #13 схему веде TypeORM: entities у `src/entities/`, сама схема — міграція в
+`src/migrations/` (розділ 7). `db/schema.sql` лишається SQL-дизайном #12 і
+основою бенчмарку `EXPLAIN` (розділ 6).
+
+`openapi/openapi.yaml` — це контракт **v1**, знімок на момент ДЗ#9: немає ні
+`category`, ні `region`, ні фільтрів каталогу. Гроші в ньому — `*_cents` цілими
+копійками, і з #13 так само в БД, тож тут контракт і схема вже збігаються.
 
 ### Перевірка домену
 
@@ -111,7 +113,7 @@ books`. `Promotion`, `Payment` і `PointsEntry` уже і в схемі, і в �
 | **JWT + RBAC по `User.role`** | покупець бачить своє, продавець своє, адмін усе. Поки `security: []` у спеці документує, що авторизації немає **свідомо** | #24 |
 | **S3 + presigned URL** | фото товару не мають ходити через Node-процес | #26 |
 | **Keyset-пагінація з фільтрами** | фільтри її не ламають — ламає зміна `ORDER BY`, тому курсор носить відпечаток фільтрів і чужий відхиляє як `invalid-cursor`. Фільтри, індекси й SQL — у `docs/design-notes.md` | #12 · #13 |
-| **`NUMERIC(12,2)` для грошей** | ціни десяткові (`259.99`), арифметика через `decimal.js`, в API рядок. `float` не використовується ніде: `0.1 + 0.2` дає `0.30000000000000004`, і на кошику з 30 позицій це вже видима копійка. Політика округлення скидок — у `docs/design-notes.md` | #12 · #14 |
+| **Гроші — `integer` у копійках** | `259.99` грн зберігається як `25999`, в API — поле `*_cents`. Один тип від бази до JSON: `float` не зʼявляється ніде (`0.1 + 0.2` дає `0.30000000000000004`), а `numeric` драйвер `pg` віддав би рядком, і перший же `Number(row.total)` повернув би float назад. Знижки округлюються вниз до цілої копійки. Політика округлення — у `docs/design-notes.md` | #13 · #14 |
 | **Бали дозрівають відкладено** | нарахування за замовлення стає доступним через N днів, тож потрібна задача, що спрацює пізніше. Беру періодичний прохід по `(status, matures_at)`, а не відкладене повідомлення: стан живе в Postgres і не залежить від того, чи брокер його не втратив. Задача ідемпотентна через `UPDATE … WHERE status='pending'` | #19 · #23 |
 | **Регіональні акції** | регіон — це окремий рядок `Promotion` зі своїм вікном у своїй зоні, тож `ends_at` залишається однією абсолютною миттю, а запит — однією умовою. Ключ кешу отримує `region`: кілька значень, а не 38 таймзон | #12 · #23 |
 | **Docker → compose → K8s** | локально compose з Postgres і Redis, далі кластер | #28 |
@@ -125,10 +127,10 @@ books`. `Promotion`, `Payment` і `PointsEntry` уже і в схемі, і в �
   CRUD із полем `status`, і outbox не мав би що захищати.
 - **Доставки й логістики не буде.** Замовлення закінчується оплатою. Трекінг,
   склади й перевізники — це другий сервіс, і нового механізму він не приносить.
-- **Мультивалютності не буде, але ціни справжні десяткові.** Одна валюта,
-  `NUMERIC(12,2)` у БД, рядок `"259.99"` в API, `decimal.js` для арифметики.
-  `float` не використовую ніде — саме через нього ця тема й існує. Курси валют
-  на дату операції нічого не додають ні до транзакцій, ні до черг.
+- **Мультивалютності не буде.** Одна валюта, гроші цілими копійками в
+  `integer` — у БД і в API однаково. `float` не використовую ніде — саме через
+  нього ця тема й існує. Курси валют на дату операції нічого не додають ні до
+  транзакцій, ні до черг.
 - **Акцій три типи, і на цьому все.** Сезонна, за кількістю, промокод. Бандли й
   безкоштовна доставка від суми — ні: кожне це новий тип правила й нова гілка в
   розрахунку ціни, а сам механізм три наявні вже покривають повністю.
@@ -222,7 +224,7 @@ for f in $(git ls-files | grep -E '\.env($|\.)' | grep -vE '\.example$'); do gre
 | `.env.example` | так | контракт: усі змінні з коментарями, значення фейкові |
 | `.env` | **ні** (`.gitignore`) | реальні значення цієї машини |
 | `secrets/db_password` | **ні** (`.gitignore`) | пароль БД, який ротується |
-| `secrets/pg_admin_password` | **ні** (`.gitignore`) | пароль адміністратора Postgres; генерує `db-up.sh` |
+| `secrets/pg_admin_password` | **ні** (`.gitignore`) | пароль адміністратора Postgres на цій машині; генерує `db-up.sh` |
 
 `npm run check:env` звіряє `.env.example` зі схемою і падає з `exit 1`, якщо
 файл відстав: змінна є в схемі, але не у файлі — помилка; є у файлі, але не в
@@ -345,10 +347,13 @@ docker history --no-trunc marketplace-api | grep -i password   # порожнь�
 конфіг приходить у рантаймі: `docker run -e`, `env_file:` у compose або
 секрет-волюм від оркестратора.
 
-У git не лежить жоден пароль, включно з адміністраторським. Postgres отримує
-його файлом — `POSTGRES_PASSWORD_FILE: /run/secrets/pg_admin_password` через
-compose `secrets:` — а сам файл генерує `scripts/db-up.sh` у гітігнорному
-`secrets/`. Роль `app_user` у `db/init.sql` створюється взагалі без пароля
+Єдиний пароль у git — дев-дефолт адміністратора в `docker-compose.yml`
+(`${PG_ADMIN_PASSWORD:-marketplace-dev}`), і це свідомо. Порт відкритий лише на
+loopback, а свіжий клон мусить підніматися голим `docker compose up` без жодного
+файла поза git — інакше `compose secrets:` падає на відсутньому файлі ще до
+старту контейнера. На робочій машині дефолт не використовується: `db-up.sh`
+генерує `secrets/pg_admin_password` і передає його в compose через
+`PG_ADMIN_PASSWORD`. Роль `app_user` у `db/init.sql` створюється взагалі без пароля
 (логін неможливий), значення ставить той самий `db-up.sh` зі
 `secrets/db_password` — тож «дефолтного пароля» не існує ані секунди, і немає
 двох джерел, які могли б розійтись. `rotate.sh` пароль адміна не потребує:
@@ -361,12 +366,15 @@ compose `secrets:` — а сам файл генерує `scripts/db-up.sh` у �
 повернеться на `#28` (K8s Secrets) і `#31` (AWS Secrets Manager + KMS).
 Наступний крок драбинки, який тут навмисно не зроблений, — винести значення з
 машини у сховище (Infisical, Vault): тоді `.env` зникає взагалі, а секрети
-приїжджають у процес-нащадок зі сховища.
+приїжджають у процес-нащадок зі сховища. Місце для цього вже є:
+`scripts/with-secrets.sh` (розділ 7). Сьогодні вона читає `.env` і файл-секрет,
+після переїзду всередині стане `infisical run`, а npm-скрипти не зміняться.
 
 ## 6. Дата-шар
 
 Схема, seed на реальний обсяг, чотири повільні запити API й індекси рівно під
 них — усе в `db/`. Головна таблиця — **`orders`**, таблиця пошуку — **`products`**.
+Це SQL-дизайн і бенчмарк #12; робочу схему з #13 веде TypeORM — розділ 7.
 
 | Файл | Що робить |
 | --- | --- |
@@ -414,6 +422,204 @@ psql -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q1.sql)"    # після: I
 (покупець, код) не повторювалась: частковий унікальний індекс із
 `docs/design-notes.md` можна буде створити на #14 без чистки даних.
 
+## 7. ORM-шар (TypeORM)
+
+Схема з розділу 6 переїхала в код: сім entities, десять звʼязків і одна
+згенерована міграція замість `psql -f db/schema.sql`. Схему змінюють **тільки
+міграції**: `synchronize` у DataSource явно `false`, бо `true` на кожному старті
+підганяв би базу під класи й мовчки робив би `DROP COLUMN` разом із даними.
+
+| Файл | Що робить |
+| --- | --- |
+| `src/entities/` | `User` · `Product` · `Promotion` · `Order` · `OrderItem` · `Payment` · `PointsEntry`; типи, `nullable`, `CHECK`-и, імена обмежень і індекси — як у `db/schema.sql` + `db/indexes.sql` |
+| `src/migrations/…-InitSchema.ts` | згенерована `migration:generate` проти порожньої бази і дописана руками (нижче) |
+| `src/data-source.ts` | DataSource для CLI: `synchronize: false`, міграції з `dist/migrations`, усі параметри з `process.env` |
+| `src/seed.ts` + `src/seed-data.ts` | детермінований ідемпотентний seed |
+| `src/demo-nplus1.ts` | N+1 на графі order → items → product, лічильник запитів `src/query-count-logger.ts` |
+| `src/report.ts` | виторг по категоріях через `createQueryBuilder().getRawMany()` |
+| `scripts/with-secrets.sh` | кладе параметри підключення зі сховища #11 в оточення і робить `exec` команди |
+
+```bash
+npm run db:up && npm run build
+npm run migrate            # схема з нуля
+npm run migrate:show       # [X] 1 InitSchema…
+npm run migrate:revert     # down() зносить усе, що створив up()
+npm run seed               # другий запуск: «Seed уже застосовано»
+npm run demo:nplus1
+npm run report
+```
+
+### Гроші
+
+Усі суми — `integer` у копійках з суфіксом `_cents`: `products.price_cents`,
+`orders.subtotal_cents / discount_cents / total_cents`,
+`order_items.unit_price_cents / discount_cents`, `payments.amount_cents`. Межа
+`int4` — 21 474 836.47 грн на одну суму, для одного замовлення маркетплейса з
+запасом. Не гроші лишились десятковими: `rating_avg numeric(3,2)` і
+`percent_off numeric(5,2)`. Бали (`points_entries.amount`, `orders.points_spent`)
+— ціле число балів, не копійки.
+
+### Звідки підключення
+
+`data-source.ts` не має жодного значення за замовчуванням і не читає жодного
+файла: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` приходять з
+оточення, а без будь-якої з них процес падає одразу з її назвою. Оточення
+наповнює `scripts/with-secrets.sh dev …`, і нею починається кожен npm-скрипт, що
+ходить у базу. Обгортка бере адресу з `DB_URL` у `.env`, пароль — з
+`secrets/pg_admin_password`, і робить `exec`: секрет живе лише в оточенні
+процесу-нащадка, не в аргументах команди й не в історії shell.
+
+Міграції й seed ходять власником схеми `admin`, а не `app_user`: з Postgres 15
+у звичайної ролі немає `CREATE` на `schema public`. Застосунок, як і раніше,
+ходить `app_user` через `DatabaseService` — з ротацією пароля без рестарту.
+CLI-скрипти одноразові, тож пароль, прочитаний на старті, їм достатній.
+
+`SKIP_VAULT=1` пропускає сховище: значення вже в оточенні, як у CI, де секрети
+підкладає runner. Перевірка стоїть після того, як `dev` відрізано від
+аргументів, і до першого звернення до сховища.
+
+### Звʼязки й `onDelete`
+
+Правило одне: **історію захищає `RESTRICT`, частина агрегату йде за батьком
+через `CASCADE`.**
+
+| FK | `onDelete` | Чому |
+| --- | --- | --- |
+| `order_items.order_id → orders` | `CASCADE` | позиція — частина агрегату `Order`, без замовлення вона не має сенсу |
+| `promotions.product_id → products` | `CASCADE` | акція на товар без товару нічого не означає |
+| `order_items.product_id → products` | `RESTRICT` | товар, який хтось купив, не видалити — зник би рядок із чужої історії покупок |
+| `order_items.promotion_id`, `orders.promo_code_id → promotions` | `RESTRICT` | використана акція — доказ знижки в минулому замовленні |
+| `orders.buyer_id`, `products.seller_id`, `points_entries.user_id → users` | `RESTRICT` | користувача з історією не видалити; видалення акаунта — окремий сценарій (анонімізація), а не каскад |
+| `payments.order_id → orders` (`@OneToOne`) | `RESTRICT` | платіж — незворотна подія з грошима |
+| `points_entries.order_id → orders` | `RESTRICT` | замовлення — підстава нарахування балів у журналі |
+
+`Order ↔ Product` — M:N з даними на звʼязку (кількість, ціна й знижка на
+момент покупки), тому це явна join-entity `OrderItem` з PK `(order_id,
+product_id)`, а не `@ManyToMany`: у його безіменну таблицю ці колонки не
+покласти.
+
+### Що в міграції дописано руками
+
+Генератор знає лише те, що описано декораторами. Руками додано три речі, і
+кожна має пару в `down()`:
+
+- `idx_users_email_lower` — expression index по `lower(email)`: `@Index` уміє
+  лише колонки;
+- `idx_products_search_vector` — GIN по `tsvector`: `@Index` не має `USING`;
+- `GRANT` для `app_user` на сім таблиць і шість sequences — генератор не знає
+  про ролі. Перелік явний, а не `ALL TABLES`, щоб `app_user` не отримав
+  `DELETE` на службові `migrations` і `typeorm_metadata`. Обгорнуто в
+  перевірку існування ролі: на базі без `app_user` (testcontainers на #16)
+  міграція не падає.
+
+Обидва індекси оголошені в entity з `synchronize: false`: TypeORM знає, що вони
+існують, і не пропонує їх знести. Перевірка, що entities і міграція не
+розʼїхались, — повторний генератор після `migrate`:
+
+```bash
+npm run migrate:generate -- src/migrations/Drift
+# No changes in database schema were found - cannot generate a migration.
+```
+
+### Seed
+
+Сім таблиць, 61 рядок: 8 users · 10 products · 3 promotions (по одній кожного
+типу) · 10 orders · 18 order_items · 6 payments · 6 points_entries. Суми
+замовлень не вписані руками, а рахуються з позицій, тож `CHECK` на
+`total_cents` перевіряє арифметику самого сіду.
+
+Ідемпотентність — через фіксовані id і `INSERT … ON CONFLICT DO NOTHING`:
+повторний рядок бʼється об PK або UNIQUE і тихо пропускається. `repository.save()`
+тут не підходить: id — `GENERATED ALWAYS AS IDENTITY`, і Postgres відкидає явне
+значення без `OVERRIDING SYSTEM VALUE`, якого в TypeORM немає. Тому INSERT
+будується з метаданих entity (назви таблиць і колонок — з декораторів), а
+після нього `setval` зсуває лічильник identity за максимальний id, інакше
+перший `INSERT` застосунку отримав би `id = 1` і впав на PK. Уся заливка — одна
+транзакція.
+
+Перевірка, що другий запуск нічого не додав:
+
+```bash
+npm run seed && npm run seed
+docker compose exec -T db psql -U admin -d marketplace -c "
+  SELECT 'users' AS t, count(*) FROM users UNION ALL SELECT 'products', count(*) FROM products
+  UNION ALL SELECT 'promotions', count(*) FROM promotions UNION ALL SELECT 'orders', count(*) FROM orders
+  UNION ALL SELECT 'order_items', count(*) FROM order_items UNION ALL SELECT 'payments', count(*) FROM payments
+  UNION ALL SELECT 'points_entries', count(*) FROM points_entries;"
+# 8 · 10 · 3 · 10 · 18 · 6 · 6 — і після першого, і після другого запуску
+```
+
+### N+1: до і після
+
+Запит — «сторінка замовлень із позиціями й товарами», граф order → items →
+product (два рівні). Демо проганяє кожну стратегію на 5 і на 10 замовленнях і
+друкує кількість SQL-запитів із власного логера TypeORM (`logging: ['query']`):
+
+| Стратегія | N = 5 (7 позицій) | N = 10 (18 позицій) |
+| --- | --- | --- |
+| наївно: `find()` + запит на кожне замовлення + запит на кожну позицію | **13** | **29** |
+| `find({ relations: { items: { product: true } } })` | **1** | **1** |
+| `createQueryBuilder().leftJoinAndSelect(…)` | **1** | **1** |
+| `relationLoadStrategy: 'query'` | **4** | **4** |
+
+Наївний варіант — це 1 + N + (кількість позицій), тобто він росте з вибіркою.
+Фікси дають константу, яка від N не залежить. `query`-стратегія на цьому графі дає 4
+запити: `orders`, `order_items`, `products` і ще раз `order_items` — TypeORM
+перечитує проміжний рівень, щоб звʼязати товари з позиціями. Це в межах
+`1 + 2 × рівні = 5`. Вона потрібна, коли JOIN роздуває результат (одне
+замовлення × 200 позицій × широкий рядок товару); для сторінки з десятка
+замовлень JOIN дешевший.
+
+### Repository чи QueryBuilder
+
+Межу проводжу по формі результату. Якщо відповідь — entities або їхній граф
+(«замовлення з позиціями», CRUD, фільтр по колонках), це `Repository.find()` з
+`relations`, бо він типізований і не дає забути джойн. Щойно результат — рядки,
+яких немає в жодній таблиці (`SUM`, `COUNT DISTINCT`, `GROUP BY`, підзапит),
+беру `createQueryBuilder().getRawMany()` і сам описую тип рядка звіту.
+
+`npm run report` — виторг по категоріях за оплаченими замовленнями: `JOIN`
+`order_items → orders → products`, `GROUP BY p.category`, `SUM` і
+`COUNT(DISTINCT)`. Агрегати Postgres повертає як `bigint`, і `pg` віддає їх
+рядками, щоб не втратити точність за 2^53, тому звіт рахує їх через `BigInt`.
+Виторг рахується з позицій до промокоду: промокод діє на все замовлення, і
+розкласти його по категоріях без правила пропорції не можна.
+
+### `db/` після #13
+
+`db/schema.sql`, `seed.sql`, `queries/` і `OPTIMIZATIONS.md` — SQL-дизайн і
+бенчмарк #12 (`npm run db:bench`). Гроші там ще `numeric(12,2)`, бо таким був
+дизайн на момент бенчмарку, а плани `EXPLAIN` від типу грошових колонок не
+залежать. Робоча схема застосунку — міграції. Бенчмарк сам робить
+`docker compose down -v` і лишає по собі схему #12, тож після нього база
+повертається так: `docker compose down -v && npm run db:up && npm run migrate && npm run seed`.
+
+## Grading
+
+Свіжий клон, чиста БД, без доступу до сховища:
+
+```bash
+docker compose up -d --wait
+export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=marketplace-dev DB_NAME=marketplace
+export SKIP_VAULT=1    # у грейдера немає доступу до сховища
+```
+
+`DB_*` — дев-креденшели з `docker-compose.yml` (`POSTGRES_USER: admin`,
+дефолт `PG_ADMIN_PASSWORD`, `POSTGRES_DB: marketplace`). Далі — команди з
+acceptance criteria як є:
+
+```bash
+npm ci && npx tsc --noEmit
+grep -rn "synchronize" src/                       # лише synchronize: false
+npm run build && npm run migrate && npm run migrate:show
+npm run migrate:revert && npm run migrate
+grep -rn "onDelete" src/                          # RESTRICT і CASCADE
+npm run seed && npm run seed                      # перевірка кількості — розділ 7, «Seed»
+npm run demo:nplus1
+npm run report && grep -rniE "\.(add)?groupBy\(" src/
+grep -nE "password:[[:space:]]*['\"]" src/data-source.ts   # порожньо
+```
+
 ## Журнал рішень
 
 Дописую знизу, розділи вище не переписую. На захисті історія рішень цінніша за
@@ -448,6 +654,11 @@ psql -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q1.sql)"    # після: I
 | 2026-09-17 | ~~promotions/payments/points_entries лишаються порожніми до #14~~ → наливаються сідом | Ревʼю: три з десяти FK були оголошені, але під обсягом не перевірені. Порожня таблиця не доводить нічого про звʼязок. Промокоди роздані з `DISTINCT ON (buyer_id, promo_code_id)`, тож відкладений унікальний індекс стане без чистки даних |
 | 2026-09-17 | Знижки рахуються до вставки, у тимчасових таблицях, а не `UPDATE`-ом після | `UPDATE` лишив би мертвий кортеж на кожен рядок: `VACUUM` звільняє місце, але файл не стискає, і heap `orders` у звіті перестав би відповідати чистому наливанню |
 | 2026-09-17 | Версія Postgres у звіті — рядок із `SELECT version()`, знятий скриптом | Ревʼю: `postgres:17-alpine` — плаваючий тег, у грейдера він дав 17.9 проти моїх 17.11. Пінити образ поки не став: це спільна інфраструктура для #13+ |
+| 2026-09-27 | ~~`NUMERIC(12,2)` + рядок в API~~ → гроші `integer` у копійках, колонки `*_cents` | ДЗ#13 вимагає копійки. І сам аргумент сильний: `numeric` драйвер `pg` віддає рядком, тож десяткова арифметика вимагала б `decimal.js` на кожному кроці, а копійки проходять від БД до JSON одним типом. Спека v1 уже була в `*_cents` — тепер з нею збігається й схема |
+| 2026-09-27 | Схему веде міграція TypeORM, а не `db/schema.sql` | Два джерела правди розійшлися б на першій же зміні. `db/` лишається бенчмарком #12, який сам себе піднімає на чистому томі |
+| 2026-09-27 | ~~`POSTGRES_PASSWORD_FILE` + compose `secrets:`~~ → `POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:-marketplace-dev}` | Свіжий клон падав на першій же команді: compose не стартує контейнер, якщо файла-секрета немає. ДЗ#13 фіксує, що дев-креденшели compose секретом не є; порт — лише loopback. На робочій машині `db-up.sh` і далі генерує пароль і передає його через `PG_ADMIN_PASSWORD` |
+| 2026-09-27 | Seed — фіксовані id + `OVERRIDING SYSTEM VALUE` + `ON CONFLICT DO NOTHING`, потім `setval` | Natural key є лише в `users.email`; у товарів і замовлень його немає, а вигадувати його заради сіду — змінювати схему під тест. `GENERATED ALWAYS` лишився: він не дає коду застосунку підставити id випадково |
+| 2026-09-27 | Поруч із `pnpm-lock.yaml` комічу `package-lock.json` | Критерій грейдера — `npm ci`, а він читає тільки `package-lock.json`. Працюю й далі через pnpm; npm-лок — для тих, хто ставить через npm |
 
 ## Запуск
 
@@ -458,8 +669,9 @@ psql -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q1.sql)"    # після: I
 pnpm install               # або npm install
 cp .env.example .env
 npm run db:up              # Postgres у compose + файл-секрет
-npm run db:bench           # чистий том → schema → seed → EXPLAIN до/після (розділ 6)
+npm run build && npm run migrate && npm run seed   # схема й дані через TypeORM (розділ 7)
 npm run start              # http://localhost:3000/v1
+npm run db:bench           # окремо: бенчмарк #12 на чистому томі (розділ 6)
 
 npm run check:env          # .env.example звірений зі схемою
 npm run lint:spec          # redocly lint openapi/openapi.yaml
@@ -467,4 +679,11 @@ npm run lint:spec          # redocly lint openapi/openapi.yaml
 
 Конфігурація pnpm — у `pnpm-workspace.yaml` (карантин на свіжі версії, контроль
 install-скриптів, точний пінінг). `packageManager` свідомо не зафіксований, тож
-працює з будь-яким менеджером; версії в `dependencies` запінені точно.
+працює з будь-яким менеджером; версії в `dependencies` запінені точно. Локів два:
+`pnpm-lock.yaml` для pnpm і `package-lock.json` для `npm ci`; після зміни
+залежностей оновлюю обидва. npm-лок генерую в чистій теці, бо npm не вміє
+читати `node_modules`, розкладений pnpm:
+
+```bash
+d=$(mktemp -d) && cp package.json "$d" && (cd "$d" && npm install --package-lock-only) && cp "$d/package-lock.json" .
+```
