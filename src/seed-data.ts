@@ -8,7 +8,33 @@ import type { Order, OrderItem, Payment, PointsEntry, Product, Promotion, User }
  * Суми замовлень не вписані руками, а рахуються з позицій (buildOrders нижче):
  * CHECK total_cents = subtotal_cents - discount_cents перевіряє база, і сід
  * з арифметичною помилкою просто не вставиться.
+ *
+ * Кожен рядок типізований як Pick з усіма колонками, які сід заповнює, а не
+ * Partial: тоді поле, яке сід сам же й записав, далі читається без `!`.
  */
+
+type UserRow = Pick<User, 'id' | 'email' | 'role' | 'passwordHash' | 'createdAt'>;
+type ProductRow = Pick<
+  Product,
+  | 'id' | 'sellerId' | 'category' | 'title' | 'description' | 'priceCents' | 'currency'
+  | 'stock' | 'ratingAvg' | 'ratingCount' | 'imageKeys' | 'createdAt'
+>;
+type PromotionRow = Pick<
+  Promotion,
+  | 'id' | 'kind' | 'productId' | 'code' | 'percentOff' | 'minQty' | 'region' | 'timezone'
+  | 'startsLocal' | 'endsLocal' | 'startsAt' | 'endsAt' | 'createdAt'
+>;
+type OrderRow = Pick<
+  Order,
+  | 'id' | 'buyerId' | 'deviceId' | 'region' | 'status' | 'currency' | 'subtotalCents'
+  | 'discountCents' | 'totalCents' | 'pointsSpent' | 'promoCodeId' | 'createdAt'
+>;
+type OrderItemRow = Pick<OrderItem, 'orderId' | 'productId' | 'qty' | 'unitPriceCents' | 'discountCents' | 'promotionId'>;
+type PaymentRow = Pick<Payment, 'id' | 'orderId' | 'amountCents' | 'status' | 'providerRef' | 'createdAt'>;
+type PointsEntryRow = Pick<
+  PointsEntry,
+  'id' | 'userId' | 'orderId' | 'kind' | 'amount' | 'status' | 'maturesAt' | 'createdAt'
+>;
 
 // Не справжній хеш і не пароль: заглушка, поки немає автентифікації (#24).
 const SEED_PASSWORD_HASH = '$argon2id$v=19$seed$not-a-real-hash';
@@ -24,14 +50,14 @@ const userSeeds: Pick<User, 'id' | 'email' | 'role'>[] = [
   { id: '8', email: 'sofiia@marketplace.test', role: 'buyer' },
 ];
 
-export const users: Partial<User>[] = userSeeds.map((u) => ({
+export const users: UserRow[] = userSeeds.map((u) => ({
   ...u,
   passwordHash: SEED_PASSWORD_HASH,
   createdAt: new Date('2026-08-01T09:00:00Z'),
 }));
 
 type ProductSeed = Pick<Product, 'id' | 'sellerId' | 'category' | 'title' | 'priceCents' | 'stock'> &
-  Partial<Pick<Product, 'ratingAvg' | 'ratingCount' | 'description'>>;
+  Partial<Pick<Product, 'ratingAvg' | 'ratingCount'>>;
 
 const productSeeds: ProductSeed[] = [
   { id: '1', sellerId: '2', category: 'shoes', title: 'Кросівки Nike Pegasus 41', priceCents: 499900, stock: 20, ratingAvg: '4.70', ratingCount: 31 },
@@ -46,7 +72,7 @@ const productSeeds: ProductSeed[] = [
   { id: '10', sellerId: '3', category: 'books', title: 'Чистий код — Роберт Мартін', priceCents: 69900, stock: 50, ratingAvg: '4.90', ratingCount: 203 },
 ];
 
-export const products: Partial<Product>[] = productSeeds.map((p, i) => ({
+export const products: ProductRow[] = productSeeds.map((p, i) => ({
   description: `${p.title}. Демо-товар сіду.`,
   ratingAvg: null,
   ratingCount: 0,
@@ -68,19 +94,25 @@ const SEPTEMBER = {
   createdAt: new Date('2026-08-25T09:00:00Z'),
 };
 
-export const promotions: Partial<Promotion>[] = [
-  { id: '1', kind: 'seasonal', productId: '1', code: null, percentOff: '15.00', minQty: null, ...SEPTEMBER },
-  { id: '2', kind: 'quantity_tier', productId: '4', code: null, percentOff: '10.00', minQty: 3, ...SEPTEMBER },
-  { id: '3', kind: 'promo_code', productId: null, code: 'WELCOME10', percentOff: '10.00', minQty: null, ...SEPTEMBER },
-];
+// Поріг «від N штук» — окрема константа, а не читання з рядка акції: у рядку
+// min_qty має тип number | null, а для quantity_tier він завжди заданий.
+const TIER_MIN_QTY = 3;
+
+const seasonal: PromotionRow = { id: '1', kind: 'seasonal', productId: '1', code: null, percentOff: '15.00', minQty: null, ...SEPTEMBER };
+const tier: PromotionRow = { id: '2', kind: 'quantity_tier', productId: '4', code: null, percentOff: '10.00', minQty: TIER_MIN_QTY, ...SEPTEMBER };
+const welcome: PromotionRow = { id: '3', kind: 'promo_code', productId: null, code: 'WELCOME10', percentOff: '10.00', minQty: null, ...SEPTEMBER };
+
+export const promotions: PromotionRow[] = [seasonal, tier, welcome];
 
 // Замовлення: хто, у якому статусі, що купив і чи ввів промокод.
-const orderSpecs: {
+interface OrderSpec {
   buyerId: string;
   status: Order['status'];
   promoCode?: boolean;
   lines: [productId: string, qty: number][];
-}[] = [
+}
+
+const orderSpecs: OrderSpec[] = [
   { buyerId: '4', status: 'paid', lines: [['1', 1], ['6', 1]] },
   { buyerId: '4', status: 'pending', lines: [['10', 2]] },
   { buyerId: '5', status: 'paid', lines: [['4', 3], ['3', 1]] },
@@ -96,12 +128,23 @@ const orderSpecs: {
 /** Знижка у копійках — завжди вниз до цілої копійки, щоб не подарувати зайве. */
 const percentOf = (amountCents: number, percent: string) => Math.floor((amountCents * Number(percent)) / 100);
 
-function buildOrders() {
-  const priceOf = new Map(products.map((p) => [p.id!, p.priceCents!]));
-  const [seasonal, tier, welcome] = promotions;
+/** Одруківка в id товару в orderSpecs — помилка сіду, а не тихий NaN у сумах. */
+function priceOf(productId: string): number {
+  const product = products.find((p) => p.id === productId);
+  if (!product) throw new Error(`seed: у orderSpecs посилання на неіснуючий товар ${productId}`);
+  return product.priceCents;
+}
 
-  const orders: Partial<Order>[] = [];
-  const items: Partial<OrderItem>[] = [];
+/** Акція на позицію: сезонна — на свій товар, «від N штук» — від порогу. */
+function promotionFor(productId: string, qty: number): PromotionRow | null {
+  if (productId === seasonal.productId) return seasonal;
+  if (productId === tier.productId && qty >= TIER_MIN_QTY) return tier;
+  return null;
+}
+
+function buildOrders(): { orders: OrderRow[]; items: OrderItemRow[] } {
+  const orders: OrderRow[] = [];
+  const items: OrderItemRow[] = [];
 
   orderSpecs.forEach((spec, i) => {
     const orderId = String(i + 1);
@@ -109,13 +152,9 @@ function buildOrders() {
     let itemDiscounts = 0;
 
     for (const [productId, qty] of spec.lines) {
-      const unit = priceOf.get(productId)!;
-      // Акція на позицію: сезонна на свій товар, «від N штук» — від min_qty.
-      const promo =
-        productId === seasonal.productId ? seasonal
-        : productId === tier.productId && qty >= tier.minQty! ? tier
-        : null;
-      const discount = promo ? percentOf(unit * qty, promo.percentOff!) : 0;
+      const unit = priceOf(productId);
+      const promo = promotionFor(productId, qty);
+      const discount = promo ? percentOf(unit * qty, promo.percentOff) : 0;
 
       subtotal += unit * qty;
       itemDiscounts += discount;
@@ -123,7 +162,7 @@ function buildOrders() {
     }
 
     // Промокод діє на суму, що лишилась після знижок на позиції.
-    const codeDiscount = spec.promoCode ? percentOf(subtotal - itemDiscounts, welcome.percentOff!) : 0;
+    const codeDiscount = spec.promoCode ? percentOf(subtotal - itemDiscounts, welcome.percentOff) : 0;
     const discount = itemDiscounts + codeDiscount;
 
     orders.push({
@@ -137,7 +176,7 @@ function buildOrders() {
       discountCents: discount,
       totalCents: subtotal - discount,
       pointsSpent: 0,
-      promoCodeId: spec.promoCode ? welcome.id! : null,
+      promoCodeId: spec.promoCode ? welcome.id : null,
       createdAt: new Date(Date.UTC(2026, 8, 1 + i, 10)),
     });
   });
@@ -149,13 +188,13 @@ export const { orders, items: orderItems } = buildOrders();
 
 const paidOrders = orders.filter((o) => o.status === 'paid');
 
-export const payments: Partial<Payment>[] = paidOrders.map((o, i) => ({
+export const payments: PaymentRow[] = paidOrders.map((o, i) => ({
   id: String(i + 1),
-  orderId: o.id!,
-  amountCents: o.totalCents!,
+  orderId: o.id,
+  amountCents: o.totalCents,
   status: 'succeeded',
   providerRef: `psp_seed_${String(i + 1).padStart(4, '0')}`,
-  createdAt: new Date(o.createdAt!.getTime() + 5 * 60_000),
+  createdAt: new Date(o.createdAt.getTime() + 5 * 60_000),
 }));
 
 // Той самий курс, що в db/seed.sql з #12: 1 бал за кожні повні 100 грн.
@@ -165,18 +204,18 @@ const POINTS_PER_CENTS = 100_00;
 const MATURITY_MS = 14 * 24 * 3600_000;
 const AS_OF = new Date('2026-09-20T00:00:00Z');
 
-export const pointsEntries: Partial<PointsEntry>[] = paidOrders
-  .filter((o) => o.totalCents! >= POINTS_PER_CENTS)
+export const pointsEntries: PointsEntryRow[] = paidOrders
+  .filter((o) => o.totalCents >= POINTS_PER_CENTS)
   .map((o, i) => {
-    const maturesAt = new Date(o.createdAt!.getTime() + MATURITY_MS);
+    const maturesAt = new Date(o.createdAt.getTime() + MATURITY_MS);
     return {
       id: String(i + 1),
-      userId: o.buyerId!,
-      orderId: o.id!,
+      userId: o.buyerId,
+      orderId: o.id,
       kind: 'earned',
-      amount: Math.floor(o.totalCents! / POINTS_PER_CENTS),
+      amount: Math.floor(o.totalCents / POINTS_PER_CENTS),
       status: maturesAt <= AS_OF ? 'available' : 'pending',
       maturesAt,
-      createdAt: new Date(o.createdAt!.getTime() + 10 * 60_000),
+      createdAt: new Date(o.createdAt.getTime() + 10 * 60_000),
     };
   });
