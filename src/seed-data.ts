@@ -204,7 +204,7 @@ const POINTS_PER_CENTS = 100_00;
 const MATURITY_MS = 14 * 24 * 3600_000;
 const AS_OF = new Date('2026-09-20T00:00:00Z');
 
-export const pointsEntries: PointsEntryRow[] = paidOrders
+const earnedForOrders: PointsEntryRow[] = paidOrders
   .filter((o) => o.totalCents >= POINTS_PER_CENTS)
   .map((o, i) => {
     const maturesAt = new Date(o.createdAt.getTime() + MATURITY_MS);
@@ -219,3 +219,24 @@ export const pointsEntries: PointsEntryRow[] = paidOrders
       createdAt: new Date(o.createdAt.getTime() + 10 * 60_000),
     };
   });
+
+// Стартовий бонус для demo:race (#14): баланси свідомо надлишкові, щоб число
+// успішних checkout обмежував лише stock, а не бали. 1 000 000 балів — це
+// 10 000 грн за курсом 1 бал = 1 копійка; прогін гонки списує 1 000.
+// Покупця 8 (sofiia) бонус оминає навмисно: її єдине нарахування ще pending,
+// доступний баланс 0 — на ній гонка перевіряє відкат через «недостатньо балів».
+const RACE_BONUS_POINTS = 1_000_000;
+const bonusBuyers = ['4', '5', '6', '7'];
+
+const raceBonus: PointsEntryRow[] = bonusBuyers.map((userId, i) => ({
+  id: String(earnedForOrders.length + i + 1),
+  userId,
+  orderId: null,
+  kind: 'earned',
+  amount: RACE_BONUS_POINTS,
+  status: 'available',
+  maturesAt: new Date('2026-08-01T09:00:00Z'),
+  createdAt: new Date('2026-08-01T09:00:00Z'),
+}));
+
+export const pointsEntries: PointsEntryRow[] = [...earnedForOrders, ...raceBonus];

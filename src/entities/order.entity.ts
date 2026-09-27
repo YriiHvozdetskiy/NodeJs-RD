@@ -29,10 +29,16 @@ export type OrderStatus = (typeof ORDER_STATUSES)[number];
  * Два індекси — рівно під запити з #12 (db/queries/q1, q2):
  *   • складений (buyer_id, created_at, id) — «мої замовлення за період»;
  *   • partial по created_at лише для pending — черга «зависших».
+ *
+ * Третій — не для швидкості, а для правила: `one_code_per_user` робить
+ * «промокод раз на користувача» властивістю даних. Два одночасні checkout з
+ * тим самим кодом не проскочать обидва: другий INSERT чекає на коміт першого
+ * й отримує 23505, а транзакція відкочується цілою (src/checkout/checkout.ts).
  */
 @Entity('orders')
 @Index('idx_orders_buyer_created', ['buyerId', 'createdAt', 'id'])
 @Index('idx_orders_pending_created', ['createdAt'], { where: `status = 'pending'` })
+@Index('one_code_per_user', ['buyerId', 'promoCodeId'], { unique: true, where: `promo_code_id IS NOT NULL` })
 @Check('orders_region_check', `region ~ '^[A-Z]{2}$'`)
 @Check('orders_status_check', `status IN ('pending', 'paid', 'cancelled')`)
 @Check('orders_currency_check', `currency ~ '^[A-Z]{3}$'`)
