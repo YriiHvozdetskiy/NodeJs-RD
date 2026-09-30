@@ -1,3 +1,6 @@
+-- Сід бенчмарку ДЗ #12 під db/schema.sql (гроші numeric). Для схеми з
+-- міграцій TypeORM він не підходить — там `npm run seed` (src/seed.ts).
+--
 -- Реалістичний обсяг під EXPLAIN. Наливаю всі сім таблиць дата-шару:
 --   users 50 000 · products 120 000 · promotions 12 040 · orders 200 000 ·
 --   order_items ≈ 386 000 · payments ≈ 180 000 · points_entries ≈ 179 000.

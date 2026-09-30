@@ -1,4 +1,17 @@
--- Дата-шар Marketplace API. Застосовується на чисту базу однією командою:
+-- ⚠ Знімок SQL-дизайну ДЗ #12 — не робоча схема застосунку.
+--
+-- З ДЗ #13 схему Marketplace API веде TypeORM: entities у src/entities/,
+-- DDL — міграції в src/migrations/ (`npm run migrate`). Цей файл лишився
+-- лише для бенчмарку EXPLAIN з #12 (`npm run db:bench`, db/OPTIMIZATIONS.md):
+-- бенчмарк сам піднімає чистий том і на мігровану базу не накладається.
+--
+-- Свідома розбіжність із міграцією — гроші. Тут numeric(12,2) (`price`,
+-- `total`, …), у міграції integer-копійки (`price_cents`, `total_cents`, …).
+-- Приводити цей файл до копійок не став: тоді довелося б переписати seed.sql і
+-- перезняти всі плани в OPTIMIZATIONS.md, а від типу грошових колонок вони не
+-- залежать. Накладати цей файл на базу, створену міграціями, не можна.
+--
+-- Застосовується на чисту базу однією командою:
 --   psql -v ON_ERROR_STOP=1 -f db/schema.sql
 --
 -- Тут лише таблиці й констрейнти. Індекси під запити живуть у db/indexes.sql:
@@ -28,6 +41,7 @@ CREATE TABLE users (
 
 -- ---------------------------------------------------------------------------
 -- products — каталог. Гроші numeric(12,2), ніколи float.
+-- (Дизайн #12. У міграції #13 — price_cents integer, див. шапку файла.)
 -- rating_avg NULL, поки немає жодного відгуку: товар без оцінок не проходить
 -- фільтр min_rating, і це рішення, а не побічний ефект (docs/design-notes.md).
 -- search_vector — збережена генерована колонка: Postgres перераховує її сам на
@@ -97,6 +111,7 @@ CREATE TABLE orders (
   status        text          NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'paid', 'cancelled')),
   currency      text          NOT NULL DEFAULT 'UAH' CHECK (currency ~ '^[A-Z]{3}$'),
+  -- три суми нижче — numeric дизайну #12; у міграції #13 це *_cents integer
   subtotal      numeric(12,2) NOT NULL CHECK (subtotal >= 0),
   discount      numeric(12,2) NOT NULL DEFAULT 0 CHECK (discount >= 0),
   total         numeric(12,2) NOT NULL CHECK (total >= 0),
