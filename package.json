@@ -8,9 +8,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:test": "rm -rf dist-test && tsc -p tsconfig.test.json",
     "start": "tsc -p tsconfig.json && node dist/main.js",
     "start:dev": "ts-node -P tsconfig.json src/main.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "lint:spec": "redocly lint openapi/openapi.yaml",
     "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
     "check:scope": "redocly bundle openapi/openapi.yaml -o spec.json && node scripts/check-scope.js",
@@ -31,7 +32,11 @@
     "demo:workers": "bash scripts/with-secrets.sh dev node dist/demo-workers.js",
     "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js",
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
-    "drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh"
+    "drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",
+    "test:integration": "npm run build:test && jest dist-test/test/integration",
+    "test:e2e": "npm run build:test && jest dist-test/test/e2e",
+    "test:contract": "npm run build:test && jest dist-test/test/contract/consumer",
+    "verify:provider": "npm run build:test && jest dist-test/test/contract/provider"
   },
   "dependencies": {
     "@nestjs/common": "11.2.1",
@@ -47,11 +52,18 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@nestjs/testing": "11.2.1",
+    "@pact-foundation/pact": "17.1.4",
     "@redocly/cli": "2.46.0",
+    "@testcontainers/postgresql": "12.1.0",
     "@types/express": "5.0.6",
+    "@types/jest": "30.0.0",
     "@types/node": "22.20.1",
     "@types/pg": "8.23.1",
+    "@types/supertest": "7.2.1",
     "dotenv": "17.4.2",
+    "jest": "30.5.2",
+    "supertest": "7.2.2",
     "ts-node": "10.9.2",
     "typescript": "5.9.3"
   }
