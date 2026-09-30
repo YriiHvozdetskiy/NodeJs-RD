@@ -3,9 +3,11 @@ import { DatabaseService } from './database.service';
 
 /**
  * `@Global`, бо доступ до БД потрібен усюди, а перекладати `DbModule` в
- * `imports` кожного майбутнього модуля — шум без користі. На #13 сюди
- * приїде `TypeOrmModule.forRootAsync`, і `DatabaseService` або стане
- * обгорткою над `DataSource`, або зникне разом із сирим `pg`.
+ * `imports` кожного майбутнього модуля — шум без користі. ORM-шар #13
+ * живе поза DI: `src/data-source.ts` обслуговує міграції, seed і звіти з CLI.
+ * `TypeOrmModule.forRootAsync` приїде сюди разом із транзакційною логікою #14,
+ * і тоді `DatabaseService` або стане обгорткою над `DataSource`, або зникне
+ * разом із сирим `pg`.
  */
 @Global()
 @Module({

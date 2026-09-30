@@ -2,7 +2,7 @@
   "name": "marketplace-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу.",
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder.",
   "engines": {
     "node": ">=20"
   },
@@ -19,7 +19,14 @@
     "db:down": "docker compose down",
     "db:psql": "docker compose exec -w / db psql -U admin -d marketplace",
     "db:bench": "bash scripts/db-bench.sh",
-    "rotate": "bash rotate.sh"
+    "rotate": "bash rotate.sh",
+    "migrate": "bash scripts/with-secrets.sh dev typeorm migration:run -d dist/data-source.js",
+    "migrate:show": "bash scripts/with-secrets.sh dev typeorm migration:show -d dist/data-source.js",
+    "migrate:revert": "bash scripts/with-secrets.sh dev typeorm migration:revert -d dist/data-source.js",
+    "migrate:generate": "bash scripts/with-secrets.sh dev typeorm migration:generate -d dist/data-source.js",
+    "seed": "bash scripts/with-secrets.sh dev node dist/seed.js",
+    "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/demo-nplus1.js",
+    "report": "bash scripts/with-secrets.sh dev node dist/report.js"
   },
   "dependencies": {
     "@nestjs/common": "11.2.1",
@@ -31,6 +38,7 @@
     "pg": "8.23.0",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
+    "typeorm": "0.3.31",
     "zod": "4.4.3"
   },
   "devDependencies": {
