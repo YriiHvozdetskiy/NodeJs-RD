@@ -1,6 +1,6 @@
 # Локальна інфраструктура курсового проєкту: Postgres, PgBouncer перед ним,
-# Pact Broker для контрактних тестів і (лише для restore-drill) чистий Postgres
-# для відновлення. Застосунок на цьому етапі зручніше тримати на хості
+# Pact Broker для контрактних тестів, RabbitMQ для подій домену і (лише для
+# restore-drill) чистий Postgres для відновлення. Застосунок на цьому етапі зручніше тримати на хості
 # (`npm run start`), бо ротація перевіряється через uptime процесу, а не
 # контейнера.
 name: marketplace
@@ -93,6 +93,50 @@ services:
       timeout: 3s
       retries: 30
 
+  # Брокер подій (#19). 4.2 — LTS-гілка (підтримка до 30.06.2030), а не
+  # поточна 4.3: курсовий піде в деплой на #28, і там потрібна версія, яка
+  # проживе довше за проєкт. `-management` — HTTP API на 15672: через нього
+  # споживач вішає DLX політикою, і через нього ж x-death видно очима в UI.
+  rabbit:
+    image: rabbitmq:4.2.9-management-alpine
+    # Імʼя ноди — rabbit@<hostname>, і дані на томі привʼязані до нього. Без
+    # фіксованого hostname перестворений контейнер отримав би нове імʼя і не
+    # впізнав би власних черг.
+    hostname: rabbit
+    # Loopback, як у db: 5672 — AMQP для застосунку й демо, 15672 — UI та API.
+    ports:
+      - '127.0.0.1:5672:5672'
+      - '127.0.0.1:15672:15672'
+    environment:
+      # Той самий прийом, що з PG_ADMIN_PASSWORD: свіжий клон і грейдер
+      # отримують дев-креденшел app/app, робоча машина — згенерований
+      # secrets/rabbitmq_password (scripts/db-up.sh). Діє лише на порожньому
+      # томі; далі пароль вирівнює db-up.sh через rabbitmqctl.
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-app}
+    volumes:
+      # Брокер, що зберігає повідомлення до появи одержувача, не має губити їх
+      # на `docker compose down`.
+      - rabbitdata:/var/lib/rabbitmq
+    # Не «порт відкрився»: TCP 5672 приймає зʼєднання раніше, ніж нода готова
+    # до basic.publish, і клієнт у цьому вікні ловить ECONNRESET.
+    # check_running відповідає після старту застосунку rabbit, а не Erlang VM.
+    #
+    # `test -f` перед CLI — не прикраса. Healthcheck виконується від root, і
+    # rabbitmq-diagnostics, не знайшовши .erlang.cookie, створює його сам — із
+    # власником root. Якщо він встигає раніше за ноду (на порожньому томі це
+    # перші 2–3 с), нода від імені rabbitmq не може прочитати cookie, падає з
+    # `eacces`, і `up --wait` повертає «unhealthy». Поки cookie немає, нода ще
+    # не готова однаково, тож перевірка чесно відповідає «ні» і нічого не пише.
+    healthcheck:
+      test: ['CMD-SHELL', 'test -f /var/lib/rabbitmq/.erlang.cookie && rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity']
+      interval: 5s
+      start_period: 40s
+      start_interval: 1s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
   # Чистий Postgres для restore-drill. Без профілю `drill` не стартує:
   # scripts/restore-drill.sh піднімає його сам і сам прибирає разом із томом.
   # Том даних навмисно анонімний: `rm -v` зносить його разом із контейнером,
@@ -121,4 +165,5 @@ services:
 
 volumes:
   pgdata:
+  rabbitdata:
 

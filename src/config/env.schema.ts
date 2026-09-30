@@ -53,6 +53,20 @@ export const envSchema = z.object({
    * у якому обробник віддає event loop, гілка 409 `in-flight` недосяжна.
    */
   SLOW_MS: z.coerce.number().int().min(0).default(0),
+
+  /**
+   * Куди публікувати події домену (#19) — БЕЗ пароля, як і DB_URL:
+   * `amqp://user@host:port`. Пароль — файлом із BROKER_PASSWORD_FILE.
+   *
+   * Опціональна свідомо. Замовлення — джерело правди, подія про нього — поки
+   * що побічний канал: без брокера checkout працює, а order.placed не виходить
+   * нікуди. Так ходять тести, яким брокер не потрібен. Порожній рядок
+   * дорівнює відсутності — ним тести й вимикають брокер поверх локального .env.
+   */
+  BROKER_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^amqps?$/ }).optional()),
+
+  /** Файл із паролем брокера. Відносний — від кореня репозиторію. */
+  BROKER_PASSWORD_FILE: z.string().min(1).default('./secrets/rabbitmq_password'),
 });
 
 export type Env = z.infer<typeof envSchema>;

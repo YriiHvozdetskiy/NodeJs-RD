@@ -17,6 +17,12 @@
 #
 #   bash scripts/with-secrets.sh dev npm run verify:provider
 #
+# З ДЗ #19 — адреса брокера. Той самий формат, що з базою: BROKER_URL у .env
+# без пароля, пароль — у secrets/rabbitmq_password (або у файлі з
+# BROKER_PASSWORD_FILE). Процесу-нащадку дістається повний BROKER_URL.
+#
+#   bash scripts/with-secrets.sh dev node dist/consumer.js
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -28,6 +34,7 @@ ENV_SLUG="${1:-dev}"; shift || true
 
 # грейдер не має доступу до сховища: значення вже в оточенні. Досить одного
 # DATABASE_URL — DB_* для TypeORM виводяться з нього, якщо їх не задали окремо.
+# BROKER_URL приходить повним (amqp://user:pass@host:5672) і йде далі як є.
 if [ "${SKIP_VAULT:-0}" = "1" ]; then
   if [ -n "${DATABASE_URL:-}" ] && [ -z "${DB_HOST:-}" ]; then
     # shellcheck source=scripts/lib/db.sh
@@ -88,6 +95,23 @@ fi
 if [ -f "${PACT_TOKEN_FILE}" ]; then
   PACT_BROKER_TOKEN="$(cat "${PACT_TOKEN_FILE}")"
   export PACT_BROKER_TOKEN
+fi
+
+# RabbitMQ (#19). amqp://user@host:port[/vhost] + пароль із файла →
+# amqp://user:pass@host:port[/vhost]. Згенерований пароль — hex, кодувати в URL
+# нічого. Немає BROKER_URL у .env — немає змінної, і демо брокера впадуть із
+# назвою змінної, а не з «connection refused».
+BROKER_URL_BASE="$(grep -E '^BROKER_URL=' "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+BROKER_SECRET_FILE="$(grep -E '^BROKER_PASSWORD_FILE=' "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+BROKER_SECRET_FILE="${BROKER_SECRET_FILE:-./secrets/rabbitmq_password}"
+case "${BROKER_SECRET_FILE}" in /*) ;; *) BROKER_SECRET_FILE="${ROOT}/${BROKER_SECRET_FILE}" ;; esac
+if [ -n "${BROKER_URL_BASE}" ]; then
+  if [ ! -f "${BROKER_SECRET_FILE}" ]; then
+    echo "with-secrets: немає ${BROKER_SECRET_FILE}. Спершу: npm run db:up" >&2; exit 1
+  fi
+  broker_rest="${BROKER_URL_BASE#*://}"
+  BROKER_URL="${BROKER_URL_BASE%%://*}://${broker_rest%%@*}:$(cat "${BROKER_SECRET_FILE}")@${broker_rest#*@}"
+  export BROKER_URL
 fi
 
 exec "$@"
