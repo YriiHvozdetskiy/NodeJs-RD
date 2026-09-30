@@ -53,6 +53,10 @@ export async function startPostgres(): Promise<TestPostgres> {
         // кожну перевірку форми відповіді.
         DRIFT: '0',
         SLOW_MS: '0',
+        // Порожній рядок = брокера немає. Без цього рядка локальний .env дав би
+        // застосунку в тестах справжній RabbitMQ, і кожне POST /orders лишало б
+        // order.placed у черзі дев-споживача.
+        BROKER_URL: '',
       };
     },
 
