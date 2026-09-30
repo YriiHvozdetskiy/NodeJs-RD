@@ -202,6 +202,8 @@ books`. `Promotion`, `Payment` і `PointsEntry` уже і в схемі, і в �
 | `DB_POOL_MAX` | число 1–100 | ні, дефолт `10` | `.env` / оточення | розмір пулу `pg` |
 | `DRIFT` | `0` \| `1` | ні, дефолт `0` | `.env` / оточення | демо дрейфу контракту з ДЗ#9 |
 | `SLOW_MS` | число ≥ 0 | ні, дефолт `0` | `.env` / оточення | штучна затримка `POST /orders` (демо 409 з ДЗ#9) |
+| `BROKER_URL` | `amqp://user@host:port` — **без пароля** | ні; порожньо — `order.placed` не публікується | **сховище #11**, як `DB_URL` | куди публікувати події домену (#19, розділ 12) |
+| `BROKER_PASSWORD_FILE` | шлях | ні, дефолт `./secrets/rabbitmq_password` | `.env` / оточення | де лежить пароль брокера |
 | — | вміст `secrets/db_password` | так | **файл-секрет** | пароль ролі `app_user` |
 
 Останній рядок — не змінна, і це головне рішення розділу. Пароль БД свідомо
@@ -233,6 +235,7 @@ for f in $(git ls-files | grep -E '\.env($|\.)' | grep -vE '\.example$'); do gre
 | `secrets/pgbouncer_userlist.txt` | **ні** (`.gitignore`) | обидва паролі для PgBouncer; збирає `scripts/pgbouncer-userlist.sh` |
 | `secrets/pact_broker_url` | **ні** (`.gitignore`) | адреса Pact Broker; `db-up.sh` кладе туди брокер із compose (розділ 10) |
 | `secrets/pact_broker_token` | **ні** (`.gitignore`) | токен хмарного брокера; для брокера з compose файла немає |
+| `secrets/rabbitmq_password` | **ні** (`.gitignore`) | пароль користувача `app` у RabbitMQ; генерує `db-up.sh` (розділ 12) |
 
 `npm run check:env` звіряє `.env.example` зі схемою і падає з `exit 1`, якщо
 файл відстав: змінна є в схемі, але не у файлі — помилка; є у файлі, але не в
@@ -1109,6 +1112,266 @@ WebSocket варто брати, коли клієнт теж говорить �
 | Автентифікація | `auth` у handshake — будь-що, зокрема токен; перевіряється на `join` | лише те, що вміє звичайний GET: cookie або токен у query. Власних заголовків `EventSource` не ставить |
 | Heartbeat | вбудований: ping раз на 25 с, мертвий сокет закривається за ~45 с | свій: коментар `: ping` раз на 15 с |
 
+## 12. Async-події через RabbitMQ
+
+Realtime з розділу 11 доставляє тому, хто підключений зараз: немає одержувача —
+немає доставки. Подія `order.placed` іде через брокер, який тримає її, доки
+споживач не візьме на себе відповідальність. Перший споживач — нарахування
+бонусних балів за правилом із `docs/design-notes.md`: 1 бал за кожні повні
+100 грн позицій без акції, запис `earned` у статусі `pending`, дозріває через
+14 днів.
+
+```
+POST /v1/orders ─► checkout() ─ COMMIT ─► EventPublisher (confirm-канал, mandatory)
+                                                │ order.placed
+                                                ▼
+                               shop.events (topic) ── binding order.placed
+                                                ▼
+                          loyalty.order.placed (quorum) ──► npm run consumer
+                                                │ reject(false) · delivery-limit
+                                                ▼
+                               shop.dlx (direct) ── binding loyalty.order.placed
+                                                ▼
+                          loyalty.order.placed.dlq (quorum)
+```
+
+Топологію оголошує споживач (`src/messaging/topology.ts`, викликається зі
+`src/consumer.ts`), а демо — тим самим кодом як бутстрап-крок. API знає лише
+exchange і routing key: новий підписник на `order.placed` приходить зі своєю
+чергою й binding, не чіпаючи checkout.
+
+### Подія
+
+```json
+{
+  "eventId": "36f91334-4649-50c7-9c47-0cb2a1fc2676",
+  "type": "order.placed",
+  "version": 1,
+  "occurredAt": "2026-09-30T20:23:54.300Z",
+  "data": { "orderId": "174", "buyerId": "9", "currency": "UAH", "totalCents": 59900,
+            "items": [{ "productId": "4", "qty": 1 }] }
+}
+```
+
+Контракт — zod-схема в `src/messaging/order-placed.event.ts`, тип виводиться з
+неї. Не ORM-сутність через spread: сутність змінюється разом зі схемою БД,
+контракт — лише разом із `version`. `eventId` — UUID v5 від
+`order.placed:<orderId>`: одне замовлення дає рівно одну подію, тож повтор
+публікації, redrive з DLQ чи relay outbox на #22 отримають той самий `eventId`.
+Випадковий UUID на кожну спробу зробив би кожну спробу окремою подією.
+`occurredAt` — `orders.created_at`, а не момент відправки.
+
+Публікує `OrdersService.create` після COMMIT — подія про замовлення, що
+відкотилось, пообіцяла б споживачам те, чого немає в базі. «Опублікував»
+означає «брокер підтвердив і повідомлення кудись потрапило»: confirm-канал плюс
+`mandatory: true`. Одного confirm мало — перевірено на 4.2.9: повідомлення без
+жодного binding брокер викидає і все одно шле **позитивний** `basic.ack`, а
+перед ним `basic.return`. За return публікатор і відрізняє «прийнято» від
+«викинуто».
+
+Між COMMIT і publish атомарності немає: спільного COMMIT у Postgres і RabbitMQ
+не існує. Брокер лежить або процес упав між ними — замовлення є, події немає.
+API при цьому відповідає `201` і пише в лог `order.placed <eventId> (замовлення
+N) не опубліковано: connect ECONNREFUSED …` — замовлення оформлене, і `500` був
+би неправдою. Перевірено на трьох запусках: живий брокер, лежачий, хибний
+пароль — усюди `201`. Закриває цю щілину transactional outbox на #22.
+`BROKER_URL` тому й опціональна: без неї checkout працює, а подія не виходить
+нікуди — так ходять тести.
+
+### Споживач
+
+`src/consumer.ts` — окремий процес: його масштабують, зупиняють і вбивають
+незалежно від API. `noAck: false`, і вердикт виноситься **після** ефекту:
+
+| Що сталось | Вердикт | Куди далі |
+| --- | --- | --- |
+| бали нараховано, або вже були (дубль), або нема за що | `ack` | повідомлення видалено |
+| тіло не JSON, не та форма чи версія (`ContractError`) | `reject(requeue=false)` | одразу в DLX, причина `rejected` |
+| будь-що інше: база недоступна, замовлення не знайдено | `reject(requeue=true)` | ще спроба; після 5 повернень — DLX, причина `delivery_limit` |
+
+Битий контракт не повторюють: повтор дасть те саме. «Замовлення не знайдено» —
+повторюють: споживач не знає, це битий продюсер чи репліка, що відстала, а межу
+повторам ставить delivery-limit.
+
+**prefetch = 10**: `10 × 38 мс` (найгірша обробка в прогонах `demo:publish`,
+разом із відкриттям зʼєднання; медіана — 1,9–11 мс) ≈ 0,4 с непідтвердженої
+роботи на споживача, у тисячі разів менше за стоковий `consumer_timeout` 30 хв;
+а 10 — це розмір пулу БД споживача: кожна доставка тримає одне зʼєднання на один
+INSERT, і більше непідтверджених, ніж зʼєднань, лише чекали б у памʼяті цього
+процесу, звідки їх не забере другий інстанс. Дефолт брокера — `0`, «без
+ліміту»: перший підписаний споживач забрав би всю чергу, другий простоював би.
+`prefetch=1` тут давав би мережевий round-trip на кожні 3 мс роботи.
+
+`null` у колбеку `consume` — не порожнє повідомлення, а `basic.cancel` від
+брокера (чергу видалили або спрацював `consumer_timeout`). Споживач тоді
+виходить із кодом 1, а не лишається живим і глухим. Так само на обрив
+зʼєднання: відновлення в коді немає, перезапуск — справа супервізора, а
+непідтверджене брокер уже повернув у чергу. SIGTERM — коректне завершення:
+`cancel`, дочекатись того, що в роботі, закрити канал.
+
+### Ідемпотентний ефект
+
+```sql
+INSERT INTO points_entries (user_id, order_id, kind, amount, status, matures_at)
+SELECT … FROM target WHERE base_cents >= 10000
+ON CONFLICT (order_id) WHERE kind = 'earned' DO NOTHING
+RETURNING amount
+```
+
+Сам по собі INSERT нового рядка не ідемпотентний — кожен виклик додає
+нарахування, як `qty = qty - 1` віднімає ще раз. Безпечним для повтору його
+робить ключ ідемпотентності — природний ключ бізнес-операції `order_id`: частковий
+унікальний індекс `points_entries_one_earned_per_order` (міграція
+`OneEarnedPerOrder`) дозволяє одне `earned` на замовлення, і повтор дає
+`0 рядків` замість других балів. Ключ — не `eventId`: «бали за замовлення 174» —
+один факт, скільки б подій про нього не приїхало. Перевірки `if (уже нараховано)`
+перед INSERT немає: два споживачі на двох подах обидва побачили б «ще ні», а
+індекс серіалізує їх у Postgres. Дедуплікація живе там само, де дані, — переживає
+рестарт і однакова для всіх інстансів; `Set` у памʼяті процесу не пережив би ні
+того, ні іншого.
+
+Позначка «оброблено» і ефект тут — один і той самий рядок в одному INSERT, тож
+щілини між ними немає. Вона зʼявиться, щойно ефект вийде за межі Postgres (лист,
+платіжний провайдер): тоді позначку й ефект треба комітити разом через
+`processed_messages` — #22.
+
+### DLQ
+
+DLX і ліміт повішені **політикою** через HTTP API management-плагіна, а не
+x-arguments черги: аргументи незмінні, і додати DLX до наявної черги можна лише
+через її видалення (`406 PRECONDITION_FAILED - inequivalent arg`). Тип черги —
+аргумент, політикою його не задати.
+
+```json
+{ "dead-letter-exchange": "shop.dlx", "dead-letter-routing-key": "loyalty.order.placed", "delivery-limit": 5 }
+```
+
+- `dead-letter-routing-key` — імʼя робочої черги, а не `order.placed`: інакше
+  DLQ кожного майбутнього підписника `order.placed` на тому самому `shop.dlx`
+  отримувала б копію чужих мерців.
+- `delivery-limit: 5`, а не стокові 20: повернення миттєві, без паузи, і 20
+  спроб за мілісекунди транзієнтній помилці не допомагають. Retry з паузою — #22.
+- На DLQ окрема політика `delivery-limit: -1`. DLQ теж quorum, і в неї той
+  самий дефолт 20 — але без DLX. Кожен «Get messages → Requeue» в UI — повернення,
+  і на 21-му перегляді повідомлення мовчки зникло б.
+- PUT політики відповідає `204` одразу, а до quorum-черги вона доїжджає за
+  ~2,4 с. Споживач чекає, доки `effective_policy_definition` черги покаже DLX, і
+  лише потім підписується: інакше перше отруєне повідомлення пішло б у reject
+  без DLX, тобто в нікуди.
+
+Причин dead-letter рівно чотири — `rejected`, `expired`, `maxlen`,
+`delivery_limit`. Демо показує дві: `delivery_limit` за замовчуванням і
+`rejected` з `--contract`. Три речі, які я перевірив на 4.2.9 окремим прогоном і
+які розходяться з матеріалом під 4.3:
+
+- `delivery-count` інкрементують **і** `reject(requeue=true)`, **і**
+  `nack(requeue=true)`: з лімітом 3 обидва дали 4 доставки й `delivery_limit`. На
+  4.3 `nack` лічильник не чіпає, і цикл на ньому не обмежений. У коді `reject` —
+  він тримає ліміт на обох версіях.
+- Обрив зʼєднання споживача з непідтвердженим повідомленням теж інкрементить
+  лічильник: чотири обриви з лімітом 3 — і повідомлення в DLQ. Подія, що валить
+  сам процес споживача, не крутиться вічно в циклі «старт → падіння».
+- `x-acquired-count` на 4.2 немає, лише `x-delivery-count`.
+
+І одна в клієнті: amqplib 2.0.1 типізує `x-death[].reason` як
+`'rejected' | 'expired' | 'maxlen'` — без `delivery_limit`, хоча брокер його
+ставить. Демо читає причину рядком.
+
+**Dead-letter-strategy лишив дефолтну, `at-most-once`.** Брокер перекладає
+мерця в DLX без внутрішнього confirm і видаляє з робочої черги одразу: якщо DLQ
+у цей момент не приймає (переповнена, недоступна репліка), повідомлення
+втрачено. `at-least-once` це закриває, але працює лише в парі з
+`overflow: reject-publish` на робочій черзі. Без неї політика приймається
+(`204`), а брокер мовчки відкочується на `at-most-once` і каже про це тільки в
+лозі — перевірено на 4.2.9: `Falling back to dead-letter-strategy at-most-once
+for queue '…' because configured dead-letter-strategy at-least-once is
+incompatible with effective overflow strategy drop-head`. Ціна пари — `reject-publish`
+відмовляє продюсерам, коли черга повна, а DLQ може отримати дублікати. Для
+однієї ноди в dev дефолт годиться; у кластері на #28 — пара.
+
+### Чому at-least-once, а не exactly-once
+
+Ack — не «дійшло», а «я більше не вимагаю повтору». Споживач шле його після
+ефекту, тож падіння між ефектом і ack лишає брокер без підтвердження, і він
+повертає повідомлення — ефект пробує статися вдруге. Шли б ack до ефекту —
+падіння забрало б роботу назавжди. Третього варіанта немає: споживач не може
+атомарно «застосувати ефект і повідомити брокера», бо це дві різні системи. Тому
+доставка тут **at-least-once**, і exactly-once доставки не дає ні RabbitMQ, ні
+будь-який інший брокер. Результат один на подію забезпечує не брокер, а
+споживач: ефект виражено через унікальний індекс на `order_id`, і друга доставка
+тієї самої події впирається в `ON CONFLICT DO NOTHING`. At-least-once доставка
+плюс ідемпотентний ефект — це exactly-once **результат**, і `demo:duplicate`
+показує саме його: доставок 2, нарахування 1.
+
+### Три демо
+
+Кожне приводить стан до чистого (топологія, порожні робоча черга й DLQ; товар
+і покупець — свої на кожен прогін), запускає справжній `dist/consumer.js`
+окремим процесом, друкує `ключ=значення` і виходить із кодом 1, якщо інваріант
+порушено. Якщо чергу вже слухає `npm run consumer` із сусіднього терміналу, демо
+відмовляється стартувати: він забирав би доставки, і числа стали б випадковими.
+
+```
+$ npm run demo:publish
+published=5  delivered=5  effect=5  acked=5  dlq=0  work=0  prefetch=10
+points=125   handle-ms-median=3.3  handle-ms-max=22.3
+
+$ npm run demo:dlq
+rejected=6  work=0  dlq=1  dlq-reason=delivery_limit  effect=0  deliveries=6  delivery-limit=5
+x-death: queue=loyalty.order.placed reason=delivery_limit count=1 routing-keys=["order.placed"]
+
+$ npm run demo:dlq -- --contract
+rejected=1  work=0  dlq=1  dlq-reason=rejected  effect=0  deliveries=1
+
+$ npm run demo:duplicate
+deliveries=2  effect=1  skipped=1  points=25  acked-before-kill=0  redelivered=1  delivery-count=1  work=0  dlq=0
+```
+
+(Тут рядки зведені по кілька в один, демо друкує кожен окремо.)
+
+- **`demo:publish`** — пʼять оформлень через той самий `checkout()`, що й
+  `POST /v1/orders`, після кожного COMMIT — `order.placed`. `effect` — рядки в
+  `points_entries`, а не звіт споживача: 5 × 25 балів = 125.
+- **`demo:dlq`** — валідна подія про замовлення `0`, якого не буває. Шість
+  доставок: ліміт 5 перевіряється після інкременту, тож шоста доставка його
+  перевищує. Мертве повідомлення лишається в DLQ після демо — видно в UI,
+  `http://127.0.0.1:15672` → Queues → `loyalty.order.placed.dlq` → Get messages.
+- **`demo:duplicate`** — повторну доставку викликає **справжній `kill -9`
+  процесу-споживача** між ефектом і ack. Вікно між ними в проді — мікросекунди,
+  але воно є завжди; демо розширює його до 10 с (`CONSUMER_ACK_DELAY_MS`), щоб
+  влучати детерміновано. Брокер бачить обрив TCP, повертає повідомлення з
+  `redelivered=true`, другий споживач отримує `0 рядків` з INSERT і підтверджує.
+  Не `channel.close()`: це коректне завершення, яке брокер теж requeue-ить, але
+  падіння в проді виглядає як обрив.
+
+Що демо міряють, а не друкують, я перевірив мутаціями. `DO UPDATE SET amount =
+points_entries.amount + EXCLUDED.amount` замість `DO NOTHING` дав `effect=1`, але
+`points=50`, `skipped=0` і `exit=1` — рядок один, бали подвоєні, тому демо
+рахує й суму. `noAck: true` у споживачі — повідомлення зникло разом із вбитим
+процесом, брокеру не було чого повертати, `exit=1`.
+
+### Брокер
+
+`rabbitmq:4.2.9-management-alpine`. 4.2 — LTS-гілка з підтримкою до 30.06.2030;
+поточна 4.3 — до 30.04.2028. Курсовий піде в деплой на #28, і версія має прожити
+довше за проєкт. Класичного дзеркалювання (`ha-mode`) у 4.x немає, тому всі
+черги quorum.
+
+Healthcheck — `rabbitmq-diagnostics -q check_running && … check_port_connectivity`,
+а не «порт відкрився»: TCP 5672 приймає зʼєднання раніше, ніж нода готова до
+`basic.publish`. Перед ним стоїть `test -f /var/lib/rabbitmq/.erlang.cookie`, і
+це не прикраса. Healthcheck виконується від root, а `rabbitmq-diagnostics`, не
+знайшовши cookie, створює його сам — із власником root. На порожньому томі він
+встигав раніше за ноду, нода падала з `eacces`, і `docker compose up --wait`
+повертав `container marketplace-rabbit-1 is unhealthy`. З перевіркою — healthy за
+7,5 с, нуль рестартів.
+
+Пароль — той самий прийом, що з Postgres: свіжий клон і грейдер отримують
+дев-креденшел `app`/`app` з compose, робоча машина — згенерований
+`secrets/rabbitmq_password` (`npm run db:up`), який `db-up.sh` вирівнює через
+`rabbitmqctl change_password` на наявному томі. `BROKER_URL` у `.env` — без
+пароля, як `DB_URL`; повний URL процесу-нащадку збирає `scripts/with-secrets.sh`.
+
 ## Grading
 
 Свіжий клон, чиста БД, без доступу до сховища:
@@ -1248,6 +1511,34 @@ node scripts/realtime-demo.mjs --same-room; echo "exit=$?"   # A_RECEIVED=1 · B
 процесу, спільний для всіх замовлень: на щойно запущеному сервері це `id: 4`,
 після інших прогонів — більше, але завжди > 3.
 
+ДЗ #19 (розділ 12). Свіжий клон, чиста БД, без доступу до сховища:
+
+```bash
+docker compose up -d --wait
+export BROKER_URL=amqp://app:app@127.0.0.1:5672    # дев-креденшел compose; 5672 — AMQP (15672 — UI й API)
+export DATABASE_URL=postgres://admin:marketplace-dev@127.0.0.1:6432/marketplace
+export SKIP_VAULT=1                                 # у грейдера немає доступу до сховища
+npm ci
+npm run build && npm run migrate                    # демо запускають dist/, ефект пише в points_entries
+```
+
+Сід не потрібен: товар і покупець у кожного демо свої. Далі — команди з
+acceptance criteria як є:
+
+```bash
+npm ci && npx tsc --noEmit
+npm run demo:publish      # published=5 · effect=5 · dlq=0 · prefetch=10 · exit 0
+npm run demo:dlq          # work=0 · dlq=1 · dlq-reason=delivery_limit · exit 0
+npm run demo:duplicate    # deliveries=2 · effect=1 · skipped=1 · exit 0
+npm run demo:dlq -- --contract   # друга причина: dlq-reason=rejected
+```
+
+`BROKER_URL` під `SKIP_VAULT=1` обгортка передає як є. Політику DLX споживач
+ставить через HTTP API на `15672` того самого хоста й тими самими
+креденшелами — порт відкритий у compose. Демо відмовляються стартувати, якщо
+`loyalty.order.placed` уже слухає інший споживач (`npm run consumer` у
+сусідньому терміналі), — він забирав би доставки собі.
+
 ## Журнал рішень
 
 Дописую знизу, розділи вище не переписую. На захисті історія рішень цінніша за
@@ -1309,6 +1600,15 @@ node scripts/realtime-demo.mjs --same-room; echo "exit=$?"   # A_RECEIVED=1 · B
 | 2026-09-30 | Одна шина (`OrderEventsService`, `Subject` + буфер 1000 подій), два транспорти | Бізнес-логіка публікує один раз і не знає про транспорти. На #19 між `publish` і підписниками стане RabbitMQ без змін в `OrdersService` |
 | 2026-09-30 | Власник кімнати — за email із handshake, до #24 | Іншої особи клієнта у v1 немає. Перевірка стоїть там, де стане JWT; «чужого» й «немає» не розрізняю, щоб не підтверджувати існування чужого замовлення |
 | 2026-09-30 | SSE поза `/v1`, `retry:` у кожному блоці події | Потік — транспорт, а не ресурс контракту. Окремий блок `retry:` Nest нумерує як `id: 1`, і EventSource відкотив би свій `Last-Event-ID` |
+| 2026-09-30 | Перший споживач `order.placed` — нарахування балів, ідемпотентність через частковий унікальний індекс на `order_id` | Правило «бали за замовлення» вже було в домені без виконавця. Природний ключ робить повтор безпечним одним INSERT, без окремої таблиці оброблених id — вона приїде на #22 разом з ефектами поза Postgres |
+| 2026-09-30 | `order.placed` публікується після COMMIT, без outbox; збій публікації — лог, а не `500` | Спільного COMMIT у Postgres і RabbitMQ немає, тож «замовлення без події» можливе в будь-якому порядку викликів. Чесна межа до #22 — назвати щілину й не брехати клієнту про оформлене замовлення |
+| 2026-09-30 | Confirm-канал **і** `mandatory: true` | Перевірено: без binding брокер шле позитивний ack. Лише `basic.return` перед ним каже, що повідомлення викинуто |
+| 2026-09-30 | DLX і delivery-limit — політикою через management API, тип черги — аргументом | Аргументи черги незмінні (`406` на зміну), політику брокер перезаписує на живій черзі. Ціна — споживач чекає ~2,4 с, доки політика доїде до черги |
+| 2026-09-30 | `delivery-limit` 5 на робочій черзі, `-1` на DLQ; у коді `reject`, не `nack` | Миттєві повернення без паузи не лікують транзієнтну помилку, 20 спроб — лише шум. DLQ без DLX на дефолтних 20 з'їдала б мерців після 20 переглядів. `reject` обмежений лімітом і на 4.2, і на 4.3 |
+| 2026-09-30 | `prefetch = 10` — розмір пулу БД споживача | Більше непідтверджених, ніж зʼєднань, чекали б у памʼяті одного процесу; `10 × 38 мс` ≪ 30 хв `consumer_timeout` |
+| 2026-09-30 | `eventId` — UUID v5 від `order.placed:<orderId>` | Стабільний за побудовою: будь-який повтор публікації дає той самий id. Випадковий UUID на спробу зробив би кожну спробу окремою подією |
+| 2026-09-30 | RabbitMQ 4.2.9 LTS, а не 4.3 | Підтримка до 2030 проти 2028; курсовий деплоїться на #28. Відмінності 4.3, які я перевіряв (`nack` і delivery-count), код обходить `reject` |
+| 2026-09-30 | `BROKER_URL` опціональна, у тестах — порожній рядок | Замовлення — джерело правди, подія поки побічний канал. Тести не мають лишати `order.placed` у черзі дев-споживача з локального `.env` |
 
 ## Запуск
 
@@ -1318,7 +1618,7 @@ node scripts/realtime-demo.mjs --same-room; echo "exit=$?"   # A_RECEIVED=1 · B
 ```bash
 pnpm install               # або npm install
 cp .env.example .env
-npm run db:up              # Postgres + PgBouncer + Pact Broker у compose + файли-секрети
+npm run db:up              # Postgres + PgBouncer + Pact Broker + RabbitMQ у compose + файли-секрети
 npm run build && npm run migrate && npm run seed   # схема й дані через TypeORM (розділ 7)
 npm run start              # http://localhost:3000/v1
 npm run db:bench           # окремо: бенчмарк #12 на чистому томі (розділ 6)
@@ -1328,6 +1628,8 @@ bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh   # restore-drill
 npm run test:integration && npm run test:e2e                     # testcontainers, потрібен Docker (розділ 10)
 bash scripts/with-secrets.sh dev npm run pact:gate               # контракт і гейт брокера: unknown → deployable
 node scripts/realtime-demo.mjs                                   # ізоляція кімнат socket.io, поверх npm run start (розділ 11)
+npm run consumer                                                 # споживач order.placed → бали (розділ 12)
+npm run demo:publish && npm run demo:dlq && npm run demo:duplicate   # брокер: happy path, DLQ, дубль — без npm run consumer
 
 npm run check:env          # .env.example звірений зі схемою
 npm run lint:spec          # redocly lint openapi/openapi.yaml
