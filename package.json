@@ -29,7 +29,9 @@
     "report": "bash scripts/with-secrets.sh dev node dist/report.js",
     "demo:race": "bash scripts/with-secrets.sh dev node dist/demo-race.js",
     "demo:workers": "bash scripts/with-secrets.sh dev node dist/demo-workers.js",
-    "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js"
+    "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js",
+    "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
+    "drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh"
   },
   "dependencies": {
     "@nestjs/common": "11.2.1",

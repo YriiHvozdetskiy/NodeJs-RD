@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Піднімає Postgres і готує файли-секрети. Ідемпотентний: можна запускати скільки завгодно разів.
+# Піднімає Postgres і PgBouncer і готує файли-секрети. Ідемпотентний: можна запускати скільки завгодно разів.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -16,7 +16,12 @@ mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 
 PG_ADMIN_PASSWORD="$(cat "${ADMIN_SECRET_FILE}")"
 export PG_ADMIN_PASSWORD
-docker compose up -d --wait
+# PgBouncer отримує userlist зі згенерованих паролів, а не дев-файл із репо.
+NO_RELOAD=1 bash scripts/pgbouncer-userlist.sh
+export PGBOUNCER_USERLIST=./secrets/pgbouncer_userlist.txt
+# Спершу лише db: healthcheck PgBouncer логіниться адміном, і на томі, де пароль
+# ще старий, він не пройшов би до ALTER ROLE нижче — `--wait` висів би вічно.
+docker compose up -d --wait db
 
 # Вирівнюємо паролі ролей зі вмістом файлів. Потрібно у двох випадках:
 #   • контейнер уже існував — init.sql не перевиконується, а файли могли ротуватись;
@@ -29,7 +34,9 @@ docker compose exec -T db psql -U admin -d marketplace \
 docker compose exec -T db psql -U admin -d marketplace \
   -c "ALTER ROLE admin WITH PASSWORD '$(cat "${ADMIN_SECRET_FILE}")';" >/dev/null
 
-echo "Postgres готовий на 127.0.0.1:5432, паролі ролей вирівняні з secrets/."
+docker compose up -d --wait
+
+echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:6432; паролі ролей вирівняні з secrets/."
 echo "Далі:"
 echo "  npm run start                       # застосунок на :3000"
 echo "  curl -s localhost:3000/health/db    # запит через пул"

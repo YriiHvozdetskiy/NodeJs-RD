@@ -1,6 +1,7 @@
-# Локальна інфраструктура курсового проєкту. Поки що — лише Postgres:
-# застосунок на цьому етапі зручніше тримати на хості (`npm run start`),
-# бо ротація перевіряється через uptime процесу, а не контейнера.
+# Локальна інфраструктура курсового проєкту: Postgres, PgBouncer перед ним і
+# (лише для restore-drill) чистий Postgres для відновлення. Застосунок на цьому
+# етапі зручніше тримати на хості (`npm run start`), бо ротація перевіряється
+# через uptime процесу, а не контейнера.
 name: marketplace
 
 services:
@@ -39,6 +40,60 @@ services:
       timeout: 3s
       retries: 15
     restart: unless-stopped
+
+  # Пулер на боці БД. Застосунок ходить сюди, а не в db:5432 напряму.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    # Loopback, як і в db: грейдер і застосунок ходять із хоста.
+    ports:
+      - '127.0.0.1:6432:6432'
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      # Свіжий клон: дев-креденшел із репозиторію. Робоча машина: db-up.sh
+      # генерує secrets/pgbouncer_userlist.txt зі згенерованих паролів і
+      # передає шлях сюди — той самий прийом, що з PG_ADMIN_PASSWORD вище.
+      - ${PGBOUNCER_USERLIST:-./pgbouncer/userlist.txt}:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    # Перевіряє весь ланцюжок, а не лише відкритий порт: логін адміном через
+    # PgBouncer у Postgres. Пароль береться з того самого userlist, який
+    # змонтований, тож перевірка працює і з дев-, і зі згенерованим файлом.
+    # Рядок (а не список) compose виконує через shell — як CMD-SHELL.
+    healthcheck:
+      test: >-
+        PGPASSWORD="$$(sed -n 's/^"admin" "\(.*\)"$$/\1/p' /etc/pgbouncer/userlist.txt)"
+        psql -h 127.0.0.1 -p 6432 -U admin -d marketplace -Atc 'SELECT 1' >/dev/null
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  # Чистий Postgres для restore-drill. Без профілю `drill` не стартує:
+  # scripts/restore-drill.sh піднімає його сам і сам прибирає разом із томом.
+  # Том даних навмисно анонімний: `rm -v` зносить його разом із контейнером,
+  # тож кожен прогін починається з порожньої бази.
+  restore:
+    image: postgres:17-alpine
+    profiles: ['drill']
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: marketplace-dev
+      POSTGRES_DB: marketplace
+    volumes:
+      - type: volume
+        target: /var/lib/postgresql/data
+      # Ролі в pg_dump не потрапляють — вони живуть на рівні кластера. Без
+      # app_user відновлення впало б на першому ж GRANT з міграцій.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # -h 127.0.0.1 обовʼязковий: поки entrypoint виконує init.sql, Postgres
+    # слухає лише unix-сокет, і pg_isready без -h сказав би «готовий» тимчасовому
+    # серверу, який за мить перезапуститься посеред pg_restore.
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U admin -d marketplace']
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
 volumes:
   pgdata:

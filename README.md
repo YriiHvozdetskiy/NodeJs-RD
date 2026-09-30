@@ -206,8 +206,9 @@ books`. `Promotion`, `Payment` і `PointsEntry` уже і в схемі, і в �
 «Сховище» для `DB_URL` — не окремий сервіс, а те, що зафіксовано на #11: у dev
 це `.env` поза git плюс файл-секрет, у prod — оточення й секрет-волюм
 оркестратора; Infisical/Vault названі як наступний крок у «Куди це росте».
-Значення вказує на базу цього репозиторію (`marketplace` на `127.0.0.1:5432`),
-і жоден трекнутий env-файл, крім `.env.example`, його не містить:
+Значення вказує на базу цього репозиторію через PgBouncer (`marketplace` на
+`127.0.0.1:6432`; сам Postgres на `:5432` лишився для адмінських задач —
+розділ 9), і жоден трекнутий env-файл, крім `.env.example`, його не містить:
 
 ```bash
 for f in $(git ls-files | grep -E '\.env($|\.)' | grep -vE '\.example$'); do grep -lE '^(DATABASE_URL|DB_URL)=' "$f"; done   # порожньо
@@ -225,6 +226,7 @@ for f in $(git ls-files | grep -E '\.env($|\.)' | grep -vE '\.example$'); do gre
 | `.env` | **ні** (`.gitignore`) | реальні значення цієї машини |
 | `secrets/db_password` | **ні** (`.gitignore`) | пароль БД, який ротується |
 | `secrets/pg_admin_password` | **ні** (`.gitignore`) | пароль адміністратора Postgres на цій машині; генерує `db-up.sh` |
+| `secrets/pgbouncer_userlist.txt` | **ні** (`.gitignore`) | обидва паролі для PgBouncer; збирає `scripts/pgbouncer-userlist.sh` |
 
 `npm run check:env` звіряє `.env.example` зі схемою і падає з `exit 1`, якщо
 файл відстав: змінна є в схемі, але не у файлі — помилка; є у файлі, але не в
@@ -695,18 +697,124 @@ Postgres 17, чиста база після `migrate` + `seed`, 2026-09-30. Ча
 - Замовлення лишається `pending`: оплата решти після балів (`amountDueCents`) —
   #22 разом з outbox.
 
+## 9. Data layer ops
+
+### Як піднято
+
+```
+застосунок ──:6432──▶ PgBouncer (transaction) ──▶ db:5432 Postgres
+backup.sh / drill ──────────────────────────────▶ db:5432   (в обхід пулера)
+```
+
+`npm run db:up` на робочій машині, `docker compose up -d --wait` на свіжому
+клоні. `DB_URL` застосунку веде на `127.0.0.1:6432`. Порт `5432` лишився
+опублікованим на loopback для адмінських задач.
+
+Конфіг — `pgbouncer/pgbouncer.ini`: `default_pool_size = 10` серверних
+з'єднань на пару (база, роль), `max_client_conn = 200`, адмін-консоль для
+`admin` (`psql -h 127.0.0.1 -p 6432 -U admin -d pgbouncer -c 'SHOW POOLS'`).
+У `pgbouncer/userlist.txt` у git лежить лише дев-креденшел адміна з compose. На
+робочій машині `db-up.sh` збирає `secrets/pgbouncer_userlist.txt` зі
+згенерованих паролів і монтує його через `PGBOUNCER_USERLIST`. Тому стек на
+робочій машині піднімаю тільки через `npm run db:up`: голий `docker compose up`
+перестворить PgBouncer із дев-файлом.
+
+### Чому transaction mode і що він ламає
+
+PgBouncer дає клієнтові backend Postgres лише на час однієї транзакції. Між
+транзакціями того самого клієнта backend може бути вже інший. Session mode
+закріплював би backend за клієнтом на все життя з'єднання: 10 інстансів × пул 10
+однаково дали б 100 процесів Postgres, тобто пулер нічого б не зекономив.
+Statement mode забороняє транзакції з кількох запитів, а на них стоїть checkout
+із #14. Ціна transaction mode — усе, що живе в сесії, а не в транзакції:
+
+1. **Сесійні `SET`** (`search_path`, `statement_timeout`, `SET ROLE`) лягають на
+   backend, а не на клієнта. Наступна транзакція клієнта може потрапити в інший
+   backend і цього `SET` не побачить. Гірше, що `SET` лишається на старому
+   backend і дістається чужому клієнту. Можна тільки `SET LOCAL` усередині
+   транзакції.
+2. **Іменовані prepared statements** живуть у backend: у сусідньому backend
+   отримаєш `prepared statement "…" does not exist`. Драйвер `pg` без `name:`
+   іменованих не створює, а `max_prepared_statements = 200` (PgBouncer ≥ 1.21)
+   страхує на випадок, коли хтось такий запит додасть.
+3. **`LISTEN`/`NOTIFY`**: підписка належить сесії, тож повідомлення прийдуть у
+   backend, який уже обслуговує когось іншого.
+4. **Сесійні advisory-локи** `pg_advisory_lock`: лок бере один backend, а
+   `unlock` приходить в інший, і лок висить. Працює тільки
+   `pg_advisory_xact_lock`.
+5. **`TEMP`-таблиці й курсори `WITH HOLD`** між транзакціями зникають.
+
+У коді нічого з цього немає (`grep -rnE "\bSET\b|LISTEN|advisory|name: *'" src`
+знаходить лише `UPDATE … SET`). `migrate`, `seed`, `demo:race`, `demo:workers`,
+`demo:retry`, `report` і `/health/db` пройдені через `:6432`. `pg_dump` ставить
+сесійні `SET` до свого `BEGIN`, тому бекап іде в обхід пулера.
+
+### Ротація пароля через PgBouncer
+
+PgBouncer перевіряє клієнтів паролем з userlist і тим самим паролем логіниться в
+Postgres. Тому `rotate.sh` тепер між оновленням файла-секрета й обривом старих
+з'єднань перезбирає userlist і робить `RELOAD` (крок 2б). Тут була пастка.
+PgBouncer перечитує `auth_file`, тільки якщо змінились його `mtime` (у секундах)
+або розмір. Розмір у нас сталий, бо паролі однакової довжини, а дві ротації за
+секунду дають той самий `mtime`. У результаті `RELOAD` мовчки лишав старий
+пароль: 3 з 8 ротацій поспіль, і застосунок отримував
+`password authentication failed`. `scripts/pgbouncer-userlist.sh` тепер сам
+зсуває `mtime` і не повертає керування, доки логін новим паролем через PgBouncer
+не пройде. Після цього 15 ротацій із 15, застосунок не рестартував.
+
+### Бекап
+
+```bash
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+# backup: marketplace → 40K (38774 B), 82 обʼєктів у TOC, 0.18 с
+# контрольне значення: orders[count|sum(total_cents)]=125|30500735 · tables …
+# /…/backups/marketplace-2026-09-27T193832Z.dump
+```
+
+`pg_dump -Fc` запускається всередині контейнера `db`, тож його версія збігається
+з версією сервера. Роль, пароль і базу він бере з `DATABASE_URL`, а ходить по TCP,
+тобто пароль справді перевіряється. Дамп лягає в `backups/` на хості, поза
+контейнером, під іменем із датою UTC. Останнім рядком скрипт друкує шлях.
+
+Поруч лягає `.fingerprint` — контрольне значення: `count|sum(total_cents)` по
+`orders` плюс точна кількість рядків кожної таблиці. Його знято в **тому самому
+знімку**, що й дамп (`pg_export_snapshot()` → `pg_dump --snapshot`). Окремий
+запит до чи після дампу під записами давав би фальшивий MISMATCH. Архів
+перевіряється `pg_restore --list` ще до того, як отримає остаточне ім'я, а
+зберігаються 14 найсвіжіших. Розклад — `backup.cron`, щоночі о 03:00.
+
+### Відновлення
+
+```bash
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh   # … MATCH
+```
+
+Drill бере найсвіжіший дамп, піднімає сервіс `restore` (профіль `drill`) з
+новим порожнім томом і переконується, що в ньому 0 таблиць. Далі
+`pg_restore --no-owner --single-transaction --exit-on-error`, звірка з
+`.fingerprint` і MATCH або код 1. Контейнер і том скрипт прибирає сам. У `restore`
+змонтований `db/init.sql`, бо ролі живуть на рівні кластера і в `pg_dump` не
+потрапляють: без `app_user` відновлення впало б на першому `GRANT`.
+
+Справжнє відновлення — той самий `pg_restore` у нову базу, потім новий `host` у
+`[databases]` і `RELOAD` PgBouncer. Застосунок не рестартує: адреса PgBouncer
+лишається тією самою. Виміряні RTO і RPO — у [`RESTORE-DRILL.md`](RESTORE-DRILL.md):
+RTO drill-у 2.19 с, RPO розкладу до 24 год (чесно — до 48 год, поки немає
+алерта на впалий бекап).
+
 ## Grading
 
 Свіжий клон, чиста БД, без доступу до сховища:
 
 ```bash
 docker compose up -d --wait
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=marketplace-dev DB_NAME=marketplace
+export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=admin DB_PASSWORD=marketplace-dev DB_NAME=marketplace
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 ```
 
 `DB_*` — дев-креденшели з `docker-compose.yml` (`POSTGRES_USER: admin`,
-дефолт `PG_ADMIN_PASSWORD`, `POSTGRES_DB: marketplace`). Далі — команди з
+дефолт `PG_ADMIN_PASSWORD`, `POSTGRES_DB: marketplace`). Порт — PgBouncer, як і в
+застосунку: міграції, seed і демо ходять через пулер (розділ 9). Далі — команди з
 acceptance criteria як є:
 
 ```bash
@@ -735,6 +843,45 @@ grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "40001
 Сід наливає покупцям 4–7 по 1 000 000 балів, щоб у `demo:race` обмежував лише
 stock. Кожен прогін `demo:race` і `demo:retry` створює власні товари, тож
 повторний запуск не потребує скидання бази.
+
+ДЗ #15 (розділ 9). Свіжий клон, чиста БД; `DATABASE_URL` дивиться на PgBouncer:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL=postgres://admin:marketplace-dev@127.0.0.1:6432/marketplace
+export SKIP_VAULT=1    # у грейдера немає доступу до сховища
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
+```
+
+Обидва скрипти читають `DATABASE_URL` прямо з оточення: під `SKIP_VAULT=1`
+обгортка лише виконує команду, тож голий `bash scripts/backup.sh` після цих
+`export` працює так само. Без `DATABASE_URL` скрипт падає з
+`DATABASE_URL: unbound variable`. Звідти береться роль, пароль і база. Хост і
+порт — адреса PgBouncer для застосунку, а `pg_dump`/`pg_restore` ідуть у
+контейнер `db` напряму (розділ 9, «Бекап»).
+
+Перевірки з acceptance criteria:
+
+```bash
+PGPASSWORD=marketplace-dev psql -h 127.0.0.1 -p 6432 -U admin -d marketplace -c "SELECT 1"
+PGPASSWORD=marketplace-dev psql -h 127.0.0.1 -p 6432 -U admin -d pgbouncer -c "SHOW POOLS"   # marketplace … transaction
+grep -E '^(export[[:space:]]+)?(DATABASE_URL|DB_URL)=' .env.example                            # …@127.0.0.1:6432/…
+grep -E '^\s*pool_mode\s*=\s*transaction' pgbouncer/pgbouncer.ini
+pg_restore --list backups/marketplace-<дата>.dump     # шлях — останній рядок backup.sh
+grep -cE '^(@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)|([0-9*/,-]+[[:space:]]+){4}[0-9*/,-]+)[[:space:]]+.*backup' backup.cron
+grep -iE 'RTO|RPO' RESTORE-DRILL.md
+```
+
+Дамп зроблено `pg_dump` 17. `pg_restore` 16 і старіший з хоста його не
+прочитає (`unsupported version (1.16) in file header`), тоді той самий TOC дає
+`docker compose exec -T db pg_restore --list < backups/marketplace-<дата>.dump`.
+
+На чистій БД без міграцій дамп порожній: drill доводить лише, що архів
+відновлюється, і попереджає про це. Змістовний прогін — ті самі дві команди
+після `npm ci && npm run build && npm run migrate && npm run seed`. Цим
+TypeORM-скриптам окремі `DB_*` не потрібні: обгортка виводить їх із того самого
+`DATABASE_URL`.
 
 ## Журнал рішень
 
@@ -780,6 +927,11 @@ stock. Кожен прогін `demo:race` і `demo:retry` створює вла
 | 2026-09-27 | Retry — лише `40001` і `40P01`, транзакція повторюється цілком | Інші коди детерміновані або небезпечні: обрив після `COMMIT` не каже, чи транзакція пройшла, і повтор створив би друге замовлення |
 | 2026-09-27 | `one_code_per_user` створено міграцією #14 разом із checkout | Закриває відкладене 2026-09-13: тепер є транзакція, яка на індекс спирається, і 23505 від нього стає відповіддю `promo_code_used` |
 | 2026-09-27 | Сід наливає покупцям 4–7 по 1 000 000 балів, покупцю 8 — нічого | ДЗ#14 вимагає надлишкові баланси, щоб у гонці обмежував лише stock. Покупець без балів — детермінована перевірка відкату після декременту |
+| 2026-09-27 | PgBouncer у transaction mode перед Postgres; застосунок, міграції й демо ходять через `:6432` | Session mode не економить з'єднань, statement mode ламає транзакції checkout. Сесійних `SET`, іменованих statements, `LISTEN` чи advisory-локів у коді немає — перевірено `grep` і прогоном усіх демо через пулер |
+| 2026-09-27 | Userlist PgBouncer генерується з `secrets/`, у git — лише дев-креденшел адміна | Той самий прийом, що з `PG_ADMIN_PASSWORD`: свіжий клон піднімається голим `docker compose up`, а згенеровані паролі в git не потрапляють. Ціна — на робочій машині лише `npm run db:up` |
+| 2026-09-27 | `pg_dump` і drill — в обхід PgBouncer, у контейнері `db` | `pg_dump` ставить сесійні `SET` до `BEGIN` і лишив би їх на чужому backend. Бінарник із контейнера гарантовано тієї самої версії, що й сервер |
+| 2026-09-27 | Контрольне значення бекапу знімається в тому самому знімку, що й дамп | Окремий запит до чи після `pg_dump` під записами дав би фальшивий MISMATCH. Перевірено: 300 вставок під час бекапу, drill — MATCH |
+| 2026-09-27 | Бекап — у локальну теку `backups/` поза контейнером, не S3 | ДЗ#15 допускає локальну теку; S3 приїде на #26 разом зі справжнім object storage |
 
 ## Запуск
 
@@ -789,11 +941,13 @@ stock. Кожен прогін `demo:race` і `demo:retry` створює вла
 ```bash
 pnpm install               # або npm install
 cp .env.example .env
-npm run db:up              # Postgres у compose + файл-секрет
+npm run db:up              # Postgres + PgBouncer у compose + файли-секрети
 npm run build && npm run migrate && npm run seed   # схема й дані через TypeORM (розділ 7)
 npm run start              # http://localhost:3000/v1
 npm run db:bench           # окремо: бенчмарк #12 на чистому томі (розділ 6)
 npm run demo:race && npm run demo:workers && npm run demo:retry   # конкурентність (розділ 8)
+bash scripts/with-secrets.sh dev bash scripts/backup.sh          # бекап (розділ 9)
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh   # restore-drill → MATCH
 
 npm run check:env          # .env.example звірений зі схемою
 npm run lint:spec          # redocly lint openapi/openapi.yaml

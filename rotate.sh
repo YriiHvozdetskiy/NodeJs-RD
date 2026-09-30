@@ -10,8 +10,10 @@
 # Порядок кроків важливий:
 #   1. ALTER ROLE у БД — нове значення стає істиною;
 #   2. ОДРАЗУ оновити файл — щоб нові з'єднання йшли вже з новим паролем;
+#   2б. оновити userlist PgBouncer — він логіниться в Postgres тим самим паролем;
 #   3. прибити старі з'єднання — щоб наступний запит довів, що механізм працює,
-#      а не просто перевикористав з'єднання зі старим паролем.
+#      а не просто перевикористав з'єднання зі старим паролем. Через PgBouncer
+#      це його серверні з'єднання: клієнтські (застосунок → PgBouncer) живуть.
 #
 # Між 1 і 2 є вікно у мілісекунди, коли нове з'єднання зі старим паролем впаде.
 # У продакшн-менеджерах (AWS Secrets Manager rotation, Vault database engine)
@@ -36,6 +38,11 @@ docker compose exec -T db psql -U admin -d marketplace \
 
 echo "2. Оновлюю файл-секрет ${SECRET_FILE}…"
 printf '%s' "${NEW_PASSWORD}" > "${SECRET_FILE}"
+
+# Застосунок ходить через PgBouncer, а той логіниться в Postgres паролем зі
+# свого userlist. Без цього кроку нові серверні зʼєднання впали б на старому.
+echo "2б. Оновлюю userlist PgBouncer і роблю RELOAD…"
+DB_PASSWORD_FILE="${SECRET_FILE}" bash scripts/pgbouncer-userlist.sh
 
 echo -n "3. Закриваю старі з'єднання ${DB_ROLE} (закрито): "
 docker compose exec -T db psql -U admin -d marketplace -tA \

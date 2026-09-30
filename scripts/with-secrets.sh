@@ -6,7 +6,7 @@
 #
 # Сховище — те, що зафіксовано на ДЗ #11: адреса бази лежить у .env (DB_URL,
 # без пароля), пароль — у гітігнорному файлі-секреті. Обгортка перекладає їх
-# у DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME і робить exec, тож секрет
+# у DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME і DATABASE_URL і робить exec, тож секрет
 # живе лише в оточенні процесу-нащадка: ні в git, ні в історії shell, ні в
 # аргументах команди, які видно в `ps`.
 #
@@ -19,8 +19,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_SLUG="${1:-dev}"; shift || true
 [ "$#" -gt 0 ] || set -- npm run start
 
-# грейдер не має доступу до сховища: значення вже в оточенні
-if [ "${SKIP_VAULT:-0}" = "1" ]; then exec "$@"; fi
+# грейдер не має доступу до сховища: значення вже в оточенні. Досить одного
+# DATABASE_URL — DB_* для TypeORM виводяться з нього, якщо їх не задали окремо.
+if [ "${SKIP_VAULT:-0}" = "1" ]; then
+  if [ -n "${DATABASE_URL:-}" ] && [ -z "${DB_HOST:-}" ]; then
+    # shellcheck source=scripts/lib/db.sh
+    source "${ROOT}/scripts/lib/db.sh"
+    parse_database_url "${DATABASE_URL}"
+    export DB_HOST="${DBU_HOST}" DB_PORT="${DBU_PORT}" DB_USER="${DBU_USER}" \
+           DB_PASSWORD="${DBU_PASS}" DB_NAME="${DBU_NAME}"
+  fi
+  exec "$@"
+fi
 
 case "${ENV_SLUG}" in
   dev) ;;
@@ -56,5 +66,8 @@ export DB_HOST DB_PORT DB_NAME
 export DB_USER=admin
 DB_PASSWORD="$(cat "${ADMIN_SECRET_FILE}")"
 export DB_PASSWORD
+# Та сама адреса одним рядком — контракт ДЗ #15 для scripts/backup.sh і
+# scripts/restore-drill.sh. Згенеровані паролі — hex, кодувати в URL нічого.
+export DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
 
 exec "$@"

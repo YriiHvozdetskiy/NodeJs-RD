@@ -43,3 +43,4 @@ spec.json
 .claude
 *.log
 .DS_Store
+backups
