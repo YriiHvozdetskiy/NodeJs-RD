@@ -47,6 +47,7 @@
     "@nestjs/platform-express": "11.2.1",
     "@nestjs/platform-socket.io": "11.2.1",
     "@nestjs/websockets": "11.2.1",
+    "amqplib": "2.0.1",
     "express": "5.2.1",
     "express-openapi-validator": "5.6.2",
     "pg": "8.23.0",
