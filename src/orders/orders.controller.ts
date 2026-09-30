@@ -7,18 +7,43 @@ import {
   HttpCode,
   Param,
   ParseIntPipe,
+  Patch,
   Post,
   Query,
   Res,
+  Sse,
+  type MessageEvent,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
+import { interval, map, merge, takeUntil, type Observable } from 'rxjs';
 import { OrdersService, type CreateOrderItem } from './orders.service';
 import type { Order } from './orders.repository';
 import { IdempotencyService } from './idempotency.service';
+import { OrderEventsService } from './order-events.service';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 import type { Env } from '../config/env.schema';
+import type { OrderStatus } from '../entities/order.entity';
+
+/**
+ * Через скільки EventSource перепідключається після обриву. Без цього поля
+ * браузер чекає кілька секунд на свій розсуд.
+ */
+const SSE_RETRY_MS = 1000;
+
+/**
+ * Коментар `: ping` у потік. Проксі й балансувальники рвуть зʼєднання, яким
+ * нічого не пишуть (nginx — через 60 с), а статус замовлення може не
+ * змінюватись годинами. EventSource коментарі ігнорує.
+ */
+const SSE_HEARTBEAT_MS = 15_000;
+
+/** `Last-Event-ID` — рядок від клієнта; все, що не додатне ціле, означає «з початку буфера». */
+function lastEventIdOf(raw: string | undefined): number {
+  const id = Number(raw);
+  return Number.isSafeInteger(id) && id > 0 ? id : 0;
+}
 
 @Controller('orders')
 export class OrdersController {
@@ -26,6 +51,7 @@ export class OrdersController {
     private readonly orders: OrdersService,
     private readonly idempotency: IdempotencyService<Order>,
     private readonly config: ConfigService<Env, true>,
+    private readonly events: OrderEventsService,
   ) {}
 
   /** DRIFT=1 — «невинний рефакторинг»: camelCase замість snake_case, currency
@@ -52,6 +78,65 @@ export class OrdersController {
     const order = await this.orders.find(orderId);
     if (!order) throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
     return this.view(order);
+  }
+
+  /**
+   * Тіло перевіряє валідатор спеки (схема `OrderStatusChange`): сюди доходить
+   * лише статус з `enum`. Чи дозволений перехід — питання вже не форми, а
+   * стану, тому його вирішує сервіс.
+   */
+  @Patch(':orderId')
+  async changeStatus(
+    @Param('orderId', ParseIntPipe) orderId: number,
+    @Body() body: { status: OrderStatus },
+  ): Promise<unknown> {
+    return this.view(await this.orders.changeStatus(orderId, body.status));
+  }
+
+  /**
+   * SSE-потік змін статусу — `GET /orders/:id/events`, поза `/v1`
+   * (src/app.setup.ts): це не JSON-ресурс контракту, OpenAPI 3.0 потік подій
+   * не описує, і валідатор спеки його не бачить.
+   *
+   * Nest пише кожне значення як блок `event:` / `id:` / `data:` і
+   * відписується від Observable, коли клієнт закриває зʼєднання, — підписка
+   * на шину не переживає клієнта.
+   *
+   * Реконект — робота EventSource: після обриву він сам надсилає
+   * `Last-Event-ID` з останнім отриманим `id:`, і потік дограє з буфера лише
+   * те, що новіше. Без заголовка — вся історія цього замовлення, що є в
+   * буфері: новий клієнт одразу бачить, де замовлення зараз.
+   */
+  @Sse(':orderId/events')
+  async statusEvents(
+    @Param('orderId', ParseIntPipe) orderId: number,
+    @Headers('last-event-id') lastEventId?: string,
+  ): Promise<Observable<MessageEvent>> {
+    // До першого байта потоку: заголовки ще не надіслані, тож 404 приходить
+    // звичайним problem+json, а не обривом уже відкритого стриму.
+    if (!(await this.orders.find(orderId))) {
+      throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
+    }
+
+    // `retry:` їде в кожному блоці події, а не окремим першим блоком. Nest
+    // нумерує сам кожне повідомлення без `id`, крім коментарів: блок з одним
+    // `retry` вийшов би як `id: 1`, EventSource запамʼятав би 1 як останню
+    // подію, і після реконекту `Last-Event-ID: 1` дограв би вже отримане.
+    // Заголовки від цього не чекають першої події — Nest 11 відправляє їх
+    // одразу після підписки.
+    const events$ = this.events.stream(orderId, lastEventIdOf(lastEventId)).pipe(
+      map((event): MessageEvent => ({
+        id: String(event.id),
+        type: 'order.status',
+        retry: SSE_RETRY_MS,
+        data: event,
+      })),
+    );
+    const heartbeat$ = interval(SSE_HEARTBEAT_MS).pipe(
+      map((): MessageEvent => ({ comment: 'ping' })),
+      takeUntil(this.events.closed$),
+    );
+    return merge(events$, heartbeat$);
   }
 
   /**

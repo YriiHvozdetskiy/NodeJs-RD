@@ -3,13 +3,29 @@ import { checkout, CheckoutError } from '../checkout/checkout';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 import { OrmService } from '../db/orm.service';
+import type { OrderStatus } from '../entities/order.entity';
 import { UsersRepository } from '../users/users.repository';
+import { OrderEventsService } from './order-events.service';
 import { OrdersRepository, type Order } from './orders.repository';
 
 export interface CreateOrderItem {
   product_id: number;
   qty: number;
 }
+
+/**
+ * З якого статусу можна прийти в кожен. Попередник у кожного рівно один, тому
+ * перехід — це одна умова в UPDATE, а не перелік дозволених пар. `pending`
+ * тут немає: у нього не повертаються. `cancelled` — лише з `pending`: після
+ * оплати скасування означало б refund, а його в сервісі немає (README, розділ 4).
+ */
+const PREVIOUS: Partial<Record<OrderStatus, OrderStatus>> = {
+  paid: 'pending',
+  packed: 'paid',
+  shipped: 'packed',
+  delivered: 'shipped',
+  cancelled: 'pending',
+};
 
 /**
  * Власник усіх замовлень v1. Авторизації поки немає (`security: []` у спеці),
@@ -26,6 +42,7 @@ export class OrdersService {
     private readonly orders: OrdersRepository,
     private readonly users: UsersRepository,
     private readonly orm: OrmService,
+    private readonly events: OrderEventsService,
   ) {}
 
   page(limit: number, cursor?: string): Promise<Page<Order>> {
@@ -59,6 +76,32 @@ export class OrdersService {
 
     const order = await this.orders.findById(Number(orderId));
     if (!order) throw new Error(`замовлення ${orderId} закомічене, але не читається`);
+    return order;
+  }
+
+  /**
+   * Перевести замовлення в статус `to`. Подію отримують підписники шини —
+   * кімната `orders:<id>` у WebSocket і SSE-потік цього замовлення.
+   *
+   * Публікація — після COMMIT, і лише коли UPDATE справді змінив рядок.
+   * Подія про перехід, який відкотився, пообіцяла б покупцю те, чого немає в
+   * базі. UPDATE тут один і без явної транзакції, тож його повернення і є
+   * комітом.
+   *
+   * Повтор того самого статусу — 200 без нової події, як і має бути в PATCH:
+   * клієнт, що не дочекався відповіді й повторив запит, не породить другого
+   * сповіщення.
+   */
+  async changeStatus(id: number, to: OrderStatus): Promise<Order> {
+    const from = PREVIOUS[to];
+    const changed = from !== undefined && (await this.orders.transition(id, from, to));
+    if (changed) this.events.publish(id, from, to);
+
+    const order = await this.orders.findById(id);
+    if (!order) throw new HttpProblem(404, `замовлення ${id} не існує`, 'not-found');
+    if (!changed && order.status !== to) {
+      throw new HttpProblem(409, `замовлення ${id} у статусі ${order.status}, перейти в ${to} не можна`, 'conflict');
+    }
     return order;
   }
 

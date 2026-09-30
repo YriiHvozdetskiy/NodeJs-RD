@@ -65,6 +65,38 @@ export class OrdersRepository {
   }
 
   /**
+   * Перехід `from → to` одним оператором, як декремент stock у checkout (#14):
+   * умова на поточний статус стоїть у самому UPDATE, а не в `if` після SELECT.
+   * Двоє, що одночасно переводять paid → packed, не проскочать обидва: другий
+   * чекає на лок рядка, після коміту першого перечитує умову, бачить `packed`
+   * і не оновлює нічого. `false` — переходу не було: або замовлення немає, або
+   * воно вже не в `from`; що саме — вирішує сервіс.
+   */
+  async transition(id: number, from: OrderStatus, to: OrderStatus): Promise<boolean> {
+    const { rows } = await this.db.query(
+      `UPDATE orders SET status = $3 WHERE id = $1 AND status = $2 RETURNING id`,
+      [id, from, to],
+    );
+    return rows.length === 1;
+  }
+
+  /**
+   * Чи оформлене замовлення покупцем із цим email. Відсутнє замовлення й чуже
+   * дають однакове `false` — той, хто питає, не має дізнатися, що чуже існує.
+   */
+  async isOwnedBy(id: number, email: string): Promise<boolean> {
+    if (!Number.isSafeInteger(id) || id < 1) return false;
+    const { rows } = await this.db.query<{ owned: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM orders o JOIN users u ON u.id = o.buyer_id
+          WHERE o.id = $1 AND u.email = $2
+       ) AS owned`,
+      [id, email],
+    );
+    return rows[0].owned;
+  }
+
+  /**
    * Спершу сторінка замовлень (CTE з LIMIT), і лише потім JOIN позицій. Якби
    * LIMIT стояв після JOIN, він рахував би рядки order_items, а не замовлення:
    * сторінка «2 замовлення» по 3 позиції обрізала б друге посередині.

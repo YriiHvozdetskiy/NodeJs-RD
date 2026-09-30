@@ -201,6 +201,45 @@ paths:
           $ref: '#/components/responses/NotFound'
         default:
           $ref: '#/components/responses/Unexpected'
+    patch:
+      operationId: changeOrderStatus
+      tags: [orders]
+      summary: Перевести замовлення в наступний статус
+      description: |
+        Життєвий цикл: `pending → paid → packed → shipped → delivered`, а також
+        `pending → cancelled`. Назад і через крок не можна — `409`.
+
+        Запит із тим статусом, у якому замовлення вже є, — `200` з поточним
+        станом і без нової події: повтор після таймауту не породить другого
+        сповіщення.
+
+        Кожна справжня зміна статусу публікує подію `order.status` — у
+        WebSocket-кімнату `orders:<id>` (socket.io, шлях `/socket.io/`) і в
+        SSE-потік `GET /orders/{orderId}/events`. Обидва транспорти живуть поза
+        `/v1` і цією спекою не описуються.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusChange'
+      responses:
+        '200':
+          description: Замовлення в запитаному статусі
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Unexpected'
 
 components:
 
@@ -421,14 +460,28 @@ components:
           enum: [UAH]
           example: UAH
         status:
-          type: string
-          enum: [pending, paid, cancelled]
-          description: v1 створює замовлення тільки в статусі `pending`.
-          example: pending
+          $ref: '#/components/schemas/OrderStatus'
         created_at:
           type: string
           format: date-time
           example: '2026-08-20T09:12:00.000Z'
+
+    OrderStatus:
+      type: string
+      enum: [pending, paid, packed, shipped, delivered, cancelled]
+      description: |
+        v1 створює замовлення тільки в статусі `pending`. Далі — через
+        `PATCH /orders/{orderId}`: `pending → paid → packed → shipped → delivered`
+        або `pending → cancelled`.
+      example: pending
+
+    OrderStatusChange:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          $ref: '#/components/schemas/OrderStatus'
 
     OrderPage:
       type: object
@@ -478,8 +531,10 @@ components:
 
     Conflict:
       description: |
-        Запит із цим `Idempotency-Key` ще опрацьовується. Клієнту слід повторити
-        пізніше — це не помилка в його даних.
+        Запит коректний, але суперечить поточному стану. Три випадки: запит із
+        цим `Idempotency-Key` ще опрацьовується (повторити пізніше з тим самим
+        ключем), товару не вистачає на складі, або статус замовлення не
+        дозволяє запитаного переходу. Це не помилка в даних клієнта.
       content:
         application/problem+json:
           schema:

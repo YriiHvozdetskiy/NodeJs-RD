@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import express from 'express';
-import type { NestApplicationOptions } from '@nestjs/common';
+import { RequestMethod, type NestApplicationOptions } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { middleware as openApiValidator } from 'express-openapi-validator';
 import { ProblemFilter } from './common/problem.filter';
@@ -35,7 +35,13 @@ export function configureApp(app: NestExpressApplication): NestExpressApplicatio
   //
   // `/health` із префікса виключений: версіонується публічний контракт, а не
   // те, що читають оркестратор і грейдер.
-  app.setGlobalPrefix('v1', { exclude: ['health', 'health/db'] });
+  //
+  // SSE-потік `/orders/:id/events` — теж поза `/v1`: це не JSON-ресурс, а
+  // транспорт подій, як і `/socket.io/` поруч. OpenAPI 3.0 його не описує, і
+  // версія JSON-контракту до нього не стосується.
+  app.setGlobalPrefix('v1', {
+    exclude: ['health', 'health/db', { path: 'orders/:orderId/events', method: RequestMethod.GET }],
+  });
 
   app.use(
     openApiValidator({
@@ -44,9 +50,9 @@ export function configureApp(app: NestExpressApplication): NestExpressApplicatio
       // ОСЬ ТОЙ, ХТО ЗВІРЯЄ. Без цього рядка спека — красивий файл: обробник міг
       // би віддати totalCents замість total_cents, і нічого б не помітило.
       validateResponses: true,
-      // Операційні ендпоїнти у спеці відсутні навмисно — без цього рядка
-      // валідатор віддавав би на них 404 «not found in the OpenAPI spec».
-      ignorePaths: /^\/health(\/|$)/,
+      // Операційні ендпоїнти й SSE-потік у спеці відсутні навмисно — без цього
+      // рядка валідатор віддавав би на них 404 «not found in the OpenAPI spec».
+      ignorePaths: /^\/(health(\/|$)|orders\/[^/]+\/events$)/,
     }),
   );
 
