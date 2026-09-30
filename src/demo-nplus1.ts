@@ -7,16 +7,53 @@ import { QueryCountLogger } from './query-count-logger';
  * N+1 на реальному для домену запиті: «сторінка замовлень із позиціями й
  * товарами» — граф order → items → product, два рівні зв'язків.
  *
- * Кожну стратегію проганяємо на двох розмірах вибірки (5 і 10 замовлень).
- * Сам факт «після = 1» ще нічого не доводить; доводить те, що «до» росте
- * разом із N, а «після» лишається тим самим числом.
+ * Кожну стратегію проганяємо на кількох розмірах вибірки. Сам факт
+ * «після = 1» ще нічого не доводить; доводить те, що «до» росте разом із N,
+ * а «після» лишається тим самим числом на кожному N.
  *
- * Потрібен seed (`npm run seed`): id замовлень 1…10.
+ * Розміри — аргументами або змінною оточення, без них — 5 і 10 (стільки
+ * замовлень дає seed):
+ *   npm run demo:nplus1 -- 5 10 20
+ *   NPLUS1_SIZES=5,10,20 npm run demo:nplus1
+ * Id не вгадуються: демо бере перші N замовлень, які реально є в базі, тож
+ * на більшій базі воно міряє більшу вибірку, а не ті самі десять рядків.
  */
 const logger = new QueryCountLogger(['query']);
 const dataSource = new DataSource({ ...dataSourceOptions, logging: ['query'], logger });
 
-type Loaded = { orders: number; items: number; units: number };
+interface Loaded {
+  orders: number;
+  items: number;
+  units: number;
+}
+
+interface Measurement {
+  strategy: string;
+  queries: number[];
+  items: number[];
+}
+
+const DEFAULT_SIZES = [5, 10];
+
+/**
+ * Розміри з argv (`5 10 20` або `5,10,20`), інакше з NPLUS1_SIZES, інакше
+ * дефолт. Мінімум два різні розміри: з одного не видно ні росту «до», ні
+ * сталості «після».
+ */
+function parseSizes(): number[] {
+  const args = process.argv.slice(2);
+  const raw = args.length > 0 ? args.join(',') : (process.env.NPLUS1_SIZES ?? '');
+  if (raw.trim() === '') return DEFAULT_SIZES;
+
+  const parts = raw.split(',').map((part) => part.trim()).filter((part) => part !== '');
+  const invalid = parts.find((part) => !/^[1-9]\d*$/.test(part));
+  if (invalid !== undefined) throw new Error(`Розмір вибірки має бути цілим числом ≥ 1, отримано «${invalid}»`);
+  const sizes = parts.map(Number);
+
+  const unique = [...new Set(sizes)].sort((a, b) => a - b);
+  if (unique.length < 2) throw new Error('Потрібно щонайменше два різні розміри, наприклад: npm run demo:nplus1 -- 5 10');
+  return unique;
+}
 
 /** Однаковий підсумок з кожної стратегії — доказ, що фікс віддає ті самі дані. */
 function summarize(orders: { items: { qty: number; product: Product }[] }[]): Loaded {
@@ -78,10 +115,24 @@ const strategies: Record<string, (ids: string[]) => Promise<Loaded>> = {
 };
 
 async function main() {
+  const sizes = parseSizes();
+  const maxSize = sizes[sizes.length - 1];
+
   await dataSource.initialize();
   try {
-    const sizes = [5, 10];
-    const idsFor = (n: number) => Array.from({ length: n }, (_, i) => String(i + 1));
+    // Перші maxSize замовлень, які справді є в базі. Цей запит не входить у
+    // заміри: лічильник скидається перед кожною стратегією.
+    const available = await dataSource
+      .getRepository(Order)
+      .find({ select: { id: true }, order: { id: 'ASC' }, take: maxSize });
+    if (available.length < maxSize) {
+      throw new Error(
+        `Запитано N = ${maxSize}, а замовлень у базі ${available.length}. ` +
+          'Зменш розмір або налий більше даних (npm run seed дає 10).',
+      );
+    }
+    const orderIds = available.map((o) => o.id);
+    const idsFor = (n: number) => orderIds.slice(0, n);
 
     console.log(`── Як N+1 виглядає в лозі SQL (наївно, N = ${sizes[0]}) ──`);
     logger.echo = true;
@@ -89,27 +140,34 @@ async function main() {
     await strategies['наївно (запит у циклі)'](idsFor(sizes[0]));
     logger.echo = false;
 
-    const rows: Record<string, string | number>[] = [];
-    for (const [name, run] of Object.entries(strategies)) {
-      const row: Record<string, string | number> = { стратегія: name };
+    const measurements: Measurement[] = [];
+    for (const [strategy, run] of Object.entries(strategies)) {
+      const measurement: Measurement = { strategy, queries: [], items: [] };
       for (const n of sizes) {
         logger.reset();
         const loaded = await run(idsFor(n));
-        row[`запитів, N=${n}`] = logger.count;
-        row[`позицій, N=${n}`] = loaded.items;
+        measurement.queries.push(logger.count);
+        measurement.items.push(loaded.items);
       }
-      rows.push(row);
+      measurements.push(measurement);
     }
 
     console.log('\n── Кількість SQL-запитів «до» і «після» ──');
-    console.table(rows);
+    console.table(
+      measurements.map((m) =>
+        Object.fromEntries([
+          ['стратегія', m.strategy],
+          ...sizes.map((n, i) => [`N=${n} (${m.items[i]} поз.)`, m.queries[i]]),
+        ]),
+      ),
+    );
 
-    const [naive, ...fixed] = rows;
-    const grows = naive[`запитів, N=${sizes[1]}`] > naive[`запитів, N=${sizes[0]}`];
-    const constant = fixed.every((r) => r[`запитів, N=${sizes[0]}`] === r[`запитів, N=${sizes[1]}`]);
+    const [naive, ...fixed] = measurements;
+    const grows = naive.queries.every((count, i) => i === 0 || count > naive.queries[i - 1]);
+    const constant = fixed.every((m) => m.queries.every((count) => count === m.queries[0]));
     console.log(
-      `До: ${naive[`запитів, N=${sizes[0]}`]} → ${naive[`запитів, N=${sizes[1]}`]} (росте з N: ${grows ? 'так' : 'НІ'}). ` +
-        `Після: ${fixed.map((r) => r[`запитів, N=${sizes[1]}`]).join(' / ')} (не залежить від N: ${constant ? 'так' : 'НІ'}).`,
+      `До: ${naive.queries.join(' → ')} (росте з N: ${grows ? 'так' : 'НІ'}). ` +
+        `Після: ${fixed.map((m) => m.queries[0]).join(' / ')} (не залежить від N: ${constant ? 'так' : 'НІ'}).`,
     );
     if (!grows || !constant) process.exitCode = 1;
   } finally {
