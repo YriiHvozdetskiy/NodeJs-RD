@@ -49,9 +49,11 @@ const logRetry = (e: RetryEvent) =>
  * повторити лише UPDATE з уже прочитаним значенням — це той самий lost update,
  * тільки з логом. Читання мають бути зроблені наново, на свіжому снапшоті.
  *
- * Backoff експоненційний із full jitter: пауза випадкова в [0, base·2^n].
+ * Backoff експоненційний із full jitter: пауза випадкова в [1, base·2^n] мс.
  * Без випадковості транзакції, що зіткнулися, прокидаються одночасно й
- * стикаються знову — той самий шквал, тільки зсунутий у часі.
+ * стикаються знову — той самий шквал, тільки зсунутий у часі. Нижня межа 1 мс,
+ * а не 0: нульова пауза кидала б повтор у ту саму конкуренцію без жодного
+ * відступу.
  */
 export async function withRetry<T>(run: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const { label = 'tx', maxAttempts = 8, baseDelayMs = 10, maxDelayMs = 500, onRetry = logRetry } = options;
@@ -63,7 +65,7 @@ export async function withRetry<T>(run: () => Promise<T>, options: RetryOptions 
       const code = pgErrorField(err, 'code');
       if (code === undefined || !RETRYABLE.has(code) || attempt >= maxAttempts) throw err;
 
-      const delayMs = Math.floor(Math.random() * Math.min(maxDelayMs, baseDelayMs * 2 ** attempt));
+      const delayMs = Math.max(1, Math.floor(Math.random() * Math.min(maxDelayMs, baseDelayMs * 2 ** attempt)));
       onRetry({ label, code, attempt, maxAttempts, delayMs });
       await sleep(delayMs);
     }

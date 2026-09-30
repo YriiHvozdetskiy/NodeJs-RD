@@ -50,7 +50,9 @@ async function main() {
     const [check] = await dataSource.query(
       `SELECT count(*) FILTER (WHERE processed > 1)::int                             AS twice,
               count(*) FILTER (WHERE id = ANY($2::bigint[]) AND (status <> 'done' OR processed <> 1))::int AS lost,
-              count(*) FILTER (WHERE id = ANY($2::bigint[]) AND attempts > 1)::int  AS retried
+              count(*) FILTER (WHERE id = ANY($2::bigint[]) AND attempts > 1)::int  AS retried,
+              count(*) FILTER (WHERE id = ANY($2::bigint[]) AND payload->>'failOnce' = 'true'
+                                 AND status = 'done' AND processed = 1 AND attempts >= 2)::int AS recovered
          FROM jobs
         WHERE id = ANY($1::bigint[]) OR id = ANY($2::bigint[])`,
       [doneIds, batch.map((b) => b.id)],
@@ -65,7 +67,7 @@ async function main() {
     console.log(`оброблено всього: ${processed}`);
     console.log(`оброблено двічі: ${check.twice}`);
     console.log(`загублено (не done або processed ≠ 1): ${check.lost}`);
-    console.log(`виконано з другої спроби після збою: ${check.retried}`);
+    console.log(`задач, виконаних не з першої спроби: ${check.retried}`);
     console.log(`час: ${elapsedMs} мс (послідовно було б ${processed} × ${JOB_WORK_MS} = ${sequentialMs} мс)`);
 
     const activeWorkers = byWorker.filter((w) => w.jobs > 0).length;
@@ -73,7 +75,10 @@ async function main() {
       ['жодна задача не оброблена двічі', check.twice === 0],
       ['жодна задача не загубилась', check.lost === 0],
       [`задачі розподілились по ≥ 2 воркерах (${activeWorkers})`, activeWorkers >= 2],
-      ['задача зі збоєм виконана після повтору', check.retried === 1],
+      // Інваріант — доля саме тієї задачі, що впала: після повтору вона done
+      // рівно один раз. Скільки ще задач пішло на повтор через випадкові збої,
+      // на коректність черги не впливає.
+      ['задача зі збоєм виконана після повтору рівно один раз', check.recovered === 1],
       ['паралельно швидше за послідовно', elapsedMs < sequentialMs],
     ];
     for (const [name, ok] of invariants) console.log(`  ${ok ? '✓' : '✗'} ${name}`);
