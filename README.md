@@ -227,6 +227,8 @@ for f in $(git ls-files | grep -E '\.env($|\.)' | grep -vE '\.example$'); do gre
 | `secrets/db_password` | **ні** (`.gitignore`) | пароль БД, який ротується |
 | `secrets/pg_admin_password` | **ні** (`.gitignore`) | пароль адміністратора Postgres на цій машині; генерує `db-up.sh` |
 | `secrets/pgbouncer_userlist.txt` | **ні** (`.gitignore`) | обидва паролі для PgBouncer; збирає `scripts/pgbouncer-userlist.sh` |
+| `secrets/pact_broker_url` | **ні** (`.gitignore`) | адреса Pact Broker; `db-up.sh` кладе туди брокер із compose (розділ 10) |
+| `secrets/pact_broker_token` | **ні** (`.gitignore`) | токен хмарного брокера; для брокера з compose файла немає |
 
 `npm run check:env` звіряє `.env.example` зі схемою і падає з `exit 1`, якщо
 файл відстав: змінна є в схемі, але не у файлі — помилка; є у файлі, але не в
@@ -692,8 +694,9 @@ Postgres 17, чиста база після `migrate` + `seed`, 2026-09-30. Ча
 
 ### Чого тут ще немає
 
-- `POST /v1/orders` досі in-memory з #9. Checkout — функція над `DataSource`, її
-  викликають демо; у Nest-модуль вона переїде разом із `TypeOrmModule`.
+- Ключі `Idempotency-Key` досі живуть у памʼяті процесу (#9): замовлення з #16
+  вже в Postgres через `checkout()` (розділ 10), а ключі — ні. Спільне сховище —
+  Redis на #23.
 - Замовлення лишається `pending`: оплата решти після балів (`amountDueCents`) —
   #22 разом з outbox.
 
@@ -802,6 +805,168 @@ Drill бере найсвіжіший дамп, піднімає сервіс `r
 RTO drill-у 2.19 с, RPO розкладу до 24 год (чесно — до 48 год, поки немає
 алерта на впалий бекап).
 
+## 10. Тестування
+
+Три рівні, і кожен ловить те, чого не бачить попередній: integration — SQL і
+constraint-и справжнього Postgres; E2E — увесь Nest-застосунок від HTTP до
+`COMMIT`; контракт — що фронтенд і сервіс однаково розуміють ту саму відповідь.
+
+| Команда | Що перевіряє | Де |
+| --- | --- | --- |
+| `npm run test:integration` | три репозиторії проти `postgres:16-alpine` із testcontainers: UNIQUE, FK, CHECK, `ON CONFLICT`, JOIN + `json_agg`, keyset-сторінки — 13 тестів | `test/integration/` |
+| `npm run test:e2e` | `AppModule` без жодної підміни + supertest: створити → прочитати, 404, 400 від валідатора спеки, 409 з відкатом checkout | `test/e2e/` |
+| `npm run test:contract` | consumer `marketplace-web` → `pacts/marketplace-web-marketplace-api.json` | `test/contract/consumer.pact.test.ts` |
+| `npm run verify:provider` | справжній застосунок + Postgres проти контракту; із `PACT_BROKER_URL` — контракт із брокера й публікація результату | `test/contract/provider.verify.test.ts` |
+| `npm run pact:gate` | локальний гейт від початку до кінця: publish → verify → can-i-deploy «ні» → тег prod → «так» | `scripts/pact-broker.sh` |
+
+Потрібен лише запущений Docker. `DATABASE_URL` тестам не потрібен: адресу видає
+сам контейнер (`container.getConnectionUri()`), і застосунок в E2E отримує її
+тим самим каналом, що й у проді, — `DB_URL` без пароля плюс файл із паролем
+(розділ 5). Тести збирає `tsc` у `dist-test/` (`tsconfig.test.json`), jest
+запускає вже скомпільоване — без ts-jest і без транспіляції на льоту, з тієї ж
+причини, що й відмова від `tsx`: декоратор-метадані мусять бути. У
+`jest.config.js` — `reporters: ['default']` і `maxWorkers: 1`: кожен воркер
+піднімав би власні контейнери.
+
+### Ізоляція
+
+Контейнер на кожен файл, а всередині файла репозиторних тестів — транзакція на
+кожен тест: `BEGIN` у `beforeEach`, `ROLLBACK` в `afterEach`
+(`test/testkit/isolation.ts`). Репозиторії приймають `Queryable` — «щось із
+`query()`», тож тест підставляє їм клієнт із відкритою транзакцією замість пулу.
+
+Чому ROLLBACK: він коштує мілісекунди й не залежить від переліку таблиць —
+`TRUNCATE` довелося б тримати в синхроні зі схемою, а контейнер на кожен тест
+коштує секунди. Межа в нього чесна: застосунок в E2E і `checkout()` беруть
+з'єднання зі своїх пулів, і транзакція тесту для них не існує, тому там
+ізоляцію дають унікальні дані з builders і контейнер, що зникає разом із
+файлом. Другий прогін поспіль нічого не успадковує від першого:
+`npm run test:integration && npm run test:integration` зелені без чистки.
+
+Builders — `aUser()`, `aProduct()`, `anOrder()` у `test/testkit/builders.ts`:
+валідні дефолти, що проходять усі CHECK-и схеми, унікальні email і назви з
+лічильника, залежності (продавця товару, покупця й товар замовлення) builder
+створює сам. У тесті видно лише поле, від якого залежить перевірка:
+`aProduct().withStock(1)`, `anOrder().createdAt('…')`.
+
+### Що змінилось у застосунку
+
+До #16 `/v1/products` і `/v1/orders` працювали на масивах у памʼяті — E2E не
+мав би що перевіряти в базі. Тепер обидва читають Postgres через репозиторії, а
+`POST /v1/orders` іде через `checkout()` з #14 (`OrmService` — `DataSource`
+TypeORM усередині Nest, розділ 8). Власник замовлень v1 — гість
+`guest@marketplace.local`: тіло `CreateOrder` покупця не містить свідомо, і
+`UsersRepository.ensureBuyer` створює його одним `INSERT … ON CONFLICT`. На #24
+id покупця прийде з токена. Конфігурацію застосунку (body-parser, префікс `/v1`,
+валідатор спеки, фільтр problem+json) `main.ts` і тести беруть з однієї функції
+`configureApp` у `src/app.setup.ts`.
+
+Тести знайшли одну справжню помилку. Курсор пагінації тримав `created_at` із
+точністю JS `Date` — до мілісекунди, а `timestamptz` зберігає мікросекунди.
+Курсор, округлений униз, губив рядки з тієї самої мілісекунди, і це не
+екзотика: `now()` у Postgres — час початку транзакції, тож усі рядки одного
+INSERT-а мають однаковий час. Тепер позицію курсора віддає сама база текстом
+(`to_char(… 'US')`, `src/common/cursor.ts`). З мілісекундним курсором падають
+обидва тести пагінації в `products.repository.test.ts`.
+
+### Контракт
+
+Консюмер — уявний фронтенд `marketplace-web` (його клієнт —
+`test/contract/marketplace-client.ts`), провайдер — цей сервіс, `marketplace-api`.
+Три interactions, кожна з provider state:
+
+| State | Запит | Відповідь |
+| --- | --- | --- |
+| `order 1001 exists` | `GET /orders/1001` | 200, `Order` |
+| `product 501 is in stock` | `POST /orders` з `Idempotency-Key` | 201, `Order` і `Location` |
+| `order 999999 does not exist` | `GET /orders/999999` | 404 problem+json, `type` …`/not-found` |
+
+Шляхи без `/v1`, як і в спеці: версія живе в `servers.url`, тому клієнт тримає
+її в базовій адресі, а верифікація ходить на `http://127.0.0.1:<порт>/v1`.
+`stateHandlers` (`test/contract/provider-states.ts`) сідять БД провайдера
+через `INSERT … OVERRIDING SYSTEM VALUE … ON CONFLICT DO NOTHING`, тож виклик
+того самого стану вдруге нічого не ламає. Матчери (`integer`, `eachLike`,
+`iso8601DateTimeWithMillis`) — там, де значення є властивістю даних; точно
+зафіксовано лише те, на чому клієнт будує логіку: `currency`, `status` нового
+замовлення, `type` помилки.
+
+`pacts/` — у `.gitignore`: контракт генерує consumer-тест і локально, і в CI, а
+спільна копія живе в брокері.
+
+### Брокер локально
+
+`pact-broker` — сервіс у `docker-compose.yml` на `127.0.0.1:9292`. Сховище —
+sqlite усередині контейнера: `docker compose rm -sf pact-broker` повертає
+брокер у порожній стан, і гейт нижче відтворюється на кожному прогоні.
+
+Адреса й токен брокера живуть у сховищі #11: `secrets/pact_broker_url` (його
+створює `npm run db:up`) і, для хмарного брокера, `secrets/pact_broker_token`.
+`scripts/with-secrets.sh` перекладає їх у `PACT_BROKER_URL` і
+`PACT_BROKER_TOKEN`; код читає тільки `process.env`. Немає файла — немає
+змінної, і `verify:provider` звіряється з локальним `pacts/*.json`. У CI ті самі
+змінні приходять із secrets GitHub.
+
+```bash
+bash scripts/with-secrets.sh dev npm run verify:provider        # основний шлях: значення зі сховища
+PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider   # аварійний: значення напряму, без сховища
+```
+
+Друга форма — для грейдера, у якого немає доступу до сховища. Під
+`SKIP_VAULT=1` обгортка виконує команду як є, тож це рівно та сама команда без
+сховища. Версія провайдера в брокері — короткий хеш коміту
+(`git rev-parse --short HEAD`), якщо не задано `PACT_PROVIDER_VERSION`; саме на
+неї лягає тег prod.
+
+### Гейт: «не можна» → «можна»
+
+```bash
+docker compose up -d --wait
+export PACT_BROKER_URL=http://127.0.0.1:9292
+V=$(git rev-parse --short HEAD)       # і версія консюмера, і версія провайдера
+npm run test:contract
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/$V" \
+  -H 'Content-Type: application/json' -d @pacts/marketplace-web-marketplace-api.json    # 201
+PACT_BROKER_URL=$PACT_BROKER_URL npm run verify:provider                                   # exit 0
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$V&to=prod"     # «до тега»
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/$V/tags/prod" \
+  -H 'Content-Type: application/json'                                                      # 201
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$V&to=prod"     # «після тега»
+```
+
+Мій прогін, 2026-09-30. `can-i-deploy` після верифікації, до тега prod:
+
+```json
+{"summary":{"deployable":null,"reason":"There is no verified pact between version ef291ce of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)","success":0,"failed":0,"unknown":1},"notices":[{"type":"error","text":"There is no verified pact between version ef291ce of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)"}],"matrix":[{"consumer":{"name":"marketplace-web","version":{"number":"ef291ce","branch":null,"branches":[],"branchVersions":[],"environments":[],"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-web/versions/ef291ce"}},"tags":[]},"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-web"}}},"provider":{"name":"marketplace-api","version":null,"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-api"}}},"pact":{"createdAt":"2026-09-30T19:13:15+00:00","_links":{"self":{"href":"http://127.0.0.1:9292/pacts/provider/marketplace-api/consumer/marketplace-web/version/ef291ce"}}},"verificationResult":null}]}
+```
+
+Та сама команда після тега prod на версію провайдера:
+
+```json
+{"summary":{"deployable":true,"reason":"All required verification results are published and successful","success":1,"failed":0,"unknown":0},"notices":[{"type":"success","text":"All required verification results are published and successful"}],"matrix":[{"consumer":{"name":"marketplace-web","version":{"number":"ef291ce","branch":null,"branches":[],"branchVersions":[],"environments":[],"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-web/versions/ef291ce"}},"tags":[]},"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-web"}}},"provider":{"name":"marketplace-api","version":{"number":"ef291ce","branch":"16_IntegrationE2e","branches":[{"name":"16_IntegrationE2e","latest":true,"_links":{"self":{"title":"Branch version","name":"16_IntegrationE2e","href":"http://127.0.0.1:9292/pacticipants/marketplace-api/branches/16_IntegrationE2e/versions/ef291ce"}}}],"branchVersions":[{"name":"16_IntegrationE2e","latest":true,"_links":{"self":{"title":"Branch version","name":"16_IntegrationE2e","href":"http://127.0.0.1:9292/pacticipants/marketplace-api/branches/16_IntegrationE2e/versions/ef291ce"}}}],"environments":[],"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-api/versions/ef291ce"}},"tags":[{"name":"prod","latest":true,"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-api/versions/ef291ce/tags/prod"}}}]},"_links":{"self":{"href":"http://127.0.0.1:9292/pacticipants/marketplace-api"}}},"pact":{"createdAt":"2026-09-30T19:13:15+00:00","_links":{"self":{"href":"http://127.0.0.1:9292/pacts/provider/marketplace-api/consumer/marketplace-web/version/ef291ce"}}},"verificationResult":{"success":true,"verifiedAt":"2026-09-30T19:13:23+00:00","_links":{"self":{"href":"http://127.0.0.1:9292/pacts/provider/marketplace-api/consumer/marketplace-web/pact-version/3b72d2b5706aa6bd9b167e34ce35290be0146f78/metadata/Y3ZuPWVmMjkxY2U/verification-results/101"}}}}]}
+```
+
+До тега брокер чесно відповідає «не знаю» (`"deployable":null`, `"unknown":1`):
+результат верифікації в нього є, але жодна версія провайдера не позначена як
+prod, тож звіряти нема з чим. Після тега — `true`. Тег ставиться на версію
+**провайдера**, ту саму, під якою верифікація опублікувала результат; інакше
+відповідь лишилась би `unknown`. Усю послідовність робить `npm run pact:gate`, і
+на кроці «до тега» скрипт падає, якщо брокер відповів `true` зарано.
+
+### CI
+
+`.github/workflows/ci.yml`, дві джоби. `tests`: `npm ci`, `tsc --noEmit`,
+integration двічі поспіль, E2E. `contract`: consumer-тест → publish → provider
+verification з `publishVerificationResult: true` → тег prod → `can-i-deploy`, що
+валить джобу, якщо `deployable` не `true`. Версія обох сторін — `github.sha`.
+
+Без `secrets.PACT_BROKER_URL` джоба піднімає брокер із compose у самому
+раннері. Історії деплоїв у такого брокера немає, тож prod там — версія, яку
+щойно перевірили. Зі спільним брокером тег ставить лише `main`: у проді
+опиняється тільки він. На #32 тег замінить `record-deployment` після
+справжнього деплою.
+
 ## Grading
 
 Свіжий клон, чиста БД, без доступу до сховища:
@@ -883,6 +1048,24 @@ grep -iE 'RTO|RPO' RESTORE-DRILL.md
 TypeORM-скриптам окремі `DB_*` не потрібні: обгортка виводить їх із того самого
 `DATABASE_URL`.
 
+ДЗ #16 (розділ 10). Свіжий клон, запущений Docker. Ні сховище, ні `.env`, ні
+compose для тестів не потрібні — базу кожному тестовому файлу видає
+testcontainers:
+
+```bash
+npm ci && npx tsc --noEmit
+npm run test:integration && npm run test:integration    # Tests: 13 passed — обидва рази
+npm run test:e2e                                         # Tests: 4 passed
+npm run test:contract && ls pacts/*.json && grep -c providerStates pacts/*.json
+npm run verify:provider 2>&1 | sed -E $'s/\\x1b\\[[0-9;]*m//g' | grep -F "has a matching body (OK)"
+bash scripts/with-secrets.sh dev npm run verify:provider  # те саме через сховище; без нього — SKIP_VAULT=1
+```
+
+Локальний гейт брокера — розділ 10, «Гейт». Версія консюмера `<v>` і «та сама
+версія провайдера» для тега prod — обидві `$(git rev-parse --short HEAD)`.
+Повторний прогін гейта — після `docker compose rm -sf pact-broker`, інакше
+брокер пам'ятає тег із минулого разу.
+
 ## Журнал рішень
 
 Дописую знизу, розділи вище не переписую. На захисті історія рішень цінніша за
@@ -932,6 +1115,14 @@ TypeORM-скриптам окремі `DB_*` не потрібні: обгорт
 | 2026-09-27 | `pg_dump` і drill — в обхід PgBouncer, у контейнері `db` | `pg_dump` ставить сесійні `SET` до `BEGIN` і лишив би їх на чужому backend. Бінарник із контейнера гарантовано тієї самої версії, що й сервер |
 | 2026-09-27 | Контрольне значення бекапу знімається в тому самому знімку, що й дамп | Окремий запит до чи після `pg_dump` під записами дав би фальшивий MISMATCH. Перевірено: 300 вставок під час бекапу, drill — MATCH |
 | 2026-09-27 | Бекап — у локальну теку `backups/` поза контейнером, не S3 | ДЗ#15 допускає локальну теку; S3 приїде на #26 разом зі справжнім object storage |
+| 2026-09-30 | HTTP-шар на Postgres: репозиторії на `Queryable`, `POST /v1/orders` через `checkout()` з #14 | E2E поверх масивів у памʼяті перевіряв би не той сервіс. `Queryable` замість пулу — щоб тест підставив репозиторію клієнт із відкритою транзакцією |
+| 2026-09-30 | Два пули: сирий `pg` для читань, `DataSource` TypeORM для checkout | Checkout написаний і перевірений на TypeORM (#14), переписувати його під `pg` — ризик без виграшу. За PgBouncer зайві клієнтські з'єднання не коштують серверних |
+| 2026-09-30 | Покупець v1 — гість, `INSERT … ON CONFLICT (email) DO UPDATE … RETURNING`, раз на процес | Тіло `CreateOrder` покупця не містить свідомо, auth — #24. `DO NOTHING` на конфлікті не повертає рядка; `DO UPDATE` повертає, але лишає мертву версію — тому результат кешує сервіс |
+| 2026-09-30 | Курсор несе `created_at` з мікросекундами, текстом із бази | Тест показав: курсор із точністю JS `Date` губить рядки однієї мілісекунди, а в Postgres це всі рядки однієї транзакції |
+| 2026-09-30 | Ізоляція — контейнер на файл і ROLLBACK на тест | ROLLBACK — мілісекунди й не залежить від переліку таблиць. Для застосунку в E2E він неможливий — там унікальні дані з builders |
+| 2026-09-30 | Тести — `tsc` → `dist-test/` → jest, без ts-jest | Той самий канон, що й відмова від `tsx`: жодної транспіляції на льоту, декоратор-метадані гарантовано є |
+| 2026-09-30 | Pact Broker на sqlite у контейнері, без тому | Гейт «unknown → true» має відтворюватись на кожному прогоні. Спільному брокеру потрібен Postgres або PactFlow — туди дивиться `secrets.PACT_BROKER_URL` у CI |
+| 2026-09-30 | Install-скрипти тестового стеку (`ssh2`, `@scarf/scarf` та ще чотири) — `allowBuilds: false` | Жоден не потрібен для роботи. `@scarf/scarf` — телеметрія в postinstall, рівно той випадок, заради якого `strictDepBuilds` |
 
 ## Запуск
 
@@ -941,13 +1132,15 @@ TypeORM-скриптам окремі `DB_*` не потрібні: обгорт
 ```bash
 pnpm install               # або npm install
 cp .env.example .env
-npm run db:up              # Postgres + PgBouncer у compose + файли-секрети
+npm run db:up              # Postgres + PgBouncer + Pact Broker у compose + файли-секрети
 npm run build && npm run migrate && npm run seed   # схема й дані через TypeORM (розділ 7)
 npm run start              # http://localhost:3000/v1
 npm run db:bench           # окремо: бенчмарк #12 на чистому томі (розділ 6)
 npm run demo:race && npm run demo:workers && npm run demo:retry   # конкурентність (розділ 8)
 bash scripts/with-secrets.sh dev bash scripts/backup.sh          # бекап (розділ 9)
 bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh   # restore-drill → MATCH
+npm run test:integration && npm run test:e2e                     # testcontainers, потрібен Docker (розділ 10)
+bash scripts/with-secrets.sh dev npm run pact:gate               # контракт і гейт брокера: unknown → deployable
 
 npm run check:env          # .env.example звірений зі схемою
 npm run lint:spec          # redocly lint openapi/openapi.yaml
