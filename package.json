@@ -31,6 +31,7 @@
     "demo:race": "bash scripts/with-secrets.sh dev node dist/demo-race.js",
     "demo:workers": "bash scripts/with-secrets.sh dev node dist/demo-workers.js",
     "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js",
+    "demo:realtime": "node scripts/realtime-demo.mjs",
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
     "drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",
     "test:integration": "npm run build:test && jest dist-test/test/integration",
