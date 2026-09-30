@@ -3,6 +3,7 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
   JoinColumn,
   ManyToOne,
   PrimaryGeneratedColumn,
@@ -22,8 +23,13 @@ export type PointsStatus = (typeof POINTS_STATUSES)[number];
  * (earned) має дату дозрівання, списання (spent) — ні, і воно одразу spent.
  *
  * amount — бали, не гроші, тому без суфікса _cents.
+ *
+ * Індекс по user_id з'явився на #14: баланс рахується SUM-ом по журналу
+ * користувача під його локом у checkout. Без індексу це seq scan усього
+ * журналу, і лок тримався б тим довше, чим більше в системі записів.
  */
 @Entity('points_entries')
+@Index('idx_points_entries_user', ['userId'])
 @Check('points_entries_kind_check', `kind IN ('earned', 'spent')`)
 @Check('points_entries_amount_check', `amount > 0`)
 @Check('points_entries_status_check', `status IN ('pending', 'available', 'spent')`)

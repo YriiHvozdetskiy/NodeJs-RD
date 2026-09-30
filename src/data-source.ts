@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import * as path from 'node:path';
-import { DataSource, type DataSourceOptions } from 'typeorm';
+import { DataSource } from 'typeorm';
+import type { PostgresConnectionOptions } from 'typeorm/driver/postgres/PostgresConnectionOptions';
 import { entities } from './entities';
 
 /**
@@ -23,7 +24,9 @@ function required(name: string): string {
   return value;
 }
 
-export const dataSourceOptions: DataSourceOptions = {
+// Тип саме Postgres, а не загальний DataSourceOptions: демо #14 розширюють
+// опції полями драйвера (poolSize), яких у союзі всіх драйверів немає.
+export const dataSourceOptions: PostgresConnectionOptions = {
   type: 'postgres',
   host: required('DB_HOST'),
   port: Number(process.env.DB_PORT ?? 5432),

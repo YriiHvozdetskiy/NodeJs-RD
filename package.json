@@ -26,7 +26,10 @@
     "migrate:generate": "bash scripts/with-secrets.sh dev typeorm migration:generate -d dist/data-source.js",
     "seed": "bash scripts/with-secrets.sh dev node dist/seed.js",
     "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/demo-nplus1.js",
-    "report": "bash scripts/with-secrets.sh dev node dist/report.js"
+    "report": "bash scripts/with-secrets.sh dev node dist/report.js",
+    "demo:race": "bash scripts/with-secrets.sh dev node dist/demo-race.js",
+    "demo:workers": "bash scripts/with-secrets.sh dev node dist/demo-workers.js",
+    "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js"
   },
   "dependencies": {
     "@nestjs/common": "11.2.1",
