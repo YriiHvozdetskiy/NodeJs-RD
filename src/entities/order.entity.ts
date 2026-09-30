@@ -17,7 +17,13 @@ import type { PointsEntry } from './points-entry.entity';
 import type { Promotion } from './promotion.entity';
 import type { User } from './user.entity';
 
-export const ORDER_STATUSES = ['pending', 'paid', 'cancelled'] as const;
+/**
+ * Життєвий цикл: pending → paid → packed → shipped → delivered, і
+ * pending → cancelled. Стадії відвантаження (#18) ставить продавець — це те,
+ * про що покупець хоче дізнатися першим, а не логістика: трекінгу й
+ * перевізників у сервісі немає. Які переходи дозволені — `OrdersService`.
+ */
+export const ORDER_STATUSES = ['pending', 'paid', 'packed', 'shipped', 'delivered', 'cancelled'] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 /**
@@ -40,7 +46,7 @@ export type OrderStatus = (typeof ORDER_STATUSES)[number];
 @Index('idx_orders_pending_created', ['createdAt'], { where: `status = 'pending'` })
 @Index('one_code_per_user', ['buyerId', 'promoCodeId'], { unique: true, where: `promo_code_id IS NOT NULL` })
 @Check('orders_region_check', `region ~ '^[A-Z]{2}$'`)
-@Check('orders_status_check', `status IN ('pending', 'paid', 'cancelled')`)
+@Check('orders_status_check', `status IN ('pending', 'paid', 'packed', 'shipped', 'delivered', 'cancelled')`)
 @Check('orders_currency_check', `currency ~ '^[A-Z]{3}$'`)
 @Check('orders_subtotal_cents_check', `subtotal_cents >= 0`)
 @Check('orders_discount_cents_check', `discount_cents >= 0`)
