@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import * as path from 'node:path';
 import { DataSource } from 'typeorm';
 import type { PostgresConnectionOptions } from 'typeorm/driver/postgres/PostgresConnectionOptions';
+import { cliDbConfig } from './db/cli-env';
 import { entities } from './entities';
 
 /**
@@ -9,31 +10,25 @@ import { entities } from './entities';
  *
  * Жодного значення тут не зашито й жоден env-файл тут не читається: усі DB_*
  * кладе в process.env обгортка `scripts/with-secrets.sh` (див. npm-скрипти),
- * яка бере їх зі сховища ДЗ #11. Немає змінної — процес падає одразу з назвою
- * змінної, а не через 30 секунд із «connection refused» до localhost.
+ * яка бере їх зі сховища ДЗ #11. Читає їх `cliDbConfig()` — той самий, що й у
+ * споживача брокера (#19).
  *
  * Схему змінюють ТІЛЬКИ міграції. Увімкнена синхронізація порівнювала б
  * entities з базою на кожному старті й мовчки робила б DROP COLUMN разом із
  * даними, щойно поле зникло з класу.
  */
-function required(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} не задано. Запускай через npm-скрипт (bash scripts/with-secrets.sh dev …) або експортуй DB_* вручну.`);
-  }
-  return value;
-}
+const db = cliDbConfig();
 
 // Тип саме Postgres, а не загальний DataSourceOptions: демо #14 розширюють
 // опції полями драйвера (poolSize), яких у союзі всіх драйверів немає.
 export const dataSourceOptions: PostgresConnectionOptions = {
   type: 'postgres',
-  host: required('DB_HOST'),
-  port: Number(process.env.DB_PORT ?? 5432),
+  host: db.host,
+  port: db.port,
   // pg називає це `user`, TypeORM — `username`. Переплутати = «password authentication failed».
-  username: required('DB_USER'),
-  password: required('DB_PASSWORD'),
-  database: required('DB_NAME'),
+  username: db.user,
+  password: db.password,
+  database: db.database,
   entities,
   // CLI читає скомпільований dist/data-source.js, тож і міграції беремо з dist/.
   migrations: [path.join(__dirname, 'migrations', '*.js')],
