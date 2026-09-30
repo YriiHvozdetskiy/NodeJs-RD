@@ -74,6 +74,12 @@ export interface CheckoutInput {
 export interface CheckoutResult {
   orderId: string;
   jobId: string;
+  buyerId: string;
+  currency: string;
+  /** `orders.created_at` — момент, коли замовлення стало фактом, а не момент публікації події. */
+  placedAt: string;
+  /** Позиції після зведення дублікатів — рівно те, що лягло в order_items. */
+  lines: CheckoutLine[];
   subtotalCents: number;
   discountCents: number;
   totalCents: number;
@@ -255,15 +261,17 @@ async function placeOrder(
 
   // ── 4. замовлення ────────────────────────────────────────────────────────
   let orderId: string;
+  let placedAt: Date;
   try {
-    const [order] = await sql<{ id: string }>(
+    const [order] = await sql<{ id: string; created_at: Date }>(
       manager,
       `INSERT INTO orders (buyer_id, device_id, region, status, currency, subtotal_cents, discount_cents, total_cents, points_spent, promo_code_id)
        VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9)
-       RETURNING id`,
+       RETURNING id, created_at`,
       [input.buyerId, input.deviceId ?? null, region, ORDER_CURRENCY, subtotalCents, discountCents, totalCents, pointsSpent, promoCodeId],
     );
     orderId = order.id;
+    placedAt = order.created_at;
   } catch (err) {
     // «Промокод раз на користувача» тримає partial unique index, а не if:
     // паралельний INSERT із тією ж парою чекає на коміт першого й падає тут.
@@ -307,6 +315,10 @@ async function placeOrder(
   return {
     orderId,
     jobId: job.id,
+    buyerId: input.buyerId,
+    currency: ORDER_CURRENCY,
+    placedAt: placedAt.toISOString(),
+    lines: input.lines,
     subtotalCents,
     discountCents,
     totalCents,
