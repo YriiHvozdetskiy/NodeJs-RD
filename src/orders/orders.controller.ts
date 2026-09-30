@@ -13,7 +13,8 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
-import { OrdersService, type CreateOrderItem, type Order } from './orders.service';
+import { OrdersService, type CreateOrderItem } from './orders.service';
+import type { Order } from './orders.repository';
 import { IdempotencyService } from './idempotency.service';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
@@ -38,17 +39,17 @@ export class OrdersController {
   }
 
   @Get()
-  list(
+  async list(
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
     @Query('cursor') cursor?: string,
-  ): Page<unknown> {
-    const page = this.orders.page(limit, cursor);
+  ): Promise<Page<unknown>> {
+    const page = await this.orders.page(limit, cursor);
     return { ...page, items: page.items.map((order) => this.view(order)) };
   }
 
   @Get(':orderId')
-  one(@Param('orderId', ParseIntPipe) orderId: number): unknown {
-    const order = this.orders.find(orderId);
+  async one(@Param('orderId', ParseIntPipe) orderId: number): Promise<unknown> {
+    const order = await this.orders.find(orderId);
     if (!order) throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
     return this.view(order);
   }
@@ -86,14 +87,13 @@ export class OrdersController {
 
     this.idempotency.markInFlight(key, fingerprint);
     try {
-      // SLOW_MS імітує те, чим на #14 стане транзакція в Postgres: обробник
-      // віддає event loop, і саме в цьому вікні другий запит із тим самим
-      // ключем бачить стан 'in-flight'. Без затримки гілка 409 недосяжна
-      // фізично — синхронний обробник ніколи не переривається.
+      // SLOW_MS розширює вікно, у якому обробник віддає event loop. Тепер,
+      // коли тут справжня транзакція в Postgres, вікно існує й без нього, але
+      // триває мілісекунди — для демо гілки 409 'in-flight' замало.
       const delay = this.config.get('SLOW_MS', { infer: true });
       if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 
-      const order = this.orders.create(body.items);
+      const order = await this.orders.create(body.items);
       this.idempotency.markDone(key, fingerprint, order);
       res.setHeader('Location', `/v1/orders/${order.id}`);
       return this.view(order);

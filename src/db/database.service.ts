@@ -1,9 +1,9 @@
-import * as path from 'node:path';
-import { readFile } from 'node:fs/promises';
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import type { Env } from '../config/env.schema';
+import { dbConnection } from './connection';
+import type { Queryable } from './queryable';
 
 /**
  * Пул з'єднань до Postgres, який ПЕРЕЖИВАЄ ротацію пароля без рестарту процесу.
@@ -26,23 +26,17 @@ import type { Env } from '../config/env.schema';
  * покласти у конфіг-мапу чи в лог, і секрету в ньому немає.
  */
 @Injectable()
-export class DatabaseService implements OnModuleDestroy {
+export class DatabaseService implements OnModuleDestroy, Queryable {
   private readonly logger = new Logger(DatabaseService.name);
   private readonly pool: Pool;
-  private readonly passwordFile: string;
 
   constructor(config: ConfigService<Env, true>) {
-    const url = new URL(config.get('DB_URL', { infer: true }));
-    this.passwordFile = path.resolve(config.get('DB_PASSWORD_FILE', { infer: true }));
-
-    this.pool = new Pool({
-      host: url.hostname,
-      port: Number(url.port || 5432),
-      database: decodeURIComponent(url.pathname.replace(/^\//, '')),
-      user: decodeURIComponent(url.username),
-      password: () => this.readPassword(),
-      max: config.get('DB_POOL_MAX', { infer: true }),
-    });
+    // Парсинг DB_URL і читання файла-пароля — у src/db/connection.ts: ті самі
+    // параметри бере й `OrmService`, і ротація має діяти на обидва пули.
+    // Пароль читається на кожне НОВЕ з'єднання, не на кожен запит: запити, що
+    // взяли з'єднання з пулу, у файл не ходять.
+    const { host, port, database, user, password, max } = dbConnection(config);
+    this.pool = new Pool({ host, port, database, user, password, max });
 
     // ОБОВ'ЯЗКОВО. Коли сервер закриває idle-з'єднання — ротація,
     // `pg_terminate_backend`, failover реплік — пул емітить 'error' на об'єкті,
@@ -54,14 +48,6 @@ export class DatabaseService implements OnModuleDestroy {
         `Сервер закрив idle-з'єднання (${err.code ?? err.message}) — пул відкриє нове, процес живе`,
       );
     });
-  }
-
-  /**
-   * Читається на кожне НОВЕ з'єднання, не на кожен запит: запити, що взяли
-   * з'єднання з пулу, у файл не ходять.
-   */
-  private async readPassword(): Promise<string> {
-    return (await readFile(this.passwordFile, 'utf8')).trim();
   }
 
   query<T extends QueryResultRow>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
