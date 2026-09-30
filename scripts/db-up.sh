@@ -13,6 +13,8 @@ ADMIN_SECRET_FILE='./secrets/pg_admin_password'
 mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 [ -f "${APP_SECRET_FILE}" ] || printf 'app-%s' "$(openssl rand -hex 16)" > "${APP_SECRET_FILE}"
 [ -f "${ADMIN_SECRET_FILE}" ] || printf 'admin-%s' "$(openssl rand -hex 16)" > "${ADMIN_SECRET_FILE}"
+# Адреса Pact Broker зі сховища (#16) — за замовчуванням брокер із цього compose.
+[ -f ./secrets/pact_broker_url ] || printf 'http://127.0.0.1:9292' > ./secrets/pact_broker_url
 
 PG_ADMIN_PASSWORD="$(cat "${ADMIN_SECRET_FILE}")"
 export PG_ADMIN_PASSWORD
@@ -36,7 +38,7 @@ docker compose exec -T db psql -U admin -d marketplace \
 
 docker compose up -d --wait
 
-echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:6432; паролі ролей вирівняні з secrets/."
+echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:6432, Pact Broker — на 127.0.0.1:9292; паролі ролей вирівняні з secrets/."
 echo "Далі:"
 echo "  npm run start                       # застосунок на :3000"
 echo "  curl -s localhost:3000/health/db    # запит через пул"

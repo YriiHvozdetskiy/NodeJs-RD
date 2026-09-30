@@ -1,7 +1,8 @@
-# Локальна інфраструктура курсового проєкту: Postgres, PgBouncer перед ним і
-# (лише для restore-drill) чистий Postgres для відновлення. Застосунок на цьому
-# етапі зручніше тримати на хості (`npm run start`), бо ротація перевіряється
-# через uptime процесу, а не контейнера.
+# Локальна інфраструктура курсового проєкту: Postgres, PgBouncer перед ним,
+# Pact Broker для контрактних тестів і (лише для restore-drill) чистий Postgres
+# для відновлення. Застосунок на цьому етапі зручніше тримати на хості
+# (`npm run start`), бо ротація перевіряється через uptime процесу, а не
+# контейнера.
 name: marketplace
 
 services:
@@ -68,6 +69,29 @@ services:
       timeout: 3s
       retries: 15
     restart: unless-stopped
+
+  # Pact Broker (#16): тут живуть контракти консюмерів і результати верифікації
+  # провайдера — саме з них він відповідає на can-i-deploy.
+  #
+  # Сховище — sqlite у файловій системі контейнера, а не окремий Postgres і не
+  # том. Для локального гейта це і треба: `docker compose rm -sf pact-broker`
+  # повертає брокер у порожній стан, і послідовність «не можна → можна»
+  # відтворюється на кожному прогоні. Спільному брокеру команди потрібен
+  # Postgres — або хмарний PactFlow, куди в CI дивиться secrets.PACT_BROKER_URL.
+  pact-broker:
+    image: pactfoundation/pact-broker:2.142.0-pactbroker2.120.0
+    ports:
+      - '127.0.0.1:9292:9292'
+    environment:
+      PACT_BROKER_DATABASE_ADAPTER: sqlite
+      PACT_BROKER_DATABASE_NAME: /tmp/pact_broker.sqlite3
+    # 127.0.0.1, а не localhost: у контейнері localhost резолвиться і в ::1, а
+    # puma слухає лише IPv4 — healthcheck тоді вічно unhealthy.
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:9292/diagnostic/status/heartbeat']
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   # Чистий Postgres для restore-drill. Без профілю `drill` не стартує:
   # scripts/restore-drill.sh піднімає його сам і сам прибирає разом із томом.

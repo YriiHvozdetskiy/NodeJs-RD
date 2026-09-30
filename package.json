@@ -36,7 +36,8 @@
     "test:integration": "npm run build:test && jest dist-test/test/integration",
     "test:e2e": "npm run build:test && jest dist-test/test/e2e",
     "test:contract": "npm run build:test && jest dist-test/test/contract/consumer",
-    "verify:provider": "npm run build:test && jest dist-test/test/contract/provider"
+    "verify:provider": "npm run build:test && jest dist-test/test/contract/provider",
+    "pact:gate": "bash scripts/pact-broker.sh gate"
   },
   "dependencies": {
     "@nestjs/common": "11.2.1",
