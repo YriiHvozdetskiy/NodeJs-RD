@@ -808,12 +808,13 @@ RTO drill-у 2.19 с, RPO розкладу до 24 год (чесно — до 4
 
 ```bash
 docker compose up -d --wait
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=marketplace-dev DB_NAME=marketplace
+export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=admin DB_PASSWORD=marketplace-dev DB_NAME=marketplace
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 ```
 
 `DB_*` — дев-креденшели з `docker-compose.yml` (`POSTGRES_USER: admin`,
-дефолт `PG_ADMIN_PASSWORD`, `POSTGRES_DB: marketplace`). Далі — команди з
+дефолт `PG_ADMIN_PASSWORD`, `POSTGRES_DB: marketplace`). Порт — PgBouncer, як і в
+застосунку: міграції, seed і демо ходять через пулер (розділ 9). Далі — команди з
 acceptance criteria як є:
 
 ```bash
