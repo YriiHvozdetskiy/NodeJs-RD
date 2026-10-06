@@ -120,12 +120,25 @@ async function waitForPolicy(api: ManagementApi, timeoutMs = 15_000): Promise<vo
 }
 
 async function request(api: ManagementApi, method: 'GET' | 'PUT', pathname: string, body?: unknown): Promise<unknown> {
-  const res = await fetch(`${api.base}${pathname}`, {
-    method,
-    headers: { authorization: api.authorization, 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(5_000),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${api.base}${pathname}`, {
+      method,
+      headers: { authorization: api.authorization, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch (err) {
+    // Сам fetch каже лише «fetch failed». Найчастіша причина — 15672 у
+    // compose перемаплено на інший порт хоста: AMQP за BROKER_URL доступний,
+    // а API за виведеною з нього адресою — ні, і топологія падає ще до першої
+    // публікації. Тому помилка називає адресу і змінну, якою її виправити.
+    const cause = err instanceof Error && err.cause instanceof Error ? err.cause.message : String(err);
+    throw new Error(
+      `management API недоступний за ${api.base} (${cause}). ` +
+        'Якщо порт 15672 перемаплено, задай BROKER_MANAGEMENT_URL=http://<host>:<port>/api',
+    );
+  }
   if (!res.ok) throw new Error(`management API ${method} ${pathname} → ${res.status} ${await res.text()}`);
   const text = await res.text();
   return text ? JSON.parse(text) : undefined;
