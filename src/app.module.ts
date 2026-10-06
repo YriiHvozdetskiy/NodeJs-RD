@@ -10,6 +10,7 @@ import { OrdersService } from './orders/orders.service';
 import { OrdersController } from './orders/orders.controller';
 import { OrdersGateway } from './orders/orders.gateway';
 import { OrderEventsService } from './orders/order-events.service';
+import { OrderPlacedPublisher } from './orders/order-placed.publisher';
 import { IdempotencyService } from './orders/idempotency.service';
 import { UsersRepository } from './users/users.repository';
 
@@ -51,6 +52,7 @@ import { UsersRepository } from './users/users.repository';
     IdempotencyService,
     OrderEventsService,
     OrdersGateway,
+    OrderPlacedPublisher,
   ],
 })
 export class AppModule {}

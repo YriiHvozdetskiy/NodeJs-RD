@@ -27,9 +27,17 @@ export type PointsStatus = (typeof POINTS_STATUSES)[number];
  * Індекс по user_id з'явився на #14: баланс рахується SUM-ом по журналу
  * користувача під його локом у checkout. Без індексу це seq scan усього
  * журналу, і лок тримався б тим довше, чим більше в системі записів.
+ *
+ * `points_entries_one_earned_per_order` (#19) — не для швидкості, а для
+ * правила «одне нарахування на замовлення». Нараховує тепер споживач
+ * order.placed, а брокер доставляє at-least-once: повторна доставка тієї самої
+ * події впирається в індекс і дає `ON CONFLICT DO NOTHING`, а не другі бали.
+ * Partial — бо на тому самому замовленні законно живе ще й рядок `spent`,
+ * якщо його частково оплатили балами.
  */
 @Entity('points_entries')
 @Index('idx_points_entries_user', ['userId'])
+@Index('points_entries_one_earned_per_order', ['orderId'], { unique: true, where: `kind = 'earned'` })
 @Check('points_entries_kind_check', `kind IN ('earned', 'spent')`)
 @Check('points_entries_amount_check', `amount > 0`)
 @Check('points_entries_status_check', `status IN ('pending', 'available', 'spent')`)
