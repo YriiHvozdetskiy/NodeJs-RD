@@ -132,11 +132,11 @@ export class OrdersController {
     // Заголовки від цього не чекають першої події — Nest 11 відправляє їх
     // одразу після підписки.
     const events$ = this.events.stream(orderId, lastEventIdOf(lastEventId)).pipe(
-      map((event): MessageEvent => ({
-        id: String(event.id),
-        type: 'order.status',
+      map((message): MessageEvent => ({
+        id: String(message.id),
+        type: message.type,
         retry: SSE_RETRY_MS,
-        data: event,
+        data: message.data,
       })),
     );
     const heartbeat$ = interval(SSE_HEARTBEAT_MS).pipe(
