@@ -67,6 +67,25 @@ export const envSchema = z.object({
 
   /** Файл із паролем брокера. Відносний — від кореня репозиторію. */
   BROKER_PASSWORD_FILE: z.string().min(1).default('./secrets/rabbitmq_password'),
+
+  /**
+   * З яких origin браузер може ходити в API, слухати SSE і підключати socket.io:
+   * `http://localhost:5173,https://shop.example`. Порожньо — лише той самий
+   * origin. Кожен елемент — саме origin (схема + хост + порт), без шляху й
+   * слеша наприкінці: браузер надсилає `Origin` рівно в такому вигляді, і
+   * `https://shop.example/` з ним уже не збігся б.
+   */
+  CORS_ORIGINS: z
+    .string()
+    .default('')
+    .transform((raw) => raw.split(',').map((origin) => origin.trim()).filter(Boolean))
+    .pipe(
+      z.array(
+        z.url({ protocol: /^https?$/ }).refine((origin) => new URL(origin).origin === origin, {
+          message: 'потрібен origin без шляху й слеша наприкінці: http://localhost:5173',
+        }),
+      ),
+    ),
 });
 
 export type Env = z.infer<typeof envSchema>;

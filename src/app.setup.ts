@@ -1,9 +1,12 @@
 import * as path from 'node:path';
 import express from 'express';
 import { RequestMethod, type NestApplicationOptions } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { middleware as openApiValidator } from 'express-openapi-validator';
+import { CorsIoAdapter } from './common/cors-io.adapter';
 import { ProblemFilter } from './common/problem.filter';
+import type { Env } from './config/env.schema';
 
 /**
  * Спека шукається від кореня запуску, а не від `__dirname`: той самий код
@@ -27,6 +30,16 @@ export const APP_OPTIONS: NestApplicationOptions = { bodyParser: false };
  * тестував би інший сервіс, ніж той, що в проді.
  */
 export function configureApp(app: NestExpressApplication): NestExpressApplication {
+  // CORS — до валідатора спеки: preflight `OPTIONS` відповідає middleware
+  // `cors` і далі не йде. Валідатор такої операції в спеці не знайшов би й
+  // відповів би помилкою замість дозволу.
+  //
+  // Один список на всі три входи браузера: REST, SSE-потік (EventSource з
+  // іншого origin теж вимагає `Access-Control-Allow-Origin`) і socket.io.
+  const origins = app.get<ConfigService<Env, true>>(ConfigService).get('CORS_ORIGINS', { infer: true });
+  app.enableCors({ origin: origins });
+  app.useWebSocketAdapter(new CorsIoAdapter(app, origins));
+
   app.use(express.json());
 
   // Версія API живе в `servers.url` спеки (`/v1`), тому й тут вона — глобальний
