@@ -6,7 +6,7 @@ import { Pool } from 'pg';
 import { cliDbConfig, requiredEnv } from './db/cli-env';
 import { accruePoints } from './loyalty/points-accrual';
 import { ContractError, parseOrderPlaced } from './messaging/order-placed.event';
-import { assertLoyaltyTopology, LOYALTY_QUEUE } from './messaging/topology';
+import { assertLoyaltyTopology, DELIVERY_LIMIT, LOYALTY_QUEUE } from './messaging/topology';
 
 /**
  * Споживач order.placed → нарахування бонусних балів. Окремий процес, а не
@@ -42,6 +42,25 @@ export const PREFETCH = 10;
  */
 const ACK_DELAY_MS = Number(process.env.CONSUMER_ACK_DELAY_MS ?? 0);
 
+/**
+ * Пауза перед поверненням у чергу: 250 мс × 2^(повернень уже), стеля 4 с.
+ * Без неї п'ять повернень delivery-limit спалювались за мілісекунди, і
+ * секундний збій бази відправляв у DLQ усе, що було в роботі. З нею між
+ * першою доставкою й DLQ — 0,25 + 0,5 + 1 + 2 + 4 = 7,75 с: короткий збій
+ * переживається, а не розміняний на мерців.
+ *
+ * Пауза тримає повідомлення непідтвердженим і займає слот prefetch. Це
+ * свідомо: поки база лежить, брати нові доставки нема сенсу. Межа зверху —
+ * 10 слотів × 4 с, далеко від consumer_timeout. Справжній retry з паузою поза
+ * споживачем (окрема черга з TTL, retry-with-jitter) — #22.
+ */
+const RETRY_BASE_MS = 250;
+const RETRY_MAX_MS = 4_000;
+
+export function retryDelayMs(deliveryCount: number): number {
+  return Math.min(RETRY_BASE_MS * 2 ** deliveryCount, RETRY_MAX_MS);
+}
+
 /** Що споживач повідомляє батьківському процесу демо (IPC). Без демо — нікому. */
 export type ConsumerReport =
   | { t: 'ready'; pid: number; prefetch: number }
@@ -50,7 +69,7 @@ export type ConsumerReport =
   | { t: 'duplicate'; eventId: string; orderId: string }
   | { t: 'not-eligible'; eventId: string; orderId: string }
   | { t: 'acked'; eventId: string; ms: number }
-  | { t: 'rejected'; eventId: string; requeue: boolean; error: string };
+  | { t: 'rejected'; eventId: string; requeue: boolean; delayMs: number; error: string };
 
 const report = (r: ConsumerReport) => process.send?.(r);
 const log = (line: string) => console.log(`[loyalty ${process.pid}] ${line}`);
@@ -62,6 +81,9 @@ async function main(): Promise<void> {
   const ch = await connection.createChannel();
 
   let stopping = false;
+  // Перериває паузи перед поверненням: на SIGTERM повідомлення повертається
+  // одразу, а не через 4 с, — docker stop не мусить чекати на чужий backoff.
+  const stopSignal = new AbortController();
   // Відновлення зʼєднання свідомо немає: процес, що втратив брокер, виходить
   // із кодом 1, а перезапуск — справа супервізора (compose, k8s). Незасвідчені
   // повідомлення брокер уже повернув у чергу — підхопить інший інстанс.
@@ -106,8 +128,14 @@ async function main(): Promise<void> {
     } catch (err) {
       requeue = !(err instanceof ContractError);
       const error = err instanceof Error ? err.message : String(err);
-      report({ t: 'rejected', eventId, requeue, error });
-      log(`${eventId}: ${error} → reject(requeue=${requeue})${requeue ? `, повернень уже ${deliveryCount}` : ''}`);
+      // Остання доставка перед лімітом іде в DLX одразу: чекати на неї нічого.
+      const delayMs = requeue && deliveryCount < DELIVERY_LIMIT ? retryDelayMs(deliveryCount) : 0;
+      report({ t: 'rejected', eventId, requeue, delayMs, error });
+      log(
+        `${eventId}: ${error} → reject(requeue=${requeue})` +
+          (requeue ? `, повернень уже ${deliveryCount}${delayMs ? `, пауза ${delayMs} мс` : ' — далі DLX'}` : ''),
+      );
+      if (delayMs > 0) await sleep(delayMs, undefined, { signal: stopSignal.signal }).catch(() => undefined);
     }
 
     if (requeue === undefined) {
@@ -153,6 +181,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     if (stopping) return;
     stopping = true;
+    stopSignal.abort();
     log(`${signal}: відписуюсь, чекаю ${inFlight.size} в роботі`);
     await ch.cancel(consumerTag).catch(() => undefined);
     await Promise.allSettled(inFlight);
