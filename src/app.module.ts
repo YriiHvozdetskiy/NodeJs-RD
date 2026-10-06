@@ -3,16 +3,20 @@ import { ConfigModule } from '@nestjs/config';
 import { validate } from './config/env.schema';
 import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
-import { CatalogService } from './catalog/catalog.service';
+import { ProductsRepository } from './catalog/products.repository';
 import { ProductsController } from './catalog/products.controller';
+import { OrdersRepository } from './orders/orders.repository';
 import { OrdersService } from './orders/orders.service';
 import { OrdersController } from './orders/orders.controller';
+import { OrdersGateway } from './orders/orders.gateway';
+import { OrderEventsService } from './orders/order-events.service';
 import { IdempotencyService } from './orders/idempotency.service';
+import { UsersRepository } from './users/users.repository';
 
 /**
- * Один модуль на весь сервіс — на #13 сюди приїде `TypeOrmModule`, і тоді його
- * варто буде розрізати на CatalogModule / OrdersModule. Різати зараз, коли
- * провайдерів чотири, — вигадана складність.
+ * Один модуль на весь сервіс. Розрізати на CatalogModule / OrdersModule варто
+ * тоді, коли в них зʼявиться власна конфігурація чи межі доступу (#24), а не
+ * лише тому, що провайдерів стало шість.
  */
 @Module({
   imports: [
@@ -36,6 +40,17 @@ import { IdempotencyService } from './orders/idempotency.service';
     DbModule,
   ],
   controllers: [HealthController, ProductsController, OrdersController],
-  providers: [CatalogService, OrdersService, IdempotencyService],
+  // OrderEventsService — один екземпляр на весь модуль: у нього публікує
+  // OrdersService і з нього читають і gateway, і SSE-контролер. Два екземпляри
+  // означали б дві шини, і подія з однієї не дійшла б до підписників іншої.
+  providers: [
+    ProductsRepository,
+    OrdersRepository,
+    UsersRepository,
+    OrdersService,
+    IdempotencyService,
+    OrderEventsService,
+    OrdersGateway,
+  ],
 })
 export class AppModule {}

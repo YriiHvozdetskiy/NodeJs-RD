@@ -1,74 +1,144 @@
 import { Injectable } from '@nestjs/common';
-import { CatalogService } from '../catalog/catalog.service';
+import { checkout, CheckoutError } from '../checkout/checkout';
 import { HttpProblem } from '../common/http-problem';
-import { newestFirst, paginate, type Page } from '../common/cursor';
-
-export interface OrderLine {
-  product_id: number;
-  qty: number;
-  unit_price_cents: number;
-}
-
-export interface Order {
-  id: number;
-  items: OrderLine[];
-  total_cents: number;
-  currency: 'UAH';
-  status: 'pending' | 'paid' | 'cancelled';
-  created_at: string;
-}
+import type { Page } from '../common/cursor';
+import { OrmService } from '../db/orm.service';
+import type { OrderStatus } from '../entities/order.entity';
+import { UsersRepository } from '../users/users.repository';
+import { OrderEventsService } from './order-events.service';
+import { OrdersRepository, type Order } from './orders.repository';
 
 export interface CreateOrderItem {
   product_id: number;
   qty: number;
 }
 
+/**
+ * З якого статусу можна прийти в кожен. Попередник у кожного рівно один, тому
+ * перехід — це одна умова в UPDATE, а не перелік дозволених пар. `pending`
+ * тут немає: у нього не повертаються. `cancelled` — лише з `pending`: після
+ * оплати скасування означало б refund, а його в сервісі немає (README, розділ 4).
+ */
+const PREVIOUS: Partial<Record<OrderStatus, OrderStatus>> = {
+  paid: 'pending',
+  packed: 'paid',
+  shipped: 'packed',
+  delivered: 'shipped',
+  cancelled: 'pending',
+};
+
+/**
+ * Власник усіх замовлень v1. Авторизації поки немає (`security: []` у спеці),
+ * і тіло `CreateOrder` покупця не містить свідомо — інакше клієнт міг би
+ * оформлювати від чужого імені. На #24 id прийде з токена, і цей рядок зникне.
+ *
+ * Від імені гостя діє будь-який HTTP-запит v1: `POST` оформлює замовлення на
+ * нього, SSE-потік віддає лише його замовлення.
+ */
+export const GUEST_BUYER_EMAIL = 'guest@marketplace.local';
+
 @Injectable()
 export class OrdersService {
-  private readonly orders: Order[] = [
-    { id: 1, items: [{ product_id: 1, qty: 1, unit_price_cents: 260000 }], total_cents: 260000, currency: 'UAH', status: 'paid', created_at: '2026-08-10T09:00:00.000Z' },
-    { id: 2, items: [{ product_id: 3, qty: 2, unit_price_cents: 45000 }], total_cents: 90000, currency: 'UAH', status: 'pending', created_at: '2026-08-11T09:00:00.000Z' },
-    { id: 3, items: [{ product_id: 4, qty: 1, unit_price_cents: 2150000 }], total_cents: 2150000, currency: 'UAH', status: 'cancelled', created_at: '2026-08-12T09:00:00.000Z' },
-    { id: 4, items: [{ product_id: 2, qty: 1, unit_price_cents: 380000 }, { product_id: 3, qty: 1, unit_price_cents: 45000 }], total_cents: 425000, currency: 'UAH', status: 'paid', created_at: '2026-08-13T09:00:00.000Z' },
-    { id: 5, items: [{ product_id: 6, qty: 1, unit_price_cents: 1450000 }], total_cents: 1450000, currency: 'UAH', status: 'pending', created_at: '2026-08-14T09:00:00.000Z' },
-  ];
+  private guestBuyerId?: Promise<string>;
 
-  private nextId = this.orders.length + 1;
+  constructor(
+    private readonly orders: OrdersRepository,
+    private readonly users: UsersRepository,
+    private readonly orm: OrmService,
+    private readonly events: OrderEventsService,
+  ) {}
 
-  constructor(private readonly catalog: CatalogService) {}
-
-  page(limit: number, cursor?: string): Page<Order> {
-    return paginate([...this.orders].sort(newestFirst), limit, cursor);
+  page(limit: number, cursor?: string): Promise<Page<Order>> {
+    return this.orders.page(limit, cursor);
   }
 
-  find(id: number): Order | undefined {
-    return this.orders.find((o) => o.id === id);
+  find(id: number): Promise<Order | null> {
+    return this.orders.findById(id);
   }
 
-  create(items: CreateOrderItem[]): Order {
-    const lines: OrderLine[] = items.map((line) => {
-      const product = this.catalog.find(line.product_id);
-      if (!product) {
-        // Тіло синтаксично валідне — валідатор його пропустив. Опрацювати не
-        // можна: це рівно те, для чого існує 422, а не 400.
-        throw new HttpProblem(422, `товару ${line.product_id} немає в каталозі`, 'unknown-product');
-      }
-      // Ціну КОПІЮЄМО в замовлення. Читати її з каталогу під час показу
-      // означало б переписувати історію оплачених замовлень при зміні цінника.
-      return { product_id: product.id, qty: line.qty, unit_price_cents: product.price_cents };
-    });
+  isOwnedBy(id: number, email: string): Promise<boolean> {
+    return this.orders.isOwnedBy(id, email);
+  }
 
-    const order: Order = {
-      id: this.nextId++,
-      items: lines,
-      // Цілі копійки: множення й додавання лишаються в integer, тож 0.1 + 0.2
-      // тут неможливе за побудовою.
-      total_cents: lines.reduce((sum, l) => sum + l.unit_price_cents * l.qty, 0),
-      currency: 'UAH',
-      status: 'pending',
-      created_at: new Date().toISOString(),
-    };
-    this.orders.push(order);
+  /**
+   * Та сама транзакція, що й у демо #14: декремент stock, знімок цін,
+   * order_items і задача на чек — або все, або нічого. Відповідь читається
+   * вже після COMMIT, тим самим репозиторієм, що й GET: форма створеного
+   * замовлення не може розійтися з формою прочитаного.
+   */
+  async create(items: CreateOrderItem[]): Promise<Order> {
+    const dataSource = await this.orm.get();
+    const buyerId = await this.guestBuyer();
+
+    let orderId: string;
+    try {
+      ({ orderId } = await checkout(dataSource, {
+        buyerId,
+        lines: items.map((item) => ({ productId: String(item.product_id), qty: item.qty })),
+      }));
+    } catch (err) {
+      if (err instanceof CheckoutError) throw toProblem(err);
+      throw err;
+    }
+
+    const order = await this.orders.findById(Number(orderId));
+    if (!order) throw new Error(`замовлення ${orderId} закомічене, але не читається`);
     return order;
+  }
+
+  /**
+   * Перевести замовлення в статус `to`. Подію отримують підписники шини —
+   * кімната `orders:<id>` у WebSocket і SSE-потік цього замовлення.
+   *
+   * Публікація — після COMMIT, і лише коли UPDATE справді змінив рядок.
+   * Подія про перехід, який відкотився, пообіцяла б покупцю те, чого немає в
+   * базі. UPDATE тут один і без явної транзакції, тож його повернення і є
+   * комітом.
+   *
+   * Повтор того самого статусу — 200 без нової події, як і має бути в PATCH:
+   * клієнт, що не дочекався відповіді й повторив запит, не породить другого
+   * сповіщення.
+   */
+  async changeStatus(id: number, to: OrderStatus): Promise<Order> {
+    const from = PREVIOUS[to];
+    const changed = from !== undefined && (await this.orders.transition(id, from, to));
+    if (changed) this.events.publish(id, from, to);
+
+    const order = await this.orders.findById(id);
+    if (!order) throw new HttpProblem(404, `замовлення ${id} не існує`, 'not-found');
+    if (!changed && order.status !== to) {
+      throw new HttpProblem(409, `замовлення ${id} у статусі ${order.status}, перейти в ${to} не можна`, 'conflict');
+    }
+    return order;
+  }
+
+  /** Раз на процес: гість не змінюється, а кожен upsert лишав би мертву версію рядка. */
+  private guestBuyer(): Promise<string> {
+    this.guestBuyerId ??= this.users.ensureBuyer(GUEST_BUYER_EMAIL).catch((err: unknown) => {
+      this.guestBuyerId = undefined;
+      throw err;
+    });
+    return this.guestBuyerId;
+  }
+}
+
+/**
+ * Відмова бізнес-логіки → клас проблеми зі спеки. Слаг мусить бути в `enum`
+ * схеми `Problem`, інакше `validateResponses` відкине нашу ж відповідь.
+ * Бали й промокоди тіло v1 не передає — ці причини сюди не доходять і
+ * падають у загальний 422.
+ */
+function toProblem(err: CheckoutError): HttpProblem {
+  switch (err.reason) {
+    case 'unknown_product':
+      return new HttpProblem(422, err.message, 'unknown-product');
+    // Запит коректний, але суперечить поточному стану товару — 409, а не 422:
+    // той самий кошик пройде, щойно продавець поповнить залишок.
+    case 'out_of_stock':
+      return new HttpProblem(409, err.message, 'conflict');
+    case 'invalid_input':
+      return new HttpProblem(400, err.message, 'bad-request');
+    default:
+      return new HttpProblem(422, err.message, 'unprocessable-entity');
   }
 }

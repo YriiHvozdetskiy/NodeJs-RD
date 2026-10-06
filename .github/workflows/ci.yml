@@ -1,0 +1,79 @@
+# Драбинка довіри з ДЗ #16 у CI: integration і E2E проти Postgres у
+# testcontainers, далі контракт через Pact Broker із can-i-deploy як гейтом.
+# На лекції 32 ця ж джоба contract стане обовʼязковою перед деплоєм.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: integration + e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      # Двічі поспіль — та сама перевірка ізоляції, що в acceptance criteria:
+      # другий прогін не має залежати від того, що лишив перший.
+      - run: npm run test:integration && npm run test:integration
+      - run: npm run test:e2e
+
+  contract:
+    name: contract (Pact)
+    runs-on: ubuntu-latest
+    env:
+      # Адреса й токен брокера — лише з secrets. Код читає process.env і більше нічого.
+      PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+      # Версія обох сторін — коміт: один і той самий код не отримає двох версій,
+      # а різний — однієї.
+      PACT_CONSUMER_VERSION: ${{ github.sha }}
+      PACT_PROVIDER_VERSION: ${{ github.sha }}
+      PACT_BRANCH: ${{ github.head_ref || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      # Без secrets.PACT_BROKER_URL (форк, репозиторій без спільного брокера)
+      # джоба піднімає брокер із docker-compose.yml у самому раннері.
+      - name: Pact Broker у раннері (якщо secrets.PACT_BROKER_URL не задано)
+        if: env.PACT_BROKER_URL == ''
+        run: |
+          docker compose up -d --wait pact-broker
+          echo "PACT_BROKER_URL=http://127.0.0.1:9292" >> "$GITHUB_ENV"
+          echo "PACT_BROKER_EPHEMERAL=1" >> "$GITHUB_ENV"
+
+      - name: consumer-тест → pacts/*.json
+        run: npm run test:contract
+
+      - name: publish контракту в брокер
+        run: bash scripts/pact-broker.sh publish
+
+      - name: provider verification (publishVerificationResult)
+        run: npm run verify:provider
+
+      # Тег prod означає «ця версія провайдера зараз у проді». Зі спільним
+      # брокером його ставить лише main — у проді опиняється тільки main. У
+      # брокері раннера історії деплоїв немає, тож там prod — версія, яку щойно
+      # перевірили. На лекції 32 тег замінить record-deployment після деплою.
+      - name: тег prod на версію провайдера
+        if: env.PACT_BROKER_EPHEMERAL == '1' || github.ref == 'refs/heads/main'
+        run: bash scripts/pact-broker.sh tag-prod
+
+      # Гейт: валить джобу, якщо брокер не відповів "deployable": true.
+      - name: can-i-deploy marketplace-web → prod
+        run: bash scripts/pact-broker.sh can-i-deploy

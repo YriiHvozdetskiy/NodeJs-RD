@@ -10,6 +10,13 @@
 # живе лише в оточенні процесу-нащадка: ні в git, ні в історії shell, ні в
 # аргументах команди, які видно в `ps`.
 #
+# З ДЗ #16 так само приїжджають адреса й токен Pact Broker — PACT_BROKER_URL і
+# PACT_BROKER_TOKEN із secrets/pact_broker_url і secrets/pact_broker_token.
+# Кожен файл опційний: немає файла — немає змінної, і `npm run verify:provider`
+# звіряється з локальним pacts/*.json без брокера.
+#
+#   bash scripts/with-secrets.sh dev npm run verify:provider
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -69,5 +76,18 @@ export DB_PASSWORD
 # Та сама адреса одним рядком — контракт ДЗ #15 для scripts/backup.sh і
 # scripts/restore-drill.sh. Згенеровані паролі — hex, кодувати в URL нічого.
 export DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+
+# Pact Broker (#16). Локальний брокер із compose токена не має — тоді файла
+# pact_broker_token просто немає; для PactFlow туди кладеться API-токен.
+PACT_URL_FILE="${ROOT}/secrets/pact_broker_url"
+PACT_TOKEN_FILE="${ROOT}/secrets/pact_broker_token"
+if [ -f "${PACT_URL_FILE}" ]; then
+  PACT_BROKER_URL="$(cat "${PACT_URL_FILE}")"
+  export PACT_BROKER_URL
+fi
+if [ -f "${PACT_TOKEN_FILE}" ]; then
+  PACT_BROKER_TOKEN="$(cat "${PACT_TOKEN_FILE}")"
+  export PACT_BROKER_TOKEN
+fi
 
 exec "$@"

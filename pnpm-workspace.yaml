@@ -25,17 +25,31 @@ blockExoticSubdeps: true
 # в allowBuilds свідомо.
 strictDepBuilds: true
 
-# Порожньо НЕ ВИПАДКОВО: у дереві цього проєкту жоден пакет не має install-скрипта
-# (перевірено `pnpm install` — «0 blocked build scripts»). Nest, express,
-# express-openapi-validator, TypeScript, ts-node — усі чисті JS.
+# До #16 тут було порожньо: у дереві не було жодного install-скрипта. Тестовий
+# стек (#16) приніс шість — і жоден не потрібен для роботи, тому всі `false`:
+# pnpm їх не запускає і не валить install через strictDepBuilds.
+#
+#   ssh2, cpu-features — testcontainers → dockerode; нативна криптографія для
+#                        SSH до віддаленого Docker. Локальний сокет її не потребує
+#   protobufjs         — dockerode (gRPC); postinstall лише перевіряє версію CLI
+#   unrs-resolver      — jest; postinstall добирає нативний біндинг, який і так
+#                        приходить платформною optional-залежністю
+#   @parcel/watcher    — jest --watch; збірка з сирців, лише якщо немає prebuilt
+#   @scarf/scarf       — @pact-foundation/pact; postinstall шле телеметрію
+#                        встановлення. Саме той випадок, від якого цей блок і є
 #
 # Що додасться далі по курсу, коли справді знадобиться:
 #   argon2 / bcrypt   — #24 authn (нативний біндинг, потребує node-gyp)
 #   sharp             — #26 files/S3 (обробка зображень)
 #   @swc/core         — якщо перейдемо на SWC замість tsc у Nest CLI
-#   pg-native         — тільки якщо на #13 візьмемо libpq замість чистого pg
 # Додавати рядок сюди — свідома дія: означає «я подивився, що цей скрипт робить».
-allowBuilds: {}
+allowBuilds:
+  '@parcel/watcher': false
+  '@scarf/scarf': false
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
+  unrs-resolver: false
 
 # ─── Пінінг версій ───────────────────────────────────────────────────────────
 # Без ^ і ~: `pnpm add` пише точну версію. Разом із minimumReleaseAge це дає

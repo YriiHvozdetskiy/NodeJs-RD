@@ -44,3 +44,11 @@ spec.json
 *.log
 .DS_Store
 backups
+
+# Тести, їхня збірка й контракт у рантайм-образі не виконуються
+test
+dist-test
+pacts
+jest.config.js
+tsconfig.test.json
+.github

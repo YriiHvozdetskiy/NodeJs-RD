@@ -160,3 +160,11 @@ secrets/
 
 # Дампи scripts/backup.sh — дані бази, у git їм не місце.
 backups/
+
+# Збірка тестів (tsconfig.test.json): src/ і test/ разом, лише для jest.
+dist-test/
+
+# Контракт Pact генерує consumer-тест (`npm run test:contract`) — і локально, і
+# в CI-джобі contract. Джерело правди — test/contract/consumer.pact.test.ts,
+# а спільна копія живе в Pact Broker, не в git.
+pacts/
