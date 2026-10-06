@@ -31,8 +31,11 @@ const PREVIOUS: Partial<Record<OrderStatus, OrderStatus>> = {
  * Власник усіх замовлень v1. Авторизації поки немає (`security: []` у спеці),
  * і тіло `CreateOrder` покупця не містить свідомо — інакше клієнт міг би
  * оформлювати від чужого імені. На #24 id прийде з токена, і цей рядок зникне.
+ *
+ * Від імені гостя діє будь-який HTTP-запит v1: `POST` оформлює замовлення на
+ * нього, SSE-потік віддає лише його замовлення.
  */
-const GUEST_BUYER_EMAIL = 'guest@marketplace.local';
+export const GUEST_BUYER_EMAIL = 'guest@marketplace.local';
 
 @Injectable()
 export class OrdersService {
@@ -51,6 +54,10 @@ export class OrdersService {
 
   find(id: number): Promise<Order | null> {
     return this.orders.findById(id);
+  }
+
+  isOwnedBy(id: number, email: string): Promise<boolean> {
+    return this.orders.isOwnedBy(id, email);
   }
 
   /**

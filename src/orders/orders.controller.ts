@@ -17,7 +17,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
 import { interval, map, merge, takeUntil, type Observable } from 'rxjs';
-import { OrdersService, type CreateOrderItem } from './orders.service';
+import { GUEST_BUYER_EMAIL, OrdersService, type CreateOrderItem } from './orders.service';
 import type { Order } from './orders.repository';
 import { IdempotencyService } from './idempotency.service';
 import { OrderEventsService } from './order-events.service';
@@ -112,9 +112,16 @@ export class OrdersController {
     @Param('orderId', ParseIntPipe) orderId: number,
     @Headers('last-event-id') lastEventId?: string,
   ): Promise<Observable<MessageEvent>> {
-    // До першого байта потоку: заголовки ще не надіслані, тож 404 приходить
-    // звичайним problem+json, а не обривом уже відкритого стриму.
-    if (!(await this.orders.find(orderId))) {
+    // Та сама перевірка власника, що й на WS-`join`. Особа HTTP-запиту v1 —
+    // гість: від його імені `POST /v1/orders` оформлює замовлення, тож свої
+    // замовлення він слухає без креденшелів, а чужі — ні. Власного заголовка
+    // EventSource не надішле, тому до #24 явної особи тут немає; тоді гостя
+    // замінить JWT із cookie.
+    //
+    // Чуже й неіснуюче — однакові 404: відповідь не підтверджує, що чуже
+    // замовлення існує. І все це до першого байта потоку, поки заголовки ще не
+    // надіслані, — відмова приходить звичайним problem+json.
+    if (!(await this.orders.isOwnedBy(orderId, GUEST_BUYER_EMAIL))) {
       throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
     }
 
