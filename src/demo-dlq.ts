@@ -9,8 +9,9 @@ import { DELIVERY_LIMIT, EVENTS_EXCHANGE, LOYALTY_DLQ, LOYALTY_QUEUE, ORDER_PLAC
  *
  *   npm run demo:dlq                — валідна подія про замовлення, якого немає.
  *                                     Споживач не знає, що це назавжди, і
- *                                     повертає її в чергу; зупиняє цикл
- *                                     delivery-limit → причина delivery_limit
+ *                                     повертає її в чергу з паузою, що
+ *                                     росте; зупиняє цикл delivery-limit →
+ *                                     причина delivery_limit
  *   npm run demo:dlq -- --contract  — тіло не за контрактом. Повтор дасть те
  *                                     саме, тож reject(requeue=false) з першої
  *                                     доставки → причина rejected
@@ -36,10 +37,11 @@ async function main(): Promise<void> {
   let consumer: ConsumerProcess | undefined;
 
   try {
-    await resetQueues(broker);
+    await resetQueues(broker, { purgeDlq: true });
     const loyalty = (consumer = new ConsumerProcess());
     await loyalty.ready();
 
+    const publishedAt = Date.now();
     if (contractMode) {
       console.log('── demo:dlq --contract: тіло не за контрактом → reject(requeue=false) → DLX ──');
       // Сирий publish повз EventPublisher: справжній продюсер такого тіла не
@@ -51,7 +53,7 @@ async function main(): Promise<void> {
       });
       await broker.ch.waitForConfirms();
     } else {
-      console.log(`── demo:dlq: подія про неіснуюче замовлення → reject(requeue=true) × (delivery-limit ${DELIVERY_LIMIT} + 1) → DLX ──`);
+      console.log(`── demo:dlq: подія про неіснуюче замовлення → reject(requeue=true) з паузою × (delivery-limit ${DELIVERY_LIMIT} + 1) → DLX ──`);
       await publisher.publish(
         orderPlacedEvent({
           orderId: MISSING_ORDER,
@@ -65,6 +67,7 @@ async function main(): Promise<void> {
     }
 
     await waitFor('повідомлення в DLQ', async () => (await depth(broker.ch, LOYALTY_DLQ)) === 1);
+    const dlqAfterMs = Date.now() - publishedAt;
     await loyalty.stop();
 
     // Заглядаємо в мерця й повертаємо його на місце: DLQ — склад доказів, а
@@ -85,6 +88,8 @@ async function main(): Promise<void> {
     const dlq = await depth(broker.ch, LOYALTY_DLQ);
     const rejected = loyalty.count('rejected');
     const effect = loyalty.count('applied');
+    // Сума пауз, які споживач витримав перед поверненнями, — з його ж звітів.
+    const backoffMs = loyalty.of('rejected').reduce((sum, r) => sum + r.delayMs, 0);
 
     summary.line('rejected', rejected);
     summary.line('work', work);
@@ -93,6 +98,8 @@ async function main(): Promise<void> {
     summary.line('effect', effect);
     summary.line('deliveries', loyalty.count('recv'));
     summary.line('delivery-limit', DELIVERY_LIMIT);
+    summary.line('backoff-ms', backoffMs);
+    summary.line('dlq-after-ms', dlqAfterMs);
     console.log(`x-death: queue=${death?.queue} reason=${death?.reason} count=${death?.count} routing-keys=${JSON.stringify(death?.['routing-keys'])}`);
     console.log(`x-first-death-reason: ${firstReason} · x-first-death-queue: ${headers['x-first-death-queue']}`);
 
@@ -104,6 +111,13 @@ async function main(): Promise<void> {
     summary.expect(
       contractMode ? 'rejected=1 — битий контракт не повторюють' : `rejected=${DELIVERY_LIMIT + 1} — ліміт спрацював після ${DELIVERY_LIMIT} повернень`,
       rejected === (contractMode ? 1 : DELIVERY_LIMIT + 1),
+    );
+    // Повернення розтягнуті в часі, а не спалені за мілісекунди: до DLQ
+    // повідомлення дійшло не раніше, ніж минули всі паузи. Битий контракт
+    // пауз не має — повтор дав би те саме.
+    summary.expect(
+      contractMode ? 'backoff-ms=0 — битий контракт іде в DLX без пауз' : 'dlq-after-ms ≥ backoff-ms > 0 — повернення з паузами',
+      contractMode ? backoffMs === 0 : backoffMs > 0 && dlqAfterMs >= backoffMs,
     );
   } finally {
     await consumer?.stop();

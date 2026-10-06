@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   let consumer: ConsumerProcess | undefined;
 
   try {
-    await resetQueues(broker);
+    const { dlqBefore } = await resetQueues(broker, { purgeDlq: false });
     const { buyerId, productId } = await demoFixture(dataSource, 'demo:publish');
     const loyalty = (consumer = new ConsumerProcess());
     await loyalty.ready();
@@ -48,7 +48,10 @@ async function main(): Promise<void> {
 
     const { rows: effect, points } = await earned(dataSource, orderIds);
     const work = await depth(broker.ch, LOYALTY_QUEUE);
-    const dlq = await depth(broker.ch, LOYALTY_DLQ);
+    // Приріст за цей прогін, а не вся глибина: DLQ тут не чиститься, і мрець
+    // від попереднього demo:dlq має лишатись у ній для UI.
+    const dlqDepth = await depth(broker.ch, LOYALTY_DLQ);
+    const dlq = dlqDepth - dlqBefore;
     const handleMs = loyalty.of('acked').map((r) => r.ms);
 
     summary.line('published', published);
@@ -56,6 +59,7 @@ async function main(): Promise<void> {
     summary.line('effect', effect);
     summary.line('acked', loyalty.count('acked'));
     summary.line('dlq', dlq);
+    summary.line('dlq-depth', dlqDepth);
     summary.line('work', work);
     summary.line('prefetch', loyalty.prefetch);
     summary.line('points', points);

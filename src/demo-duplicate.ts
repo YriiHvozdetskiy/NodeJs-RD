@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   const started: ConsumerProcess[] = [];
 
   try {
-    await resetQueues(broker);
+    const { dlqBefore } = await resetQueues(broker, { purgeDlq: false });
     const { buyerId, productId } = await demoFixture(dataSource, 'demo:duplicate');
 
     const first = new ConsumerProcess({ CONSUMER_ACK_DELAY_MS: String(ACK_WINDOW_MS) });
@@ -62,7 +62,10 @@ async function main(): Promise<void> {
     const { rows: effect, points } = await earned(dataSource, [order.orderId]);
     const skipped = second.count('duplicate');
     const work = await depth(broker.ch, LOYALTY_QUEUE);
-    const dlq = await depth(broker.ch, LOYALTY_DLQ);
+    // Приріст за цей прогін, а не вся глибина: DLQ тут не чиститься, і мрець
+    // від попереднього demo:dlq має лишатись у ній для UI.
+    const dlqDepth = await depth(broker.ch, LOYALTY_DLQ);
+    const dlq = dlqDepth - dlqBefore;
 
     summary.line('deliveries', deliveries);
     summary.line('effect', effect);
@@ -73,6 +76,7 @@ async function main(): Promise<void> {
     summary.line('delivery-count', redelivery?.deliveryCount ?? 0);
     summary.line('work', work);
     summary.line('dlq', dlq);
+    summary.line('dlq-depth', dlqDepth);
 
     summary.expect('deliveries ≥ 2 — дубль справді доставлено', deliveries >= 2);
     summary.expect('effect=1 — ефект один, хоч доставок дві', effect === 1);

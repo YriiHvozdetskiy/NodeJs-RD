@@ -11,7 +11,8 @@ import { assertLoyaltyTopology, LOYALTY_DLQ, LOYALTY_QUEUE } from './topology';
 
 /**
  * Спільне для demo:publish, demo:dlq і demo:duplicate. Кожне демо:
- *   1. приводить стан до чистого — топологія, порожні робоча черга й DLQ;
+ *   1. приводить стан до чистого — топологія, порожня робоча черга (DLQ — лише
+ *      demo:dlq, див. resetQueues);
  *   2. запускає СПРАВЖНІЙ споживач (dist/consumer.js) окремим процесом;
  *   3. друкує підсумок рядками ключ=значення;
  *   4. сам перевіряє інваріант і виходить із кодом ≠ 0, якщо той порушено.
@@ -100,18 +101,24 @@ export async function openBroker(): Promise<Broker> {
 
 /**
  * Чистий старт: топологія є (демо — той самий бутстрап-крок, що й споживач),
- * робоча черга й DLQ порожні, і ніхто інший їх не слухає. Запущений у
- * сусідньому терміналі `npm run consumer` забирав би доставки собі, і числа
- * демо стали б випадковими — тому це відмова з поясненням, а не тиха гонка.
+ * робоча черга порожня, і ніхто інший її не слухає. Запущений у сусідньому
+ * терміналі `npm run consumer` забирав би доставки собі, і числа демо стали б
+ * випадковими — тому це відмова з поясненням, а не тиха гонка.
+ *
+ * DLQ чистить лише demo:dlq — він її господар і лишає в ній рівно одного
+ * мерця для UI. demo:publish і demo:duplicate її не чіпають: інакше прогін
+ * після demo:dlq зносив би того мерця, якого README обіцяє показати. Вони
+ * рахують приріст DLQ за свій прогін — `dlqBefore` звідси.
  */
-export async function resetQueues({ ch, url }: Broker): Promise<void> {
+export async function resetQueues({ ch, url }: Broker, { purgeDlq }: { purgeDlq: boolean }): Promise<{ dlqBefore: number }> {
   await assertLoyaltyTopology(ch, url);
   const { consumerCount } = await ch.checkQueue(LOYALTY_QUEUE);
   if (consumerCount > 0) {
     throw new Error(`${LOYALTY_QUEUE} уже слухає ${consumerCount} споживач(ів) — зупини \`npm run consumer\` і повтори`);
   }
   await ch.purgeQueue(LOYALTY_QUEUE);
-  await ch.purgeQueue(LOYALTY_DLQ);
+  if (purgeDlq) await ch.purgeQueue(LOYALTY_DLQ);
+  return { dlqBefore: await depth(ch, LOYALTY_DLQ) };
 }
 
 /** Скільки READY у черзі. Unacked сюди не входять — тому міряємо, коли споживача вже немає. */
