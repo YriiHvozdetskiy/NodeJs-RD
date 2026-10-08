@@ -19,7 +19,8 @@ import type { Response } from 'express';
 import { interval, map, merge, takeUntil, type Observable } from 'rxjs';
 import { GUEST_BUYER_EMAIL, OrdersService, type CreateOrderItem } from './orders.service';
 import type { Order } from './orders.repository';
-import { IdempotencyService } from './idempotency.service';
+import { IdempotencyService, type Verdict } from './idempotency.service';
+import { IdempotencyKeyTaken } from '../checkout/checkout';
 import { OrderEventsService } from './order-events.service';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
@@ -49,7 +50,7 @@ function lastEventIdOf(raw: string | undefined): number {
 export class OrdersController {
   constructor(
     private readonly orders: OrdersService,
-    private readonly idempotency: IdempotencyService<Order>,
+    private readonly idempotency: IdempotencyService,
     private readonly config: ConfigService<Env, true>,
     private readonly events: OrderEventsService,
   ) {}
@@ -151,6 +152,13 @@ export class OrdersController {
    * вимагає СПЕКА (`required: true`), і валідатор відкидає запит без нього до
    * входу в цей метод. Вимогу неможливо забути разом із перевіркою — її просто
    * немає в коді, щоб забути.
+   *
+   * Два шляхи до replay:
+   *   • ключ уже в базі — `decide` бачить його до будь-якої роботи;
+   *   • ключ закомітив паралельний запит на ІНШОМУ інстансі, поки наш ішов —
+   *     наша транзакція програє PK ключа, відкочується цілком (друге
+   *     замовлення й друга подія в outbox зникають разом із нею), і тоді ключ
+   *     уже видно.
    */
   @Post()
   @HttpCode(201)
@@ -160,38 +168,50 @@ export class OrdersController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<unknown> {
     const fingerprint = this.idempotency.fingerprint(body);
-    const entry = this.idempotency.get(key);
+    let verdict = await this.idempotency.decide(key, fingerprint);
 
-    switch (this.idempotency.decide(entry, fingerprint)) {
+    if (verdict.kind === 'proceed') {
+      this.idempotency.markInFlight(key, fingerprint);
+      try {
+        // SLOW_MS розширює вікно, у якому обробник віддає event loop. Тепер,
+        // коли тут справжня транзакція в Postgres, вікно існує й без нього, але
+        // триває мілісекунди — для демо гілки 409 'in-flight' замало.
+        const delay = this.config.get('SLOW_MS', { infer: true });
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+
+        const order = await this.orders.create(body.items, { key, fingerprint });
+        res.setHeader('Location', `/v1/orders/${order.id}`);
+        return this.view(order);
+      } catch (err) {
+        if (!(err instanceof IdempotencyKeyTaken)) throw err;
+        verdict = await this.idempotency.decide(key, fingerprint);
+      } finally {
+        this.idempotency.release(key);
+      }
+    }
+
+    return this.answerFromStore(verdict, res);
+  }
+
+  private async answerFromStore(verdict: Verdict, res: Response): Promise<unknown> {
+    switch (verdict.kind) {
       case 'in-flight':
         throw new HttpProblem(409, 'запит із цим Idempotency-Key ще опрацьовується', 'idempotency-key-in-flight');
       case 'mismatch':
         throw new HttpProblem(422, 'цей Idempotency-Key вже використано з іншим тілом запиту', 'idempotency-key-reused');
       case 'replay': {
-        // Обробник НЕ виконується — у цьому вся гарантія: другого замовлення
-        // й другого списання не буде.
-        const stored = entry!.response!;
+        // Обробник НЕ виконується — у цьому вся гарантія: другого замовлення й
+        // другого списання не буде. Ключ живе в одній транзакції із
+        // замовленням, тож замовлення за ним є завжди.
+        const order = await this.orders.find(verdict.orderId);
+        if (!order) throw new Error(`ключ веде на замовлення ${verdict.orderId}, якого немає`);
         res.setHeader('Idempotency-Replay', 'true');
-        res.setHeader('Location', `/v1/orders/${stored.id}`);
-        return this.view(stored);
+        res.setHeader('Location', `/v1/orders/${order.id}`);
+        return this.view(order);
       }
-    }
-
-    this.idempotency.markInFlight(key, fingerprint);
-    try {
-      // SLOW_MS розширює вікно, у якому обробник віддає event loop. Тепер,
-      // коли тут справжня транзакція в Postgres, вікно існує й без нього, але
-      // триває мілісекунди — для демо гілки 409 'in-flight' замало.
-      const delay = this.config.get('SLOW_MS', { infer: true });
-      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-
-      const order = await this.orders.create(body.items);
-      this.idempotency.markDone(key, fingerprint, order);
-      res.setHeader('Location', `/v1/orders/${order.id}`);
-      return this.view(order);
-    } catch (err) {
-      this.idempotency.forget(key);
-      throw err;
+      case 'proceed':
+        // Сюди веде лише IdempotencyKeyTaken, після якого ключ у базі є.
+        throw new Error('ключ ідемпотентності зайнято, але в базі його не видно');
     }
   }
 }

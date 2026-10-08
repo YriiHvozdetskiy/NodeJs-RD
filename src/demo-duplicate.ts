@@ -1,9 +1,7 @@
 import { DataSource } from 'typeorm';
 import { dataSourceOptions } from './data-source';
 import { checkout } from './checkout/checkout';
-import { ConsumerProcess, DEMO_POINTS_PER_UNIT, demoFixture, depth, earned, openBroker, resetQueues, Summary, waitFor } from './messaging/demo-kit';
-import { orderPlacedEvent } from './messaging/order-placed.event';
-import { EventPublisher } from './messaging/publisher';
+import { ConsumerProcess, DEMO_POINTS_PER_UNIT, demoFixture, depth, earned, flushOutbox, openBroker, relayUntilEmpty, resetQueues, Summary, waitFor } from './messaging/demo-kit';
 import { LOYALTY_DLQ, LOYALTY_QUEUE } from './messaging/topology';
 
 /**
@@ -15,8 +13,9 @@ import { LOYALTY_DLQ, LOYALTY_QUEUE } from './messaging/topology';
  *                                                             ▲
  *                                                          SIGKILL
  *   брокер       бачить обрив TCP, ack не було → повідомлення знову ready
- *   споживач №2  отримав ту саму подію (redelivered) → INSERT … ON CONFLICT
- *                DO NOTHING → 0 рядків → дубль, ефект не повторено → ack
+ *   споживач №2  отримав ту саму подію (redelivered) → INSERT у
+ *                processed_messages … ON CONFLICT DO NOTHING → 0 рядків →
+ *                дубль, ефект не повторено → ack
  *
  * Вікно між ефектом і ack у проді — мікросекунди, але воно є завжди. Демо
  * розширює його до 10 с (CONSUMER_ACK_DELAY_MS), щоб влучати детерміновано.
@@ -30,12 +29,12 @@ const ACK_WINDOW_MS = 10_000;
 async function main(): Promise<void> {
   const dataSource = await new DataSource(dataSourceOptions).initialize();
   const broker = await openBroker();
-  const publisher = new EventPublisher(async () => broker.url);
   const summary = new Summary();
   const started: ConsumerProcess[] = [];
 
   try {
     const { dlqBefore } = await resetQueues(broker, { purgeDlq: false });
+    await flushOutbox(dataSource, broker);
     const { buyerId, productId } = await demoFixture(dataSource, 'demo:duplicate');
 
     const first = new ConsumerProcess({ CONSUMER_ACK_DELAY_MS: String(ACK_WINDOW_MS) });
@@ -44,7 +43,8 @@ async function main(): Promise<void> {
     console.log('── demo:duplicate: ефект → SIGKILL до ack → брокер повертає → другий споживач ──');
 
     const order = await checkout(dataSource, { buyerId, lines: [{ productId, qty: 1 }] });
-    await publisher.publish(orderPlacedEvent(order));
+    // order.placed виносить relay з outbox (#22), як і в застосунку.
+    await relayUntilEmpty(dataSource, broker);
 
     await first.until('перший споживач застосував ефект', () => first.count('applied') === 1);
     await first.kill();
@@ -87,7 +87,6 @@ async function main(): Promise<void> {
     summary.expect('work=0 і dlq=0', work === 0 && dlq === 0);
   } finally {
     for (const consumer of started) await consumer.stop();
-    await publisher.close();
     await broker.connection.close().catch(() => undefined);
     await dataSource.destroy();
   }

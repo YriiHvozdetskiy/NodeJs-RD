@@ -7,73 +7,80 @@ import type { DataSource } from 'typeorm';
 import type { ConsumerReport } from '../consumer';
 import { requiredEnv } from '../db/cli-env';
 import { CENTS_PER_POINT } from '../loyalty/points-accrual';
+import { relayBatch } from '../outbox/relay';
+import type { RelayReport } from '../relay';
+import { ORDER_AGGREGATE } from './order-placed.event';
+import { EventPublisher } from './publisher';
 import { assertLoyaltyTopology, LOYALTY_DLQ, LOYALTY_QUEUE } from './topology';
 
 /**
- * Спільне для demo:publish, demo:dlq і demo:duplicate. Кожне демо:
+ * Спільне для демо брокера (#19) і outbox (#22). Кожне демо:
  *   1. приводить стан до чистого — топологія, порожня робоча черга (DLQ — лише
- *      demo:dlq, див. resetQueues);
- *   2. запускає СПРАВЖНІЙ споживач (dist/consumer.js) окремим процесом;
+ *      demo:dlq, див. resetQueues), винесені залишки outbox (flushOutbox);
+ *   2. запускає СПРАВЖНІ робочі процеси (dist/consumer.js, dist/relay.js)
+ *      окремо від себе;
  *   3. друкує підсумок рядками ключ=значення;
  *   4. сам перевіряє інваріант і виходить із кодом ≠ 0, якщо той порушено.
  */
 
-/** Споживач у власному процесі — щоб його можна було вбити по-справжньому. */
-export class ConsumerProcess {
-  readonly reports: ConsumerReport[] = [];
+/** Робочий процес у власному процесі ОС — щоб його можна було вбити по-справжньому. */
+class WorkerProcess<R extends { t: string }> {
+  readonly reports: R[] = [];
   private readonly proc: ChildProcess;
   private readonly exited: Promise<void>;
 
-  constructor(env: Record<string, string> = {}) {
-    this.proc = fork(path.join(__dirname, '..', 'consumer.js'), {
+  constructor(
+    private readonly label: string,
+    script: string,
+    env: Record<string, string>,
+  ) {
+    this.proc = fork(path.join(__dirname, '..', script), {
       env: { ...process.env, ...env },
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     });
     this.proc.on('message', (m) => {
-      if (isReport(m)) this.reports.push(m);
+      if (isReport<R>(m)) this.reports.push(m);
     });
     this.exited = new Promise((resolve) => this.proc.once('exit', () => resolve()));
   }
 
-  count(t: ConsumerReport['t']): number {
+  count(t: R['t']): number {
     return this.reports.filter((r) => r.t === t).length;
   }
 
-  of<T extends ConsumerReport['t']>(t: T): Extract<ConsumerReport, { t: T }>[] {
-    return this.reports.filter((r): r is Extract<ConsumerReport, { t: T }> => r.t === t);
+  of<T extends R['t']>(t: T): Extract<R, { t: T }>[] {
+    return this.reports.filter((r): r is Extract<R, { t: T }> => r.t === t);
   }
 
   /** Дочекатись стану, а не поспати навмання. Упав процес — чекати нема на що. */
   async until(what: string, predicate: () => boolean, timeoutMs = 20_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (!predicate()) {
-      if (this.proc.exitCode !== null) throw new Error(`споживач вийшов (код ${this.proc.exitCode}), не дочекавшись: ${what}`);
+      if (this.proc.exitCode !== null || this.proc.signalCode !== null) {
+        throw new Error(`${this.label} вийшов (${this.proc.signalCode ?? `код ${this.proc.exitCode}`}), не дочекавшись: ${what}`);
+      }
       if (Date.now() > deadline) throw new Error(`не дочекались за ${timeoutMs} мс: ${what}`);
       await sleep(20);
     }
   }
 
   ready(): Promise<void> {
-    return this.until('споживач підписався', () => this.count('ready') > 0);
-  }
-
-  get prefetch(): number {
-    return this.of('ready')[0]?.prefetch ?? 0;
+    return this.until(`${this.label} готовий`, () => this.count('ready') > 0);
   }
 
   /**
    * SIGKILL — не SIGTERM і не channel.close(). Коректне закриття — це фрейм
-   * channel.close, і брокер повертає незасвідчене навмисно. Падіння в проді
-   * виглядає інакше: процес зникає, ОС закриває сокет, брокер бачить обрив.
+   * channel.close чи COMMIT поточного проходу. Падіння в проді виглядає
+   * інакше: процес зникає, ОС закриває сокети, брокер і база бачать обрив.
    */
   async kill(): Promise<void> {
     this.proc.kill('SIGKILL');
     await this.exited;
   }
 
-  /** SIGTERM — коректне завершення: відписатись, доробити, закрити канал. */
+  /** SIGTERM — коректне завершення: доробити поточне, закрити зʼєднання. */
   async stop(): Promise<void> {
-    if (this.proc.exitCode !== null) return;
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
     this.proc.kill('SIGTERM');
     const forced = setTimeout(() => this.proc.kill('SIGKILL'), 5_000);
     await this.exited;
@@ -81,8 +88,36 @@ export class ConsumerProcess {
   }
 }
 
-function isReport(m: unknown): m is ConsumerReport {
+function isReport<R>(m: unknown): m is R {
   return typeof m === 'object' && m !== null && 't' in m;
+}
+
+/** Споживач order.placed → бали (dist/consumer.js). */
+export class ConsumerProcess extends WorkerProcess<ConsumerReport> {
+  constructor(env: Record<string, string> = {}) {
+    super('споживач', 'consumer.js', env);
+  }
+
+  get prefetch(): number {
+    return this.of('ready')[0]?.prefetch ?? 0;
+  }
+
+  /** Скільки доставок отримано саме цієї події: дублі рахуються, чужі події — ні. */
+  deliveriesOf(eventId: string): number {
+    return this.of('recv').filter((r) => r.eventId === eventId).length;
+  }
+}
+
+/** Relay outbox (dist/relay.js). */
+export class RelayProcess extends WorkerProcess<RelayReport> {
+  constructor(env: Record<string, string> = {}) {
+    super('relay', 'relay.js', env);
+  }
+
+  /** Скільки разів брокер підтвердив цю подію саме від цього relay. */
+  publishesOf(id: string): number {
+    return this.of('published').filter((r) => r.ids.includes(id)).length;
+  }
 }
 
 export interface Broker {
@@ -201,4 +236,64 @@ export class Summary {
     for (const f of this.failures) console.log(`✗ порушено: ${f}`);
     process.exitCode = 1;
   }
+}
+
+/**
+ * Невинесені рядки outbox, що лишились до прогону: замовлення з demo:race і
+ * demo:retry (#14), з POST /v1/orders без relay, з обірваного демо. Без цього
+ * relay демо виносив би й їх, а споживач рахував би чужі доставки.
+ *
+ * Виносить їх той самий relayBatch — без споживача, — а потім робоча черга
+ * чиститься так само, як її чистить resetQueues. Стан після: outbox без
+ * невинесених, черга порожня. Повертає, скільки рядків винесено.
+ */
+export async function flushOutbox(dataSource: DataSource, broker: Broker): Promise<number> {
+  const published = await relayUntilEmpty(dataSource, broker);
+  if (published.length > 0) await broker.ch.purgeQueue(LOYALTY_QUEUE);
+  return published.length;
+}
+
+/** relayBatch, поки є що виносити. Повертає винесені id. */
+export async function relayUntilEmpty(dataSource: DataSource, broker: Broker): Promise<string[]> {
+  const publisher = new EventPublisher(async () => broker.url);
+  const published: string[] = [];
+  try {
+    for (;;) {
+      const batch = await relayBatch(dataSource, publisher);
+      if (batch.failed) throw new Error(`relay не виніс ${batch.failed.id}: ${batch.failed.error}`);
+      published.push(...batch.published);
+      if (batch.claimed === 0) return published;
+    }
+  } finally {
+    await publisher.close();
+  }
+}
+
+/**
+ * Схема — тими самими міграціями, що `npm run migrate`. Демо #22 запускаються
+ * на свіжій базі без окремого кроку: застосовані міграції TypeORM пропускає,
+ * тож повторний виклик нічого не змінює.
+ */
+export async function migrate(dataSource: DataSource): Promise<number> {
+  return (await dataSource.runMigrations()).length;
+}
+
+/** Рядки outbox цих замовлень: скільки є, скільки винесено, сума закомічених спроб. */
+export async function outboxOf(dataSource: DataSource, orderIds: string[]): Promise<{ rows: number; published: number; attempts: number }> {
+  const [row] = await dataSource.query(
+    `SELECT count(*)::int AS rows, count(published_at)::int AS published, COALESCE(sum(attempts), 0)::int AS attempts
+       FROM outbox
+      WHERE aggregate_type = $1 AND aggregate_id = ANY($2::text[])`,
+    [ORDER_AGGREGATE, orderIds],
+  );
+  return { rows: row.rows, published: row.published, attempts: row.attempts };
+}
+
+/** Позначки inbox споживача балів для цих подій. */
+export async function processedOf(dataSource: DataSource, eventIds: string[]): Promise<number> {
+  const [row] = await dataSource.query(
+    `SELECT count(*)::int AS n FROM processed_messages WHERE consumer = $1 AND message_id = ANY($2::uuid[])`,
+    [LOYALTY_QUEUE, eventIds],
+  );
+  return row.n;
 }

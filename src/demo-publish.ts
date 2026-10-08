@@ -1,15 +1,14 @@
 import { DataSource } from 'typeorm';
 import { dataSourceOptions } from './data-source';
 import { checkout } from './checkout/checkout';
-import { ConsumerProcess, DEMO_POINTS_PER_UNIT, demoFixture, depth, earned, openBroker, resetQueues, Summary } from './messaging/demo-kit';
-import { orderPlacedEvent } from './messaging/order-placed.event';
-import { EventPublisher } from './messaging/publisher';
+import { ConsumerProcess, DEMO_POINTS_PER_UNIT, demoFixture, depth, earned, flushOutbox, openBroker, relayUntilEmpty, resetQueues, Summary } from './messaging/demo-kit';
 import { LOYALTY_DLQ, LOYALTY_QUEUE } from './messaging/topology';
 
 /**
  * demo:publish — happy path. П'ять оформлень через ту саму транзакцію
- * checkout(), що й POST /v1/orders; після кожного COMMIT — order.placed через
- * confirm-канал; споживач окремим процесом нараховує бали й підтверджує.
+ * checkout(), що й POST /v1/orders; кожне кладе order.placed у outbox, а relay
+ * (#22) виносить їх через confirm-канал; споживач окремим процесом нараховує
+ * бали й підтверджує. До #22 тут був publish після кожного COMMIT.
  *
  * Інваріант: 5 опубліковано → 5 ефектів у базі → 5 ack → 0 у DLQ і 0 у черзі,
  * а prefetch — задане число, не дефолтний 0.
@@ -21,27 +20,26 @@ const ORDERS = 5;
 async function main(): Promise<void> {
   const dataSource = await new DataSource(dataSourceOptions).initialize();
   const broker = await openBroker();
-  const publisher = new EventPublisher(async () => broker.url);
   const summary = new Summary();
   let consumer: ConsumerProcess | undefined;
 
   try {
     const { dlqBefore } = await resetQueues(broker, { purgeDlq: false });
+    await flushOutbox(dataSource, broker);
     const { buyerId, productId } = await demoFixture(dataSource, 'demo:publish');
     const loyalty = (consumer = new ConsumerProcess());
     await loyalty.ready();
     console.log(`── demo:publish: ${ORDERS} оформлень → ${ORDERS}× order.placed → споживач балів (prefetch=${loyalty.prefetch}) ──`);
 
     const orderIds: string[] = [];
-    let published = 0;
     for (let i = 0; i < ORDERS; i++) {
       const order = await checkout(dataSource, { buyerId, lines: [{ productId, qty: 1 }] });
       orderIds.push(order.orderId);
-      // Рахуємо лише підтверджене брокером: publish кидає на nack, на
-      // unroutable (basic.return) і на таймаут confirm.
-      await publisher.publish(orderPlacedEvent(order));
-      published += 1;
     }
+    // Рахуємо лише підтверджене брокером: relay позначає published_at тільки
+    // після confirm — publish кидає на nack, на unroutable (basic.return) і на
+    // таймаут confirm.
+    const published = (await relayUntilEmpty(dataSource, broker)).length;
 
     await loyalty.until(`${ORDERS} ack`, () => loyalty.count('acked') >= ORDERS);
     await loyalty.stop();
@@ -76,7 +74,6 @@ async function main(): Promise<void> {
     summary.expect('1 ≤ prefetch ≤ 2000', loyalty.prefetch >= 1 && loyalty.prefetch <= 2000);
   } finally {
     await consumer?.stop();
-    await publisher.close();
     await broker.connection.close().catch(() => undefined);
     await dataSource.destroy();
   }

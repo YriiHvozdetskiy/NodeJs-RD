@@ -8,6 +8,18 @@ export interface DomainEvent {
   occurredAt: string;
 }
 
+/**
+ * Повідомлення в тій формі, у якій його бачить брокер. Relay outbox (#22) шле
+ * рядок таблиці саме так: id → messageId, type → routing key, payload → тіло
+ * як є. Тіло він не розбирає — контракт події тримає продюсер, а не relay.
+ */
+export interface OutgoingMessage {
+  messageId: string;
+  type: string;
+  occurredAt: Date;
+  body: unknown;
+}
+
 /** Брокер прийняв повідомлення, але жоден binding його не забрав. */
 export class UnroutableError extends Error {
   override readonly name = 'UnroutableError';
@@ -17,8 +29,8 @@ const CONNECT_TIMEOUT_MS = 2_000;
 const CONFIRM_TIMEOUT_MS = 5_000;
 
 /**
- * Публікація подій домену в `shop.events`. Без Nest: той самий клас бере і
- * застосунок (src/orders/order-placed.publisher.ts), і демо.
+ * Публікація подій домену в `shop.events`. Без Nest: той самий клас бере
+ * relay outbox — і вбудований у застосунок, і окремий процес (src/outbox/), — і демо.
  *
  * «Опублікував» тут означає «брокер узяв відповідальність», а не «віддав у
  * сокет». Дві речі разом:
@@ -44,29 +56,39 @@ export class EventPublisher {
   /** URL — функцією: пароль читається з файла на кожне НОВЕ зʼєднання. */
   constructor(private readonly url: () => Promise<string>) {}
 
-  async publish(event: DomainEvent): Promise<void> {
+  publish(event: DomainEvent): Promise<void> {
+    return this.send({ messageId: event.eventId, type: event.type, occurredAt: new Date(event.occurredAt), body: event });
+  }
+
+  /**
+   * Resolve — брокер узяв відповідальність. Reject НЕ означає «не доставлено»:
+   * таймаут confirm лишає повідомлення, яке брокер міг прийняти, а відповідь
+   * загубилась. Тому той, хто повторює після reject, повторює at-least-once, і
+   * дедуплікація на споживачі обовʼязкова незалежно від акуратності продюсера.
+   */
+  async send(message: OutgoingMessage): Promise<void> {
     const ch = await this.open();
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`немає confirm від брокера за ${CONFIRM_TIMEOUT_MS} мс`)), CONFIRM_TIMEOUT_MS);
       ch.publish(
         EVENTS_EXCHANGE,
-        event.type,
-        Buffer.from(JSON.stringify(event)),
+        message.type,
+        Buffer.from(JSON.stringify(message.body)),
         {
           // persistent — на диск; для quorum-черги це й так єдиний режим, але
           // для classic-підписника, якщо він колись зʼявиться, — ні.
           persistent: true,
           mandatory: true,
           contentType: 'application/json',
-          messageId: event.eventId,
-          type: event.type,
-          timestamp: Math.floor(Date.parse(event.occurredAt) / 1000),
+          messageId: message.messageId,
+          type: message.type,
+          timestamp: Math.floor(message.occurredAt.getTime() / 1000),
         },
         (err) => {
           clearTimeout(timer);
           if (err) return reject(new Error(`брокер відмовив у прийомі (basic.nack): ${String(err)}`));
-          if (this.returned.delete(event.eventId)) {
-            return reject(new UnroutableError(`${event.type} ${event.eventId}: жоден binding у ${EVENTS_EXCHANGE} не збігся — повідомлення викинуто`));
+          if (this.returned.delete(message.messageId)) {
+            return reject(new UnroutableError(`${message.type} ${message.messageId}: жоден binding у ${EVENTS_EXCHANGE} не збігся — повідомлення викинуто`));
           }
           resolve();
         },

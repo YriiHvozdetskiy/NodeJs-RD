@@ -1,6 +1,7 @@
 import type { DataSource, EntityManager } from 'typeorm';
 import { withRetry } from '../db/retry';
 import { PG_ERROR, pgErrorField, sql } from '../db/sql';
+import { ORDER_AGGREGATE, toOrderPlacedEvent } from '../messaging/order-placed.event';
 
 /**
  * Оформлення замовлення — одна транзакція, у якій або стається все, або нічого:
@@ -9,10 +10,14 @@ import { PG_ERROR, pgErrorField, sql } from '../db/sql';
  *   2. ціна зі знижками — знімок у order_items (акції на позицію + промокод);
  *   3. списання балів — під локом рядка покупця;
  *   4. INSERT orders + order_items + points_entries(spent);
- *   5. INSERT jobs — задача на чек, яку виконає воркер (src/queue/worker.ts).
+ *   5. INSERT jobs — задача на чек, яку виконає воркер (src/queue/worker.ts);
+ *   6. INSERT outbox — подія order.placed (#22); у брокер її везе relay;
+ *   7. INSERT idempotency_keys — ключ з API-краю, якщо запит його приніс (#22).
  *
  * Будь-який збій на будь-якому кроці — throw, і TypeORM робить ROLLBACK:
- * декремент із кроку 1 зникає разом із рештою, замовлень-«сиріт» не буває.
+ * декремент із кроку 1 зникає разом із рештою, замовлень-«сиріт» не буває. І
+ * подій-сиріт теж: рядок outbox відкочується разом із замовленням, тож relay
+ * ніколи не побачить подію про замовлення, якого немає (demo:crash-write).
  *
  * Два обмежені ресурси — два різні інструменти, і це свідомо:
  *
@@ -33,6 +38,8 @@ import { PG_ERROR, pgErrorField, sql } from '../db/sql';
 /** Курс із docs/design-notes.md: 1 бал = 1 копійка. */
 const POINT_VALUE_CENTS = 1;
 const ORDER_CURRENCY = 'UAH';
+/** Скільки живе Idempotency-Key — 24 години зі спеки (`Idempotency-Key`). */
+export const IDEMPOTENCY_TTL_HOURS = 24;
 
 export const CHECKOUT_FAILURES = [
   'invalid_input',
@@ -88,6 +95,29 @@ export interface CheckoutResult {
   amountDueCents: number;
 }
 
+export interface CheckoutOptions {
+  /** `Idempotency-Key` з API-краю і sha256 тіла запиту — пишуться в транзакції замовлення. */
+  idempotency?: { key: string; fingerprint: string };
+  /**
+   * Останній крок перед COMMIT, коли замовлення, outbox і ключ уже вставлено.
+   * Кинутий звідси виняток відкочує все. Точка, у яку demo:crash-write кладе
+   * збій бізнес-запису.
+   */
+  beforeCommit?: (manager: EntityManager, placed: CheckoutResult) => Promise<void>;
+}
+
+/**
+ * Ключ уже закомітив інший запит (паралельний, на іншому інстансі чи до
+ * рестарту). Транзакцію цього запиту відкочено цілком — разом із другим
+ * замовленням і другою подією; відповідь дає вже збережений ключ.
+ */
+export class IdempotencyKeyTaken extends Error {
+  constructor(readonly key: string) {
+    super(`Idempotency-Key «${key}» уже використано`);
+    this.name = 'IdempotencyKeyTaken';
+  }
+}
+
 interface PricedLine extends CheckoutLine {
   unitPriceCents: number;
   discountCents: number;
@@ -107,7 +137,7 @@ const basisPoints = (percent: string) => Math.round(Number(percent) * 100);
 /** Знижка завжди вниз до цілої копійки — щоб не подарувати зайве (та сама політика, що в сіді). */
 const discountOf = (amountCents: number, percent: string) => Math.floor((amountCents * basisPoints(percent)) / 10_000);
 
-export async function checkout(dataSource: DataSource, input: CheckoutInput): Promise<CheckoutResult> {
+export async function checkout(dataSource: DataSource, input: CheckoutInput, options: CheckoutOptions = {}): Promise<CheckoutResult> {
   const lines = normalizeLines(input.lines);
   const pointsToSpend = input.pointsToSpend ?? 0;
   if (!Number.isInteger(pointsToSpend) || pointsToSpend < 0) {
@@ -119,7 +149,7 @@ export async function checkout(dataSource: DataSource, input: CheckoutInput): Pr
   // двома checkout неможливим, але не між checkout і будь-яким майбутнім
   // кодом, що бере ті самі рядки в іншому порядку.
   return withRetry(
-    () => dataSource.transaction('READ COMMITTED', (manager) => placeOrder(manager, { ...input, lines, pointsToSpend })),
+    () => dataSource.transaction('READ COMMITTED', (manager) => placeOrder(manager, { ...input, lines, pointsToSpend }, options)),
     { label: 'checkout' },
   );
 }
@@ -146,6 +176,7 @@ function normalizeLines(lines: CheckoutLine[]): CheckoutLine[] {
 async function placeOrder(
   manager: EntityManager,
   input: CheckoutInput & { pointsToSpend: number },
+  options: CheckoutOptions,
 ): Promise<CheckoutResult> {
   const region = input.region ?? 'UA';
 
@@ -312,7 +343,7 @@ async function placeOrder(
     [orderId],
   );
 
-  return {
+  const placed: CheckoutResult = {
     orderId,
     jobId: job.id,
     buyerId: input.buyerId,
@@ -325,4 +356,41 @@ async function placeOrder(
     pointsSpent,
     amountDueCents: totalCents - pointsSpent * POINT_VALUE_CENTS,
   };
+
+  // ── 6. подія — у тій самій транзакції (transactional outbox, #22) ────────
+  // Не publish: брокер не вміє відкочуватись, і подія, відправлена звідси,
+  // пережила б ROLLBACK. Рядок outbox — звичайний INSERT: комітиться з
+  // замовленням або зникає разом із ним. id = eventId (UUID v5 від orderId) —
+  // друга подія про те саме замовлення впреться в PK.
+  const event = toOrderPlacedEvent(placed);
+  await sql(
+    manager,
+    `INSERT INTO outbox (id, aggregate_type, aggregate_id, type, payload) VALUES ($1, $2, $3, $4, $5)`,
+    [event.eventId, ORDER_AGGREGATE, orderId, event.type, JSON.stringify(event)],
+  );
+
+  // ── 7. ключ ідемпотентності — останнім ───────────────────────────────────
+  // Останнім, бо order_id відомий лише тут. Ціна: паралельний дубль ключа
+  // проходить усю транзакцію й відкочується на цьому рядку — один зайвий
+  // ROLLBACK, але ніколи друге замовлення. Конкурентний INSERT із тим самим
+  // ключем чекає на COMMIT першого й отримує конфлікт, а не другий рядок.
+  //
+  // DO UPDATE … WHERE — лише для простроченого ключа: через 24 години той
+  // самий ключ створює нове замовлення (спека), а рядок перезаписується. Живий
+  // ключ WHERE не пропускає, і RETURNING повертає 0 рядків.
+  if (options.idempotency) {
+    const [claimed] = await sql<{ key: string }>(
+      manager,
+      `INSERT INTO idempotency_keys (key, fingerprint, order_id) VALUES ($1, $2, $3)
+       ON CONFLICT (key) DO UPDATE
+             SET fingerprint = EXCLUDED.fingerprint, order_id = EXCLUDED.order_id, created_at = now()
+           WHERE idempotency_keys.created_at <= now() - make_interval(hours => $4)
+       RETURNING key`,
+      [options.idempotency.key, options.idempotency.fingerprint, orderId, IDEMPOTENCY_TTL_HOURS],
+    );
+    if (!claimed) throw new IdempotencyKeyTaken(options.idempotency.key);
+  }
+
+  await options.beforeCommit?.(manager, placed);
+  return placed;
 }

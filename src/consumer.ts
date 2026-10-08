@@ -4,7 +4,7 @@ import * as amqp from 'amqplib';
 import type { ConsumeMessage } from 'amqplib';
 import { Pool } from 'pg';
 import { cliDbConfig, requiredEnv } from './db/cli-env';
-import { accruePoints } from './loyalty/points-accrual';
+import { accruePointsOnce } from './loyalty/points-accrual';
 import { ContractError, parseOrderPlaced } from './messaging/order-placed.event';
 import { assertLoyaltyTopology, DELIVERY_LIMIT, LOYALTY_QUEUE } from './messaging/topology';
 
@@ -16,9 +16,12 @@ import { assertLoyaltyTopology, DELIVERY_LIMIT, LOYALTY_QUEUE } from './messagin
  *   npm run consumer    ≡ bash scripts/with-secrets.sh dev node dist/consumer.js
  *
  * Гарантія — at-least-once: ack відправляється ПІСЛЯ ефекту. Упав між ефектом
- * і ack — брокер поверне повідомлення, і ефект спробує статися вдруге. Тому
- * ефект ідемпотентний (src/loyalty/points-accrual.ts), і разом це дає один
- * результат на подію. Exactly-once ДОСТАВКИ тут немає і бути не може.
+ * і ack — брокер поверне повідомлення, і ефект спробує статися вдруге. З #22
+ * дублі приходять ще й від relay outbox, який помер між publish і UPDATE
+ * published_at. Тому ефект ідемпотентний на двох рівнях — inbox
+ * processed_messages і природний ключ (src/loyalty/points-accrual.ts), — і
+ * разом це дає один результат на подію. Exactly-once ДОСТАВКИ тут немає і бути
+ * не може.
  *
  * Ack — не «дійшло», а «я більше не вимагаю повтору». Три вердикти:
  *   ack              ефект застосовано або вже був (дубль) — повторювати нічого;
@@ -66,7 +69,7 @@ export type ConsumerReport =
   | { t: 'ready'; pid: number; prefetch: number }
   | { t: 'recv'; eventId: string; redelivered: boolean; deliveryCount: number }
   | { t: 'applied'; eventId: string; orderId: string; points: number }
-  | { t: 'duplicate'; eventId: string; orderId: string }
+  | { t: 'duplicate'; eventId: string; orderId: string; by: 'inbox' | 'natural-key' }
   | { t: 'not-eligible'; eventId: string; orderId: string }
   | { t: 'acked'; eventId: string; ms: number }
   | { t: 'rejected'; eventId: string; requeue: boolean; delayMs: number; error: string };
@@ -117,13 +120,18 @@ async function main(): Promise<void> {
     try {
       const event = parseOrderPlaced(msg.content);
       const { orderId } = event.data;
-      const outcome = await accruePoints(db, orderId);
+      // eventId з тіла, а не messageId з властивостей: тіло пройшло схему, тож
+      // це гарантовано UUID — тип колонки processed_messages.message_id.
+      const outcome = await accruePointsOnce(db, { eventId: event.eventId, orderId, consumer: LOYALTY_QUEUE });
       if (outcome.kind === 'applied') {
         report({ t: 'applied', eventId, orderId, points: outcome.points });
         log(`замовлення ${orderId}: +${outcome.points} балів (pending)`);
+      } else if (outcome.kind === 'duplicate') {
+        report({ t: 'duplicate', eventId, orderId, by: outcome.by });
+        log(`замовлення ${orderId}: дубль (${outcome.by === 'inbox' ? 'подія вже в processed_messages' : 'нарахування вже є'}) — ефект не повторюю`);
       } else {
-        report({ t: outcome.kind, eventId, orderId });
-        log(`замовлення ${orderId}: ${outcome.kind === 'duplicate' ? 'уже нараховано — дубль, ефект не повторюю' : 'нема чого нараховувати'}`);
+        report({ t: 'not-eligible', eventId, orderId });
+        log(`замовлення ${orderId}: нема чого нараховувати`);
       }
     } catch (err) {
       requeue = !(err instanceof ContractError);
