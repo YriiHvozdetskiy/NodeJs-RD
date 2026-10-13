@@ -19,9 +19,11 @@ import { Check, Column, CreateDateColumn, Entity, Index, PrimaryColumn } from 't
  * тому в конекторі їх перевизначають: `route.by.field=aggregate_type`,
  * `table.field.event.key=aggregate_id` (README, розділ 13).
  *
- * `published_at` NULL = ще не винесено. `attempts` рахує лише ЗАКОМІЧЕНІ
- * спроби: спроба, після якої relay помер до COMMIT, відкотилась разом із
- * своїм +1 — це видно в demo:crash-relay (дві доставки, attempts = 1).
+ * `published_at` NULL = ще не винесено. `locked_until` — оренда relay (#22,
+ * після ревʼю): рядок узято в роботу до цієї миті, інші relay його не беруть.
+ * `attempts` +1 комітиться ДО кожного publish, тож спроба relay, що помер
+ * посеред публікації, лишається в лічильнику — demo:crash-relay: дві
+ * доставки, attempts = 2.
  *
  * Частковий індекс (created_at, id) WHERE published_at IS NULL — рівно під
  * запит relay: винесені рядки в індекс не потрапляють, тож вибірка
@@ -54,8 +56,13 @@ export class OutboxEvent {
   @Column({ name: 'published_at', type: 'timestamptz', nullable: true })
   publishedAt!: Date | null;
 
+  /** Початі спроби publish. +1 комітиться до publish, а не разом із published_at. */
   @Column({ type: 'integer', default: 0 })
   attempts!: number;
+
+  /** До цієї миті рядок орендує один relay. NULL або минуле — рядок вільний. */
+  @Column({ name: 'locked_until', type: 'timestamptz', nullable: true })
+  lockedUntil!: Date | null;
 
   /** Чому остання закомічена спроба не вдалась. Скидається в NULL на успіху. */
   @Column({ name: 'last_error', type: 'text', nullable: true })

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { DataSource } from 'typeorm';
-import { checkout } from './checkout/checkout';
+import { DataSource, type EntityManager } from 'typeorm';
+import type { IsolationLevel } from 'typeorm/driver/types/IsolationLevel';
+import { checkout, type CheckoutResult } from './checkout/checkout';
 import { dataSourceOptions } from './data-source';
 import { sql } from './db/sql';
 import {
@@ -25,7 +26,7 @@ import {
  *     INSERT orders, order_items, jobs
  *     INSERT outbox                  ← подія є, її видно цій транзакції
  *     INSERT idempotency_keys
- *     ✗ збій                         ← beforeCommit кидає виняток
+ *     ✗ збій                         ← двійник DataSource кидає виняток
  *   ROLLBACK                         ← зникає все, і рядок outbox теж
  *
  * Поруч весь час працюють справжні relay і споживач. Якби outbox і замовлення
@@ -33,13 +34,38 @@ import {
  * виніс би її. Тут виносити нічого: relay двічі опитує outbox після збою й
  * бачить порожньо, споживач не отримує нічого.
  *
- * Падіння змодельоване винятком у тій самій точці, а не kill -9: для бізнес-
- * запису обидва дають ROLLBACK, а виняток дозволяє перед ним заглянути в
- * таблицю зсередини транзакції — `outbox-in-tx=1` доводить, що рядок справді
- * був вставлений, а не просто не дійшов.
+ * Точки збою в checkout немає: його код той самий, що в проді. Збій вносить
+ * тестовий двійник DataSource (crashingBeforeCommit нижче) — справжня
+ * транзакція, у якій після всіх INSERT бізнес-операції і ДО COMMIT
+ * кидається виняток. Перед ним двійник заглядає в таблиці зсередини тієї ж
+ * транзакції: `outbox-in-tx=1` доводить, що рядок справді був вставлений, а
+ * не просто не дійшов. Виняток, а не kill -9: для бізнес-запису обидва дають
+ * ROLLBACK, а виняток дозволяє цей погляд зсередини.
  */
 class SimulatedCrash extends Error {
   override readonly name = 'SimulatedCrash';
+}
+
+/**
+ * Тестовий двійник DataSource: делегує справжньому, але обгортає роботу
+ * транзакції — коли бізнес-операція повернулась (усі INSERT виконано, COMMIT ще
+ * ні), викликає `crash`, а той кидає. Справжній `transaction()` на винятку
+ * робить ROLLBACK, як і на будь-якому збої checkout.
+ *
+ * checkout кличе лише `transaction(isolation, run)` — іншої форми двійник не
+ * підтримує. Решта властивостей іде до справжнього DataSource без змін.
+ */
+function crashingBeforeCommit(
+  dataSource: DataSource,
+  crash: (manager: EntityManager, placed: CheckoutResult) => Promise<never>,
+): DataSource {
+  return new Proxy(dataSource, {
+    get(target, prop, receiver) {
+      if (prop !== 'transaction') return Reflect.get(target, prop, receiver);
+      return (isolation: IsolationLevel, run: (manager: EntityManager) => Promise<CheckoutResult>) =>
+        target.transaction(isolation, async (manager) => crash(manager, await run(manager)));
+    },
+  });
 }
 
 async function main(): Promise<void> {
@@ -65,21 +91,16 @@ async function main(): Promise<void> {
     const key = `demo-crash-write-${randomUUID()}`;
     let crashedOrderId = '';
     let outboxInTx = 0;
+    let keysInTx = 0;
     let writeFailed = 0;
+    const crashing = crashingBeforeCommit(dataSource, async (manager, placed) => {
+      crashedOrderId = placed.orderId;
+      [{ n: outboxInTx }] = await sql<{ n: number }>(manager, `SELECT count(*)::int AS n FROM outbox WHERE aggregate_id = $1`, [placed.orderId]);
+      [{ n: keysInTx }] = await sql<{ n: number }>(manager, `SELECT count(*)::int AS n FROM idempotency_keys WHERE key = $1`, [key]);
+      throw new SimulatedCrash(`збій бізнес-запису після INSERT outbox, замовлення ${placed.orderId} ще не закомічене`);
+    });
     try {
-      await checkout(
-        dataSource,
-        { buyerId, lines: [{ productId, qty: 1 }] },
-        {
-          idempotency: { key, fingerprint: 'demo:crash-write' },
-          beforeCommit: async (manager, placed) => {
-            crashedOrderId = placed.orderId;
-            const [row] = await sql<{ n: number }>(manager, `SELECT count(*)::int AS n FROM outbox WHERE aggregate_id = $1`, [placed.orderId]);
-            outboxInTx = row.n;
-            throw new SimulatedCrash(`збій бізнес-запису після INSERT outbox, замовлення ${placed.orderId} ще не закомічене`);
-          },
-        },
-      );
+      await checkout(crashing, { buyerId, lines: [{ productId, qty: 1 }] }, { idempotency: { key, fingerprint: 'demo:crash-write' } });
     } catch (err) {
       if (!(err instanceof SimulatedCrash)) throw err;
       writeFailed = 1;
@@ -108,6 +129,7 @@ async function main(): Promise<void> {
     summary.line('deliveries', deliveries);
     summary.line('effect', effect);
     summary.line('outbox-in-tx', outboxInTx);
+    summary.line('idempotency-keys-in-tx', keysInTx);
     summary.line('idempotency-keys', keys);
     summary.line('relay-batches', relayed);
     summary.line('stock-before', stockBefore);
@@ -120,7 +142,7 @@ async function main(): Promise<void> {
     summary.expect('orders=0 і outbox=0 — обидва рядки зникли разом', orders === 0 && outbox.rows === 0);
     summary.expect('published=0, deliveries=0, effect=0 — назовні не вийшло нічого', outbox.published === 0 && deliveries === 0 && effect === 0);
     summary.expect('relay не виніс жодного рядка', relayed === 0);
-    summary.expect('ключ ідемпотентності теж відкотився', keys === 0);
+    summary.expect('ключ ідемпотентності був вставлений і теж відкотився', keysInTx === 1 && keys === 0);
     summary.expect('stock повернувся', stockAfter === stockBefore);
   } finally {
     for (const worker of workers) await worker.stop();

@@ -87,7 +87,7 @@ async function main(): Promise<void> {
 
     // BROKER_URL явно: startApi обнулив його в оточенні цього процесу, щоб
     // вимкнути вбудований relay, а нащадок успадкував би порожній рядок.
-    const relay = new RelayProcess({ BROKER_URL: broker.url });
+    const relay = new RelayProcess('relay.js', { BROKER_URL: broker.url });
     workers.push(relay);
     await relay.ready();
     await relay.until('relay виніс подію', () => eventIds.every((id) => relay.of('committed').some((r) => r.ids.includes(id))));

@@ -1447,7 +1447,7 @@ POST /v1/orders ── Idempotency-Key
    │   UPDATE products · INSERT orders, order_items, jobs, outbox, idempotency_keys
    ▼ COMMIT
 outbox (published_at IS NULL)
-   │ relay: SELECT … FOR UPDATE SKIP LOCKED → publish → UPDATE published_at → COMMIT
+   │ relay: оренда (SKIP LOCKED) → attempts + 1 → publish → UPDATE published_at
    ▼
 shop.events ──► loyalty.order.placed ──► споживач, одна транзакція:
                                            INSERT processed_messages … ON CONFLICT DO NOTHING
@@ -1457,7 +1457,8 @@ shop.events ──► loyalty.order.placed ──► споживач, одна 
 ### Таблиця outbox
 
 Міграція `OutboxInbox` (згенерована з entities, дописані лише `GRANT`) заводить
-три таблиці: `outbox`, `processed_messages`, `idempotency_keys`.
+три таблиці: `outbox`, `processed_messages`, `idempotency_keys`. Друга міграція,
+`OutboxLease`, додає `locked_until` — оренду relay (далі, «Relay»).
 
 | Колонка | Що в ній | Роль у Debezium Outbox Event Router |
 | --- | --- | --- |
@@ -1468,7 +1469,8 @@ shop.events ──► loyalty.order.placed ──► споживач, одна 
 | `payload jsonb` | конверт події з розділу 12 | тіло повідомлення |
 | `created_at` | `now()` транзакції checkout — та сама мить, що `orders.created_at` | timestamp |
 | `published_at` | NULL — ще не винесено | — |
-| `attempts`, `last_error` | закомічені спроби relay і причина останньої невдачі | — |
+| `attempts`, `last_error` | початі спроби relay (комітяться до publish) і причина останньої невдачі | — |
+| `locked_until` | до цієї миті рядок орендує один relay; NULL — вільний | — |
 
 Під relay — частковий індекс `outbox_unpublished ON outbox (created_at, id)
 WHERE published_at IS NULL`: винесені рядки в нього не потрапляють, і вибірка
@@ -1480,7 +1482,7 @@ WHERE published_at IS NULL`: винесені рядки в нього не по
 `transforms.outbox.route.by.field=aggregate_type` і
 `transforms.outbox.table.field.event.key=aggregate_id`. Консюмери цього не
 помітять: тіло повідомлення — той самий `payload`, messageId — той самий `id`.
-`published_at` і `attempts` для CDC не потрібні: Debezium читає WAL, і рядок
+`published_at`, `attempts` і `locked_until` для CDC не потрібні: Debezium читає WAL, і рядок
 можна видаляти одразу після вставки.
 
 `id` = `eventId`, а не `gen_random_uuid()`: на одне замовлення рівно одна подія
@@ -1503,33 +1505,62 @@ WHERE published_at IS NULL`: винесені рядки в нього не по
 
 ### Relay
 
-`src/outbox/relay.ts`, один прохід — одна транзакція через
-`dataSource.transaction(...)`, тобто на одному зʼєднанні пулу:
+`src/outbox/relay.ts`. Один прохід — три короткі коміти навколо мережевих
+викликів:
 
 ```sql
-SELECT id, type, payload, created_at FROM outbox
- WHERE published_at IS NULL
- ORDER BY created_at, id
- LIMIT 50
-   FOR UPDATE SKIP LOCKED;
--- publish кожного рядка, confirm-канал + mandatory (розділ 12)
-UPDATE outbox SET published_at = clock_timestamp(), attempts = attempts + 1, last_error = NULL
+-- 1. оренда: вибрати й позначити одним оператором
+WITH free AS (
+  SELECT id FROM outbox
+   WHERE published_at IS NULL
+     AND (locked_until IS NULL OR locked_until < clock_timestamp())
+   ORDER BY created_at, id
+   LIMIT 50
+     FOR UPDATE SKIP LOCKED)
+UPDATE outbox o SET locked_until = clock_timestamp() + interval '30 seconds'
+  FROM free WHERE o.id = free.id
+RETURNING o.id, o.type, o.payload, o.created_at;
+-- 2. на кожен рядок: спроба — у лічильник ДО publish
+UPDATE outbox SET attempts = attempts + 1 WHERE id = $1;
+--    publish, confirm-канал + mandatory (розділ 12)
+-- 3. позначка — після publish
+UPDATE outbox SET published_at = clock_timestamp(), locked_until = NULL, last_error = NULL
  WHERE id = ANY($1);
-COMMIT;
 ```
 
 Цикл один, хостів два. Вбудований у застосунок (`OutboxRelayService`) стартує,
 коли задано `BROKER_URL`, тож `npm run start` доносить події до споживача без
 додаткового процесу. Окремий процес — `npm run relay`: для масштабування окремо
-від API і для `demo:crash-relay`, якому треба вбити relay, не вбиваючи API.
-Скільки б relay не працювало над однією таблицею, рядок візьме один: SKIP
-LOCKED пропускає заблоковані рядки замість чекати на них. Голий `FOR UPDATE`
-дав би ті самі нуль дублів, але другий relay стояв би на локу першого.
+від API. Скільки б relay не працювало над однією таблицею, рядок візьме один:
+SKIP LOCKED пропускає рядки, які саме зараз орендує інший relay, замість чекати
+на них, а взятий рядок до кінця оренди не бачить ніхто. Голий `FOR UPDATE` дав
+би ті самі нуль дублів, але другий relay стояв би на локу першого.
 
+**Чому оренда, а не лок рядка на весь прохід.** У першій версії прохід був
+однією транзакцією: `FOR UPDATE SKIP LOCKED` → publish → `UPDATE published_at,
+attempts + 1` → COMMIT. Падіння давало дубль, а не втрату, але разом із
+транзакцією відкочувався і `+1`: у `demo:crash-relay` було дві публікації при
+`attempts=1`, і алерт на `attempts` не бачив спроб, убитих разом із процесом.
+Закомітити `+1` до publish, тримаючи лок, не можна — UPDATE того самого рядка з
+іншої транзакції чекав би на наш власний лок. Оренда — колонка, а не лок: вона
+закомічена, рядок ніхто не тримає, і `attempts + 1` комітиться окремим
+оператором перед кожним publish. Relay помер — `attempts` уже записано, оренда
+спливає за 30 с, і рядок бере наступний relay. Той самий прийом згадано у
+воркері #14 (`src/queue/worker.ts`) як вихід для довгих задач.
+
+- **`attempts` — початі спроби, а не доставлені.** Спроба, що впала ще до мережі,
+  теж у лічильнику. Для алерту це правильний бік: краще зайва тривога, ніж
+  пропущена.
 - **Прохід зупиняється на першій невдалій публікації.** Лежачий брокер відмовить
-  і решті рядків — лише триматимемо локи довше. А пізніша подія того самого
-  агрегата не має обганяти ранішу, що застрягла. Невдача теж комітиться:
-  `attempts + 1` і `last_error` — те, на що вішати алерт.
+  і решті рядків. А пізніша подія того самого агрегата не має обганяти ранішу,
+  що застрягла. Упалий рядок і ті, до яких прохід не дійшов, повертаються
+  одразу (`locked_until = NULL`), а не через 30 с оренди; причина — у
+  `last_error`.
+- **Оренда — 30 с.** Має перекривати найдовший прохід: 50 publish по мілісекунди
+  плюс 5 с таймауту confirm на першій невдачі. Довша — довше чекає рядок, чий
+  relay помер. Коротша — більше дублів від relay, що живий, але повільний: коли
+  оренда спливає посеред publish, рядок бере другий relay, і подія йде двічі.
+  Дедуплікація на споживачі це покриває.
 - **Пауза:** повний прохід (50 рядків) — одразу наступний, неповний — 500 мс,
   після збою — `0,5 с × 2^(n−1)` зі стелею 15 с, половина паузи випадкова. Брокер
   падає для всіх relay одночасно, і без джитера вони поверталися б хором.
@@ -1542,8 +1573,9 @@ LOCKED пропускає заблоковані рядки замість че�
   отримує на INSERT, а видимим стає на COMMIT. Транзакція, що почалась раніше, а
   закомітилась пізніше, лишила б рядок позаду курсора, і його не винесли б
   ніколи. Прапорець на самому рядку такої дірки не має.
-- **Ціна:** транзакція з локом рядків відкрита на час мережевих викликів. Межа —
-  5 с таймауту confirm на повідомлення і зупинка на першій невдачі.
+- **Транзакції з локом під час мережевих викликів більше немає** — це був мінус
+  першої версії. Тепер ціна інша: три коміти на прохід і `UPDATE attempts` на
+  кожен рядок, плюс до 30 с затримки для рядка, чий relay помер.
 
 ### Чому не можна просто поміняти місцями publish і UPDATE published_at
 
@@ -1558,10 +1590,10 @@ LOCKED пропускає заблоковані рядки замість че�
 «зловив помилку, відкотив — усе чисто» не працює, і дедуплікація на споживачі
 потрібна незалежно від того, наскільки акуратний relay.
 
-Одне уточнення до формулювання. Усередині однієї транзакції `UPDATE` і publish
-можна переставити — нічого не зміниться, бо `published_at` стає фактом лише на
-COMMIT. Насправді порядок такий: **publish → COMMIT**. Небезпечна перестановка —
-закомітити позначку окремою транзакцією й публікувати після неї.
+У relay ці дві дії — окремі коміти (крок 3 після publish), тож «поміняти
+місцями» тут означає буквально закомітити `published_at` до publish. Оренда цього
+не рятує: вона лише каже іншим relay «рядок у роботі», а рядок із
+`published_at` уже не бере жоден.
 
 ### Споживач: два рівні ідемпотентності
 
@@ -1625,7 +1657,8 @@ ROLLBACK, але ніколи друге замовлення.
 Кожне демо самостійне: компілює `tsc`, накочує міграції (`migrations-applied`),
 чистить робочу чергу, виносить залишки outbox від попередніх прогонів
 (`backlog-flushed`), бере свій товар і покупця. Споживач і relay — справжні
-`dist/consumer.js` і `dist/relay.js` окремими процесами. Підсумок — рядки
+`dist/consumer.js` і `dist/relay.js` окремими процесами. Код checkout і relay
+однаковий із продом: точки збою живуть у тестових двійниках усередині демо. Підсумок — рядки
 `ключ=число`, порушений інваріант — `exit 1`.
 
 ```
@@ -1635,40 +1668,44 @@ replayed=1  same-order=1  status-first=201  status-second=201  idempotency-keys=
 
 $ npm run demo:crash-write
 write-failed=1  orders=0  outbox=0  published=0  deliveries=0  effect=0
-outbox-in-tx=1  idempotency-keys=0  relay-batches=0  stock-before=1000  stock-after=1000
+outbox-in-tx=1  idempotency-keys-in-tx=1  idempotency-keys=0  relay-batches=0
+stock-before=1000  stock-after=1000
 
 $ npm run demo:crash-relay
 published=1  deliveries=2  applied=1  effect=1  processed=1
 publishes=2  duplicates=1  duplicates-by-inbox=1  published-after-kill=0
-committed-by-killed-relay=0  attempts=1  points=25
+attempts-after-kill=1  committed-by-killed-relay=0  attempts=2  points=25
 ```
 
-(Рядки зведено по кілька в один, демо друкує кожен окремо. Прогін 08.10.2026,
-під `SKIP_VAULT=1`, як у грейдера: перше демо накотило міграцію `OutboxInbox` само.)
+(Рядки зведено по кілька в один, демо друкує кожен окремо. `demo:outbox` —
+прогін 08.10.2026 під `SKIP_VAULT=1`, як у грейдера: перше демо накотило
+міграцію `OutboxInbox` само. `demo:crash-write` і `demo:crash-relay` —
+13.10.2026, після ревʼю; `OutboxLease` так само накотило перше з них.)
 
 - **`demo:outbox`** — `AppModule` у процесі демо на ефемерному порту, з тим самим
   `configureApp`, що й `main.ts`. Два справжні `POST /v1/orders` з одним ключем і
   одним тілом — клієнт, що не дочекався відповіді й повторив. Обидва `201`, другий
   — replay того самого замовлення. Вбудований relay застосунку вимкнено, подію
   виносить relay-процес демо.
-- **`demo:crash-write`** — падає бізнес-запис. `checkout()` має точку
-  `beforeCommit`: останній крок транзакції, коли замовлення, outbox і ключ уже
-  вставлено. Демо кидає там виняток. Перед ним воно заглядає в outbox зсередини
-  транзакції — `outbox-in-tx=1` доводить, що рядок справді був вставлений, а не
-  просто не дійшов. Після ROLLBACK немає ні замовлення, ні рядка outbox, ні
-  ключа, stock повернувся. Relay і споживач увесь час працюють поруч, і демо
+- **`demo:crash-write`** — падає бізнес-запис. `checkout()` викликається
+  справжній, але з тестовим двійником `DataSource` (`crashingBeforeCommit` у
+  самому демо): справжня транзакція, у якій після всіх INSERT бізнес-операції і
+  до COMMIT кидається виняток. Перед ним двійник заглядає в таблиці зсередини
+  транзакції — `outbox-in-tx=1` і `idempotency-keys-in-tx=1` доводять, що рядки
+  справді були вставлені, а не просто не дійшли. Після ROLLBACK немає ні
+  замовлення, ні рядка outbox, ні ключа, stock повернувся. Relay і споживач увесь час працюють поруч, і демо
   чекає двох порожніх проходів relay після збою: подію, що пережила б ROLLBACK,
   relay виніс би на першому.
 - **`demo:crash-relay`** — падає службовий запис. Relay вбиває **справжній `kill -9`
-  дочірнього процесу** між publish і UPDATE, як крок 4 коду лекції. Вікно між
-  ними в проді — мілісекунди; демо розширює його до 10 с
-  (`RELAY_PAUSE_AFTER_PUBLISH_MS`), щоб влучити детерміновано, — той самий прийом,
-  що `CONSUMER_ACK_DELAY_MS` у `demo:duplicate`. Брокер на момент вбивства вже
-  підтвердив повідомлення, а Postgres, побачивши обрив зʼєднання, відкотив
-  транзакцію relay: лок знято, `published_at` NULL. Другий relay бере той самий
-  рядок і публікує вдруге. Споживач отримує дві доставки: перша нараховує бали,
-  друга впирається в `processed_messages`. `attempts=1` при двох публікаціях —
-  не помилка: `+1` першої спроби відкотився разом із її транзакцією.
+  дочірнього процесу** між publish і UPDATE, як крок 4 коду лекції. Перший relay
+  — `dist/demo-relay.js`: той самий цикл, але з двійником відправника, що після
+  confirm брокера тримає паузу 10 с. Без неї вікно між publish і позначкою —
+  мілісекунди, і влучити в нього можна лише навмання. Оренда в нього 2 с замість
+  30, щоб рядок повернувся за секунди. На момент вбивства брокер уже підтвердив
+  повідомлення, `attempts=1` закомічений, `published_at` NULL. Коли оренда
+  спливає, другий relay — робочий `dist/relay.js` — бере той самий рядок і
+  публікує вдруге: `attempts=2`. Споживач отримує дві доставки: перша нараховує
+  бали, друга впирається в `processed_messages`.
 
 Чи демо справді ловлять поломки, я перевірив двома мутаціями скомпільованого
 коду. Вставка в outbox окремим автокомітом (`manager.connection.query` замість
@@ -1706,7 +1743,9 @@ DELETE FROM outbox WHERE id IN (
   далі на порядки менше за `consumer_timeout`.
 - Дубль у `demo:duplicate` тепер ловить inbox, а не природний ключ.
 - `EventPublisher` отримав `send()`: relay шле рядок outbox як є — id, type,
-  payload — і тіло не розбирає. Контракт тримає продюсер, а не relay.
+  payload — і тіло не розбирає. Контракт тримає продюсер, а не relay. Relay
+  приймає не сам клас, а інтерфейс `MessageSender` — саме туди демо підставляє
+  двійника.
 
 ## Grading
 
@@ -1908,7 +1947,7 @@ grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist \
   "on[ _]*conflict|do[ _]+nothing|or[ _]*ignore|skip[ _]*duplicates|ignore[ _]*duplicates|23505|P2002" .
 ```
 
-Кожне демо триває ~5 с разом із `tsc`. Relay у `demo:crash-relay` вбивається
+Кожне демо триває 5–6 с разом із `tsc`; у `demo:crash-relay` з них 2 с — оренда вбитого relay. Relay у `demo:crash-relay` вбивається
 справжнім `kill -9` (розділ 13). Топологію споживач ставить через management API
 на `15672`, як у #19, — якщо порт перемаплено, перед демо потрібен
 `BROKER_MANAGEMENT_URL`. Демо відмовляються стартувати, якщо
@@ -2000,6 +2039,8 @@ grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist \
 | 2026-10-08 | `Idempotency-Key` у Postgres, останнім оператором транзакції замовлення; `Map` лише для `409` | Ключ у памʼяті не переживав рестарту й не бачив інших інстансів. Останнім — бо там відомий `order_id`; ціна — зайвий ROLLBACK паралельного дубля |
 | 2026-10-08 | demo:crash-relay — справжній `kill -9` relay; demo:crash-write — виняток у `beforeCommit` | Для relay важливо, що базу кидає мертвий процес, а не коректний ROLLBACK. Для бізнес-запису обидва дають ROLLBACK, а виняток дозволяє показати `outbox-in-tx=1` |
 | 2026-10-08 | Демо #22 самі компілюють і накочують міграції; демо, що ходять через relay, спершу виносять залишки outbox | Грейдер запускає демо одразу після `npm ci`. Залишки від demo:race (#14) чи обірваного прогону relay виносив би разом із подіями демо, і числа стали б чужими |
+| 2026-10-13 | ~~Publish → UPDATE `published_at` в одній транзакції з локом рядків~~ → оренда `locked_until`, `attempts + 1` комітиться до кожного publish | Ревʼю: при двох публікаціях `attempts=1` — `+1` спроби, убитої разом із процесом, відкочувався, і алерт її не бачив. Закомітити лічильник, тримаючи лок, не можна: UPDATE того самого рядка чекав би на власний лок. Заразом зникла транзакція з локом на час мережевих викликів |
+| 2026-10-13 | ~~Точка збою `beforeCommit` у checkout і пауза `RELAY_PAUSE_AFTER_PUBLISH_MS` у relay~~ → тестові двійники в демо: `DataSource`, що кидає перед COMMIT, і відправник, що тримає паузу після confirm | Ревʼю: хук жив у проді лише заради демо. Тепер checkout і relay однакові з продом, а двійники підставляються через ті самі залежності — `DataSource` і `MessageSender` |
 
 ## Запуск
 

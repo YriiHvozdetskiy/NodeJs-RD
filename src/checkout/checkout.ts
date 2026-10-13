@@ -98,12 +98,6 @@ export interface CheckoutResult {
 export interface CheckoutOptions {
   /** `Idempotency-Key` з API-краю і sha256 тіла запиту — пишуться в транзакції замовлення. */
   idempotency?: { key: string; fingerprint: string };
-  /**
-   * Останній крок перед COMMIT, коли замовлення, outbox і ключ уже вставлено.
-   * Кинутий звідси виняток відкочує все. Точка, у яку demo:crash-write кладе
-   * збій бізнес-запису.
-   */
-  beforeCommit?: (manager: EntityManager, placed: CheckoutResult) => Promise<void>;
 }
 
 /**
@@ -391,6 +385,5 @@ async function placeOrder(
     if (!claimed) throw new IdempotencyKeyTaken(options.idempotency.key);
   }
 
-  await options.beforeCommit?.(manager, placed);
   return placed;
 }

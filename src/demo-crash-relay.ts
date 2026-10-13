@@ -22,25 +22,27 @@ import { orderPlacedEventId } from './messaging/order-placed.event';
  * ⭐ demo:crash-relay — падає СЛУЖБОВИЙ запис. Relay помирає рівно між publish
  * і UPDATE published_at — справжнім kill -9 дочірнього процесу:
  *
- *   relay №1   SELECT … FOR UPDATE SKIP LOCKED → publish → брокер підтвердив
- *              → [вікно] → UPDATE published_at → COMMIT
- *                   ▲
- *                SIGKILL
- *   Postgres   зʼєднання relay обірвалось → ROLLBACK: лок знято, published_at
- *              лишився NULL — для бази цієї публікації не було
- *   relay №2   бере той самий рядок → publish ВДРУГЕ → UPDATE → COMMIT
+ *   relay №1   оренда (SKIP LOCKED) → attempts+1 → COMMIT → publish → брокер
+ *              підтвердив → [вікно] → UPDATE published_at
+ *                               ▲
+ *                            SIGKILL
+ *   Postgres   оренда й attempts=1 закомічені, published_at лишився NULL — для
+ *              бази публікації не було, а спроба була
+ *   relay №2   оренда спливла → бере той самий рядок → attempts=2 → publish
+ *              ВДРУГЕ → UPDATE published_at
  *   споживач   доставка 1 → бали нараховано, позначка в processed_messages
  *              доставка 2 → processed_messages: конфлікт → дубль, ефекту немає
  *
  * Доставок дві, ефект один. Це не баг relay, а його контракт: at-least-once.
  * Exactly-once РЕЗУЛЬТАТ дає не брокер і не relay, а ідемпотентний споживач.
+ * А `attempts=2` — що спробу вбитого relay видно в лічильнику, і алерт на
+ * рядок, який relay раз у раз не доносить, її побачить.
  *
- * Вікно між publish і UPDATE у проді — мілісекунди, але воно є завжди. Демо
- * розширює його до 10 с (RELAY_PAUSE_AFTER_PUBLISH_MS), щоб влучити
- * детерміновано, — той самий прийом, що CONSUMER_ACK_DELAY_MS у demo:duplicate.
+ * Relay №1 — dist/demo-relay.js: той самий цикл, але з двійником відправника,
+ * що після confirm тримає паузу. Без неї вікно між publish і позначкою —
+ * мілісекунди, і влучити в нього SIGKILL-ом можна лише навмання. Relay №2 —
+ * робочий dist/relay.js.
  */
-const PUBLISH_WINDOW_MS = 10_000;
-
 async function main(): Promise<void> {
   const dataSource = await new DataSource(dataSourceOptions).initialize();
   const broker = await openBroker();
@@ -61,7 +63,7 @@ async function main(): Promise<void> {
     const order = await checkout(dataSource, { buyerId, lines: [{ productId, qty: 1 }] });
     const eventId = orderPlacedEventId(order.orderId);
 
-    const first = new RelayProcess({ RELAY_PAUSE_AFTER_PUBLISH_MS: String(PUBLISH_WINDOW_MS) });
+    const first = new RelayProcess('demo-relay.js');
     workers.push(first);
     await first.ready();
     await first
@@ -75,8 +77,8 @@ async function main(): Promise<void> {
 
     const afterKill = await outboxOf(dataSource, [order.orderId]);
 
-    // Лок рядка знімає ROLLBACK, коли Postgres помітить обрив зʼєднання.
-    // Доти SKIP LOCKED пропускає рядок, тож relay №2 просто опитує, поки не візьме.
+    // Рядок в оренді вбитого relay, доки та не спливе (2 с у demo-relay).
+    // Relay №2 просто опитує, поки не візьме.
     const second = new RelayProcess();
     workers.push(second);
     await second.ready();
@@ -91,7 +93,7 @@ async function main(): Promise<void> {
     const deliveries = consumer.deliveriesOf(eventId);
     const applied = consumer.of('applied').filter((r) => r.eventId === eventId).length;
     const duplicates = consumer.of('duplicate').filter((r) => r.eventId === eventId);
-    const publishes = first.publishesOf(eventId) + second.publishesOf(eventId);
+    const publishes = first.publishesOf(eventId) + second.committedOf(eventId);
 
     summary.line('published', outbox.published);
     summary.line('deliveries', deliveries);
@@ -102,6 +104,7 @@ async function main(): Promise<void> {
     summary.line('duplicates', duplicates.length);
     summary.line('duplicates-by-inbox', duplicates.filter((d) => d.by === 'inbox').length);
     summary.line('published-after-kill', afterKill.published);
+    summary.line('attempts-after-kill', afterKill.attempts);
     summary.line('committed-by-killed-relay', first.count('committed'));
     summary.line('attempts', outbox.attempts);
     summary.line('points', points);
@@ -115,6 +118,8 @@ async function main(): Promise<void> {
     summary.expect('processed=1 — одна позначка inbox на подію', processed === 1);
     summary.expect('published=1 — після рестарту relay рядок винесено', outbox.published === 1);
     summary.expect('повтор розпізнано як дубль', duplicates.length >= 1);
+    summary.expect('attempts-after-kill=1 — спроба вбитого relay пережила його', afterKill.attempts === 1);
+    summary.expect('attempts = publishes — кожна спроба в лічильнику', outbox.attempts === publishes);
     summary.expect(`points=${DEMO_POINTS_PER_UNIT} — сума не подвоїлась`, points === DEMO_POINTS_PER_UNIT);
   } finally {
     for (const worker of workers) await worker.stop();

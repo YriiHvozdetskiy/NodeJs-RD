@@ -8,7 +8,7 @@ import type { ConsumerReport } from '../consumer';
 import { requiredEnv } from '../db/cli-env';
 import { CENTS_PER_POINT } from '../loyalty/points-accrual';
 import { relayBatch } from '../outbox/relay';
-import type { RelayReport } from '../relay';
+import type { RelayReport } from '../outbox/relay-process';
 import { ORDER_AGGREGATE } from './order-placed.event';
 import { EventPublisher } from './publisher';
 import { assertLoyaltyTopology, LOYALTY_DLQ, LOYALTY_QUEUE } from './topology';
@@ -108,15 +108,23 @@ export class ConsumerProcess extends WorkerProcess<ConsumerReport> {
   }
 }
 
-/** Relay outbox (dist/relay.js). */
+/**
+ * Relay outbox: `relay.js` — робочий, як `npm run relay`; `demo-relay.js` — той
+ * самий цикл із двійником відправника, що стоїть між publish і позначкою.
+ */
 export class RelayProcess extends WorkerProcess<RelayReport> {
-  constructor(env: Record<string, string> = {}) {
-    super('relay', 'relay.js', env);
+  constructor(script: 'relay.js' | 'demo-relay.js' = 'relay.js', env: Record<string, string> = {}) {
+    super(script === 'relay.js' ? 'relay' : 'demo-relay', script, env);
   }
 
-  /** Скільки разів брокер підтвердив цю подію саме від цього relay. */
+  /** Скільки разів брокер підтвердив цю подію до позначки. Звітує лише demo-relay. */
   publishesOf(id: string): number {
-    return this.of('published').filter((r) => r.ids.includes(id)).length;
+    return this.of('published').filter((r) => r.id === id).length;
+  }
+
+  /** Скільки разів цей relay закомітив published_at для цієї події. */
+  committedOf(id: string): number {
+    return this.of('committed').filter((r) => r.ids.includes(id)).length;
   }
 }
 

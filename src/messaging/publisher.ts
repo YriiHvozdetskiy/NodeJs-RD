@@ -20,6 +20,12 @@ export interface OutgoingMessage {
   body: unknown;
 }
 
+/** Те, що потрібно relay від брокера. EventPublisher — справжній; демо підставляє двійника. */
+export interface MessageSender {
+  send(message: OutgoingMessage): Promise<void>;
+  close(): Promise<void>;
+}
+
 /** Брокер прийняв повідомлення, але жоден binding його не забрав. */
 export class UnroutableError extends Error {
   override readonly name = 'UnroutableError';
@@ -47,7 +53,7 @@ const CONFIRM_TIMEOUT_MS = 5_000;
  *
  * Топологію клас не оголошує і черг не знає — лише exchange і routing key.
  */
-export class EventPublisher {
+export class EventPublisher implements MessageSender {
   private channel?: Promise<ConfirmChannel>;
   private connection?: ChannelModel;
   /** messageId повідомлень, що повернулись через basic.return, — до їхнього confirm. */
