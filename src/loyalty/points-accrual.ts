@@ -1,3 +1,4 @@
+import type { Pool } from 'pg';
 import type { Queryable } from '../db/queryable';
 
 /**
@@ -15,8 +16,12 @@ export const MATURITY_DAYS = 14;
 export type AccrualOutcome =
   /** Рядок `earned` вставлено саме цим викликом. */
   | { kind: 'applied'; points: number }
-  /** Нарахування за це замовлення вже є: повторна доставка тієї самої події. */
-  | { kind: 'duplicate' }
+  /**
+   * Повтор, ефект не застосовано. `inbox` — подію цей споживач уже обробив
+   * (рівень 2); `natural-key` — inbox її не памʼятає, але нарахування за це
+   * замовлення вже є (рівень 1).
+   */
+  | { kind: 'duplicate'; by: 'inbox' | 'natural-key' }
   /** Позицій без акції менше ніж на 100 грн — нараховувати нічого. */
   | { kind: 'not-eligible' };
 
@@ -71,5 +76,61 @@ export async function accruePoints(db: Queryable, orderId: string): Promise<Accr
   if (!row?.found) throw new Error(`замовлення ${orderId} не знайдено`);
   if (row.points !== null) return { kind: 'applied', points: row.points };
   if (Number(row.base_cents) < CENTS_PER_POINT) return { kind: 'not-eligible' };
-  return { kind: 'duplicate' };
+  return { kind: 'duplicate', by: 'natural-key' };
+}
+
+/**
+ * Ефект споживача з обома рівнями ідемпотентності (#22), в ОДНІЙ транзакції:
+ *
+ *   BEGIN
+ *     INSERT INTO processed_messages … ON CONFLICT DO NOTHING   ← рівень 2, inbox
+ *     0 рядків → цю подію вже оброблено: ROLLBACK, ефекту немає
+ *     INSERT INTO points_entries … ON CONFLICT DO NOTHING       ← рівень 1, природний ключ
+ *   COMMIT
+ *
+ * Позначка й ефект комітяться разом або жоден. Окремими транзакціями це був би
+ * dual write, перенесений на споживача: упав між ними — або позначка без балів
+ * (бали втрачено назавжди), або бали без позначки (повтор спробує ще раз).
+ *
+ * Рівень 2 для балів не обовʼязковий — природний ключ сам тримає «одне
+ * нарахування на замовлення» (#19). Inbox тут для ефектів, у яких природного
+ * ключа немає (лист, пуш: одному замовленню законно шлють кілька), і щоб
+ * дедуплікація споживача була однакова для всіх подій. Природний ключ під ним
+ * лишається страховкою: позначки старіють і видаляються, факти — ні.
+ *
+ * Конкурентна доставка тієї самої події на два інстанси: другий INSERT у
+ * processed_messages чекає на COMMIT першого й отримує конфлікт.
+ *
+ * Транзакція на одному клієнті з пулу — pool.connect(), а не pool.query('BEGIN'):
+ * кожен pool.query бере довільне зʼєднання, і BEGIN із COMMIT опинились би в
+ * різних сесіях.
+ */
+export async function accruePointsOnce(
+  pool: Pool,
+  message: { eventId: string; orderId: string; consumer: string },
+): Promise<AccrualOutcome> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const inbox = await client.query(
+      `INSERT INTO processed_messages (message_id, consumer) VALUES ($1, $2)
+       ON CONFLICT DO NOTHING
+       RETURNING message_id`,
+      [message.eventId, message.consumer],
+    );
+    if (inbox.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { kind: 'duplicate', by: 'inbox' };
+    }
+    // Будь-який збій нижче (замовлення не знайдено, база впала) відкочує й
+    // позначку: повторна доставка спробує знову, а не мовчки пропустить подію.
+    const outcome = await accruePoints(client, message.orderId);
+    await client.query('COMMIT');
+    return outcome;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
 }

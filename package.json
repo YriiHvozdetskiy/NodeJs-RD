@@ -2,7 +2,7 @@
   "name": "marketplace-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder.",
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder. ДЗ#22: transactional outbox + relay на SKIP LOCKED, ідемпотентний споживач (природний ключ + inbox), Idempotency-Key у транзакції замовлення.",
   "engines": {
     "node": ">=20"
   },
@@ -33,9 +33,13 @@
     "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js",
     "demo:realtime": "node scripts/realtime-demo.mjs",
     "consumer": "bash scripts/with-secrets.sh dev node dist/consumer.js",
+    "relay": "bash scripts/with-secrets.sh dev node dist/relay.js",
     "demo:publish": "bash scripts/with-secrets.sh dev node dist/demo-publish.js",
     "demo:dlq": "bash scripts/with-secrets.sh dev node dist/demo-dlq.js",
     "demo:duplicate": "bash scripts/with-secrets.sh dev node dist/demo-duplicate.js",
+    "demo:outbox": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-outbox.js",
+    "demo:crash-write": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-crash-write.js",
+    "demo:crash-relay": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-crash-relay.js",
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
     "drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",
     "test:integration": "npm run build:test && jest dist-test/test/integration",

@@ -42,7 +42,15 @@ export type OrderPlacedEvent = z.infer<typeof orderPlacedSchema>;
 
 export type OrderPlacedFacts = Pick<CheckoutResult, 'orderId' | 'buyerId' | 'currency' | 'totalCents' | 'placedAt' | 'lines'>;
 
-export function orderPlacedEvent(order: OrderPlacedFacts): OrderPlacedEvent {
+/** `aggregate_type` рядка outbox (#22): подія про замовлення. У Debezium це став би топік. */
+export const ORDER_AGGREGATE = 'order';
+
+/**
+ * Явна функція «замовлення → контракт», а не `{ ...order }`: кожне поле події
+ * назване тут, і перейменування колонки чи поля CheckoutResult ламає
+ * компіляцію цього файла, а не споживачів у проді.
+ */
+export function toOrderPlacedEvent(order: OrderPlacedFacts): OrderPlacedEvent {
   return {
     eventId: orderPlacedEventId(order.orderId),
     type: ORDER_PLACED,

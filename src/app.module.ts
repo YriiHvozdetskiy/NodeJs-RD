@@ -10,9 +10,9 @@ import { OrdersService } from './orders/orders.service';
 import { OrdersController } from './orders/orders.controller';
 import { OrdersGateway } from './orders/orders.gateway';
 import { OrderEventsService } from './orders/order-events.service';
-import { OrderPlacedPublisher } from './orders/order-placed.publisher';
 import { IdempotencyService } from './orders/idempotency.service';
 import { UsersRepository } from './users/users.repository';
+import { OutboxRelayService } from './outbox/outbox-relay.service';
 
 /**
  * Один модуль на весь сервіс. Розрізати на CatalogModule / OrdersModule варто
@@ -52,7 +52,7 @@ import { UsersRepository } from './users/users.repository';
     IdempotencyService,
     OrderEventsService,
     OrdersGateway,
-    OrderPlacedPublisher,
+    OutboxRelayService,
   ],
 })
 export class AppModule {}

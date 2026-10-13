@@ -1,12 +1,11 @@
 import { Injectable } from '@nestjs/common';
-import { checkout, CheckoutError, type CheckoutResult } from '../checkout/checkout';
+import { checkout, CheckoutError, type CheckoutOptions, type CheckoutResult } from '../checkout/checkout';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 import { OrmService } from '../db/orm.service';
 import type { OrderStatus } from '../entities/order.entity';
 import { UsersRepository } from '../users/users.repository';
 import { OrderEventsService } from './order-events.service';
-import { OrderPlacedPublisher } from './order-placed.publisher';
 import { OrdersRepository, type Order } from './orders.repository';
 
 export interface CreateOrderItem {
@@ -47,7 +46,6 @@ export class OrdersService {
     private readonly users: UsersRepository,
     private readonly orm: OrmService,
     private readonly events: OrderEventsService,
-    private readonly placed: OrderPlacedPublisher,
   ) {}
 
   page(limit: number, cursor?: string): Promise<Page<Order>> {
@@ -68,25 +66,27 @@ export class OrdersService {
    * вже після COMMIT, тим самим репозиторієм, що й GET: форма створеного
    * замовлення не може розійтися з формою прочитаного.
    *
-   * order.placed (#19) — теж після COMMIT: подія про замовлення, яке
-   * відкотилось, пообіцяла б споживачам те, чого немає в базі. Зворотна
-   * щілина — COMMIT є, події немає — описана в OrderPlacedPublisher.
+   * order.placed (#22) — рядок outbox у ТІЙ САМІЙ транзакції, а не publish
+   * після COMMIT, як було на #19. Там між COMMIT і publish лишалась щілина:
+   * процес падав — замовлення без події. Тепер подія комітиться разом із
+   * замовленням, а в брокер її везе relay (src/outbox/). Ключ ідемпотентності
+   * — теж у цій транзакції; `IdempotencyKeyTaken` звідси летить у контролер.
    */
-  async create(items: CreateOrderItem[]): Promise<Order> {
+  async create(items: CreateOrderItem[], idempotency?: CheckoutOptions['idempotency']): Promise<Order> {
     const dataSource = await this.orm.get();
     const buyerId = await this.guestBuyer();
 
     let placed: CheckoutResult;
     try {
-      placed = await checkout(dataSource, {
-        buyerId,
-        lines: items.map((item) => ({ productId: String(item.product_id), qty: item.qty })),
-      });
+      placed = await checkout(
+        dataSource,
+        { buyerId, lines: items.map((item) => ({ productId: String(item.product_id), qty: item.qty })) },
+        { idempotency },
+      );
     } catch (err) {
       if (err instanceof CheckoutError) throw toProblem(err);
       throw err;
     }
-    await this.placed.announce(placed);
 
     const order = await this.orders.findById(Number(placed.orderId));
     if (!order) throw new Error(`замовлення ${placed.orderId} закомічене, але не читається`);

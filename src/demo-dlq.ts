@@ -1,5 +1,5 @@
 import { ConsumerProcess, depth, openBroker, resetQueues, Summary, waitFor } from './messaging/demo-kit';
-import { orderPlacedEvent } from './messaging/order-placed.event';
+import { toOrderPlacedEvent } from './messaging/order-placed.event';
 import { EventPublisher } from './messaging/publisher';
 import { DELIVERY_LIMIT, EVENTS_EXCHANGE, LOYALTY_DLQ, LOYALTY_QUEUE, ORDER_PLACED } from './messaging/topology';
 
@@ -55,7 +55,7 @@ async function main(): Promise<void> {
     } else {
       console.log(`── demo:dlq: подія про неіснуюче замовлення → reject(requeue=true) з паузою × (delivery-limit ${DELIVERY_LIMIT} + 1) → DLX ──`);
       await publisher.publish(
-        orderPlacedEvent({
+        toOrderPlacedEvent({
           orderId: MISSING_ORDER,
           buyerId: MISSING_ORDER,
           currency: 'UAH',
