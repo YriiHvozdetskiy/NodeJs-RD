@@ -57,6 +57,10 @@ export async function startPostgres(): Promise<TestPostgres> {
         // застосунку в тестах справжній RabbitMQ, і кожне POST /orders лишало б
         // order.placed у черзі дев-споживача.
         BROKER_URL: '',
+        // Те саме з Redis (#23): інакше e2e ходили б у дев-Redis, і
+        // POST /orders із 127.0.0.1 ловив би 429 від спільного з дев-сервером ліміту.
+        REDIS_CACHE_URL: '',
+        REDIS_QUEUE_URL: '',
       };
     },
 
