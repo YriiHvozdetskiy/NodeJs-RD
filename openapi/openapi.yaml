@@ -36,6 +36,10 @@ tags:
     description: Каталог товарів — тільки читання в v1
   - name: orders
     description: Замовлення покупця
+  - name: sessions
+    description: |
+      Гостьова сесія в cookie `sid`. Стан живе в Redis, і кожен запит із
+      cookie продовжує його на `idle_timeout_seconds`. Логін додасться на #24.
 
 paths:
   /products:
@@ -64,7 +68,11 @@ paths:
     get:
       operationId: getProduct
       tags: [products]
-      summary: Один товар за ідентифікатором
+      summary: Картка товару
+      description: |
+        Товар плюс залишок, рейтинг і скільки штук замовили. Віддається з кешу:
+        дані можуть відставати до 6 хвилин, а залишок — до наступного
+        замовлення цього товару. Справжній залишок перевіряє `POST /orders`.
       parameters:
         - $ref: '#/components/parameters/ProductId'
       responses:
@@ -73,7 +81,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Product'
+                $ref: '#/components/schemas/ProductCard'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -178,6 +186,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Unexpected'
 
@@ -238,6 +248,73 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /sessions:
+    post:
+      operationId: createSession
+      tags: [sessions]
+      summary: Відкрити гостьову сесію
+      description: |
+        Створює сесію з новим ідентифікатором і віддає його в cookie `sid`.
+        Попередня сесію цього браузера, якщо вона була, видаляється.
+      responses:
+        '201':
+          description: Сесію створено
+          headers:
+            Set-Cookie:
+              description: '`sid=…; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200`'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /sessions/current:
+    get:
+      operationId: getCurrentSession
+      tags: [sessions]
+      summary: Поточна сесія
+      description: |
+        Сам запит уже продовжив сесію: `expires_at` у відповіді — нова межа.
+      responses:
+        '200':
+          description: Сесія жива
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+    delete:
+      operationId: deleteCurrentSession
+      tags: [sessions]
+      summary: Закрити сесію
+      description: |
+        Видаляє сесію в Redis — з наступного запиту вона недійсна на всіх
+        інстансах. Ідемпотентно: без сесії відповідь та сама.
+      responses:
+        '204':
+          description: Сесію закрито
+          headers:
+            Set-Cookie:
+              description: '`sid=; Max-Age=0` — браузер видаляє cookie'
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
         default:
           $ref: '#/components/responses/Unexpected'
 
@@ -313,6 +390,9 @@ components:
             - https://api.marketplace.example/problems/unprocessable-entity
             - https://api.marketplace.example/problems/idempotency-key-reused
             - https://api.marketplace.example/problems/unknown-product
+            - https://api.marketplace.example/problems/unauthenticated
+            - https://api.marketplace.example/problems/rate-limited
+            - https://api.marketplace.example/problems/service-unavailable
             - https://api.marketplace.example/problems/internal
           example: https://api.marketplace.example/problems/not-found
         title:
@@ -375,6 +455,73 @@ components:
           type: string
           format: date-time
           example: '2026-08-20T09:12:00.000Z'
+
+    ProductCard:
+      type: object
+      description: |
+        Товар у картці — поля `Product` плюс залишок, рейтинг і попит.
+      required: [id, title, price_cents, currency, created_at, stock, rating_avg, rating_count, units_ordered]
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          example: 25
+        title:
+          type: string
+          example: Клавіатура Keychron K2
+        price_cents:
+          type: integer
+          example: 260000
+        currency:
+          type: string
+          enum: [UAH]
+          example: UAH
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-20T09:12:00.000Z'
+        stock:
+          type: integer
+          minimum: 0
+          description: Залишок на момент кешування; може відставати.
+          example: 14
+        rating_avg:
+          type: number
+          nullable: true
+          minimum: 1
+          maximum: 5
+          description: Середня оцінка; `null`, поки оцінок немає.
+          example: 4.35
+        rating_count:
+          type: integer
+          minimum: 0
+          example: 87
+        units_ordered:
+          type: integer
+          minimum: 0
+          description: Скільки штук замовили за весь час, зі скасованими включно.
+          example: 312
+
+    Session:
+      type: object
+      required: [created_at, expires_at, idle_timeout_seconds]
+      additionalProperties: false
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-10-15T09:12:00.000Z'
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Коли сесія протухне без нових запитів. Кожен запит із cookie
+            відсуває цю межу на `idle_timeout_seconds`, але не далі за 12 годин
+            від `created_at`.
+          example: '2026-10-15T09:42:00.000Z'
+        idle_timeout_seconds:
+          type: integer
+          example: 1800
 
     ProductPage:
       type: object
@@ -546,6 +693,36 @@ components:
         `Idempotency-Key` уже використано з ІНШИМ тілом (віддати попередню
         відповідь було б брехнею), або в позиціях є `product_id`, якого немає
         в каталозі. Клієнт розрізняє їх по полю `type`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Unauthenticated:
+      description: Сесії немає, її закрито або вона протухла.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    TooManyRequests:
+      description: |
+        Ліміт запитів вичерпано: не більше 10 замовлень за будь-які 60 секунд з
+        однієї адреси (ковзне вікно, спільне для всіх інстансів API).
+      headers:
+        Retry-After:
+          description: Через скільки секунд у вікні звільниться місце.
+          schema:
+            type: integer
+            minimum: 1
+            example: 42
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    ServiceUnavailable:
+      description: Сховище, без якого операція неможлива, не налаштоване або недоступне.
       content:
         application/problem+json:
           schema:

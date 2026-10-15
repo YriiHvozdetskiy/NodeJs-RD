@@ -20,19 +20,40 @@ const PROBLEM_BASE = 'https://api.marketplace.example/problems';
 // Назва КЛАСУ проблеми — однакова для всіх випадків цього статусу.
 const TITLES: Record<number, string> = {
   400: 'Некоректний запит',
+  401: 'Потрібна сесія',
   404: 'Ресурс не знайдено',
   409: 'Конфлікт зі станом ресурсу',
   422: 'Запит неможливо опрацювати',
+  429: 'Забагато запитів',
   500: 'Внутрішня помилка сервера',
+  503: 'Сервіс тимчасово недоступний',
 };
 
 const SLUGS: Record<number, ProblemCode> = {
   400: 'bad-request',
+  401: 'unauthenticated',
   404: 'not-found',
   409: 'conflict',
   422: 'unprocessable-entity',
+  429: 'rate-limited',
   500: 'internal',
+  503: 'service-unavailable',
 };
+
+/**
+ * Тіло problem+json. Окремою функцією, бо 429 від rate-limit
+ * (src/rate-limit/orders-rate-limit.ts) віддається middleware ДО роутера Nest
+ * і в цей фільтр не потрапляє, а форма мусить бути та сама.
+ */
+export function problemBody(status: number, code: ProblemCode, detail: string, instance: string): Record<string, unknown> {
+  return {
+    type: `${PROBLEM_BASE}/${code}`,
+    title: TITLES[status] ?? 'Помилка',
+    status,
+    detail,
+    instance,
+  };
+}
 
 /** Те, що EOV кладе в `err.errors`. */
 type ValidatorError = { path?: string; message?: string };
@@ -47,16 +68,10 @@ export class ProblemFilter implements ExceptionFilter {
     const status = this.statusOf(exception);
     const errors = this.validatorErrorsOf(exception, status);
 
-    const body: Record<string, unknown> = {
-      type: `${PROBLEM_BASE}/${this.codeOf(exception, status, errors.length > 0)}`,
-      title: TITLES[status] ?? 'Помилка',
-      status,
-      // Текст віддаємо як є, включно з 500: саме `detail` показує дрейф коду
-      // відносно спеки, і приховати його означало б осліпнути. У продакшені це
-      // ховають за NODE_ENV.
-      detail: this.detailOf(exception),
-      instance: req.originalUrl,
-    };
+    // Текст віддаємо як є, включно з 500: саме `detail` показує дрейф коду
+    // відносно спеки, і приховати його означало б осліпнути. У продакшені це
+    // ховають за NODE_ENV.
+    const body = problemBody(status, this.codeOf(exception, status, errors.length > 0), this.detailOf(exception), req.originalUrl);
 
     // Підполя названі як у прикладі RFC 9457 §3 — pointer + detail.
     // Валідатор називає їх path + message, трансляція живе рівно тут.

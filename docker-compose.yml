@@ -1,6 +1,6 @@
 # Локальна інфраструктура курсового проєкту: Postgres, PgBouncer перед ним,
-# Pact Broker для контрактних тестів, RabbitMQ для подій домену і (лише для
-# restore-drill) чистий Postgres для відновлення. Застосунок на цьому етапі зручніше тримати на хості
+# Pact Broker для контрактних тестів, RabbitMQ для подій домену, два Redis
+# (кеш і черга) і (лише для restore-drill) чистий Postgres для відновлення. Застосунок на цьому етапі зручніше тримати на хості
 # (`npm run start`), бо ротація перевіряється через uptime процесу, а не
 # контейнера.
 name: marketplace
@@ -137,6 +137,81 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Redis під КЕШ (#23). Тут лежить лише копія того, що є в Postgres, тож
+  # втратити будь-який ключ можна будь-коли:
+  #   • maxmemory + allkeys-lru — на межі памʼяті Redis витісняє найдавніше
+  #     прочитане, а не відмовляє в записі. Стоковий конфіг (maxmemory 0,
+  #     noeviction) на межі кидав би `OOM command not allowed` на кожен SET;
+  #   • --save '' і без AOF — рестарт дає холодний кеш, і це нормально: диск
+  #     під копію даних, які все одно протухнуть, — зайва робота.
+  # Пароль — той самий прийом, що з PG_ADMIN_PASSWORD: свіжий клон і грейдер
+  # отримують дев-креденшел, робоча машина — secrets/redis_password (db-up.sh).
+  redis-cache:
+    image: redis:8.10.2-alpine
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:-marketplace-dev}
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ''
+      - --appendonly
+      - 'no'
+    environment:
+      # redis-cli бере пароль звідси сам — healthcheck не світить його в аргументах.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-marketplace-dev}
+    ports:
+      - '127.0.0.1:6379:6379'
+    # grep PONG, а не код виходу: на помилку автентифікації redis-cli друкує
+    # NOAUTH і все одно виходить з 0.
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  # Redis під ЧЕРГУ BullMQ (#23) — і під усе, що не можна губити мовчки:
+  # сесії й вікна rate-limit. Протилежні до кешу налаштування, тому окремий
+  # процес: maxmemory-policy одна на інстанс, і SELECT 1 її не розводить.
+  #   • noeviction — документація BullMQ: черга «cannot work properly if Redis
+  #     evicts keys arbitrarily». На межі памʼяті запис падає з OOM, і це
+  #     видно, а витіснена задача просто зникла б;
+  #   • maxmemory усе одно задана: без неї noeviction означає «рости, доки
+  #     хост не почне свопити»;
+  #   • AOF everysec — рекомендація BullMQ: після падіння губиться щонайбільше
+  #     секунда записів, а не все з останнього RDB-знімка.
+  redis-queue:
+    image: redis:8.10.2-alpine
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:-marketplace-dev}
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-marketplace-dev}
+    ports:
+      - '127.0.0.1:6380:6379'
+    volumes:
+      # AOF без тому жив би в шарі контейнера й зникав би разом із ним.
+      - redisqueuedata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
   # Чистий Postgres для restore-drill. Без профілю `drill` не стартує:
   # scripts/restore-drill.sh піднімає його сам і сам прибирає разом із томом.
   # Том даних навмисно анонімний: `rm -v` зносить його разом із контейнером,
@@ -166,4 +241,5 @@ services:
 volumes:
   pgdata:
   rabbitdata:
+  redisqueuedata:
 

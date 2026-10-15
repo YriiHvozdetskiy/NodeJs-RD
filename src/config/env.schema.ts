@@ -70,6 +70,26 @@ export const envSchema = z.object({
   BROKER_PASSWORD_FILE: z.string().min(1).default('./secrets/rabbitmq_password'),
 
   /**
+   * Redis під кеш (#23) — БЕЗ пароля, як DB_URL: `redis://default@host:port`.
+   * Інстанс із maxmemory + allkeys-lru: там лише копія даних із Postgres.
+   *
+   * Опціональна з тієї ж причини, що BROKER_URL: без неї GET товару просто
+   * щоразу йде в базу. Порожній рядок дорівнює відсутності — так тести
+   * вимикають Redis поверх локального .env.
+   */
+  REDIS_CACHE_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
+
+  /**
+   * Redis під чергу BullMQ, сесії й вікна rate-limit (#23) — БЕЗ пароля.
+   * Інстанс із noeviction + AOF: тут лежить те, що не можна губити мовчки.
+   * Без нього немає сесій (503) і ліміту на POST /v1/orders.
+   */
+  REDIS_QUEUE_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
+
+  /** Файл із паролем обох Redis. Відносний — від кореня репозиторію. */
+  REDIS_PASSWORD_FILE: z.string().min(1).default('./secrets/redis_password'),
+
+  /**
    * З яких origin браузер може ходити в API, слухати SSE і підключати socket.io:
    * `http://localhost:5173,https://shop.example`. Порожньо — лише той самий
    * origin. Кожен елемент — саме origin (схема + хост + порт), без шляху й

@@ -1,11 +1,15 @@
 import { Controller, DefaultValuePipe, Get, Param, ParseIntPipe, Query } from '@nestjs/common';
-import { ProductsRepository, type Product } from './products.repository';
+import { ProductsRepository, type Product, type ProductCard } from './products.repository';
+import { ProductCardsService } from './product-cards.service';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 
 @Controller('products')
 export class ProductsController {
-  constructor(private readonly products: ProductsRepository) {}
+  constructor(
+    private readonly products: ProductsRepository,
+    private readonly cards: ProductCardsService,
+  ) {}
 
   /**
    * Ні `limit`, ні `cursor` тут не перевіряються: діапазон `1..100` і типи вже
@@ -20,10 +24,11 @@ export class ProductsController {
     return this.products.page(limit, cursor);
   }
 
+  /** Картка — через кеш (#23): найгарячіше й найдорожче читання каталогу. */
   @Get(':productId')
-  async one(@Param('productId', ParseIntPipe) productId: number): Promise<Product> {
-    const product = await this.products.findById(productId);
-    if (!product) throw new HttpProblem(404, `товару ${productId} не існує`, 'not-found');
-    return product;
+  async one(@Param('productId', ParseIntPipe) productId: number): Promise<ProductCard> {
+    const card = await this.cards.get(productId);
+    if (!card) throw new HttpProblem(404, `товару ${productId} не існує`, 'not-found');
+    return card;
   }
 }

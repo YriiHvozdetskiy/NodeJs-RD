@@ -15,6 +15,9 @@ export type ProblemCode =
   | 'unprocessable-entity'
   | 'idempotency-key-reused'
   | 'unknown-product'
+  | 'unauthenticated'
+  | 'rate-limited'
+  | 'service-unavailable'
   | 'internal';
 
 export class HttpProblem extends Error {

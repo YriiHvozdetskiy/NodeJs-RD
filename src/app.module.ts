@@ -13,6 +13,11 @@ import { OrderEventsService } from './orders/order-events.service';
 import { IdempotencyService } from './orders/idempotency.service';
 import { UsersRepository } from './users/users.repository';
 import { OutboxRelayService } from './outbox/outbox-relay.service';
+import { RedisModule } from './redis/redis.module';
+import { ProductCardsService } from './catalog/product-cards.service';
+import { SessionsService } from './sessions/sessions.service';
+import { SessionsController } from './sessions/sessions.controller';
+import { OrdersRateLimit } from './rate-limit/orders-rate-limit';
 
 /**
  * Один модуль на весь сервіс. Розрізати на CatalogModule / OrdersModule варто
@@ -39,13 +44,15 @@ import { OutboxRelayService } from './outbox/outbox-relay.service';
       cache: true,
     }),
     DbModule,
+    RedisModule,
   ],
-  controllers: [HealthController, ProductsController, OrdersController],
+  controllers: [HealthController, ProductsController, OrdersController, SessionsController],
   // OrderEventsService — один екземпляр на весь модуль: у нього публікує
   // OrdersService і з нього читають і gateway, і SSE-контролер. Два екземпляри
   // означали б дві шини, і подія з однієї не дійшла б до підписників іншої.
   providers: [
     ProductsRepository,
+    ProductCardsService,
     OrdersRepository,
     UsersRepository,
     OrdersService,
@@ -53,6 +60,8 @@ import { OutboxRelayService } from './outbox/outbox-relay.service';
     OrderEventsService,
     OrdersGateway,
     OutboxRelayService,
+    SessionsService,
+    OrdersRateLimit,
   ],
 })
 export class AppModule {}

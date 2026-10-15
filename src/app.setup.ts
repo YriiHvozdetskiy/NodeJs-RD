@@ -7,6 +7,8 @@ import { middleware as openApiValidator } from 'express-openapi-validator';
 import { CorsIoAdapter } from './common/cors-io.adapter';
 import { ProblemFilter } from './common/problem.filter';
 import type { Env } from './config/env.schema';
+import { OrdersRateLimit } from './rate-limit/orders-rate-limit';
+import { SessionsService } from './sessions/sessions.service';
 
 /**
  * Спека шукається від кореня запуску, а не від `__dirname`: той самий код
@@ -40,7 +42,16 @@ export function configureApp(app: NestExpressApplication): NestExpressApplicatio
   app.enableCors({ origin: origins });
   app.useWebSocketAdapter(new CorsIoAdapter(app, origins));
 
+  // Rate-limit (#23) — після CORS, щоб 429 ніс Access-Control-Allow-Origin
+  // і браузер дав сторінці прочитати Retry-After, але ДО парсингу тіла й
+  // валідатора: запит понад ліміт не вартий ні того, ні іншого.
+  app.use(app.get(OrdersRateLimit).middleware());
+
   app.use(express.json());
+
+  // Сесія (#23) читається з Redis на кожному запиті з cookie — і цим же
+  // читанням подовжується. Контролери беруть її через sessionOf(req).
+  app.use(app.get(SessionsService).middleware());
 
   // Версія API живе в `servers.url` спеки (`/v1`), тому й тут вона — глобальний
   // префікс, а не частина шляху ресурсу. Валідатор бере basePath зі спеки, тож
