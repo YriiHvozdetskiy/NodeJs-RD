@@ -23,12 +23,21 @@ const PROBLEM_TYPE = regex('application/problem\\+json.*', 'application/problem+
 
 const orderLine = { product_id: integer(501), qty: integer(2), unit_price_cents: integer(260_000) };
 
+/**
+ * Токен — властивість сесії, а не контракту: контракт фіксує лише форму
+ * заголовка. Провайдер на верифікації підставляє свій справжній токен
+ * (provider.verify.test.ts, requestFilter) — підписати приклад нижче він не зміг би.
+ */
+const EXAMPLE_TOKEN = 'eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCJ9.eyJzdWIiOiI5MDAyIn0.c2lnbmF0dXJl';
+const BEARER = regex('^Bearer [A-Za-z0-9._~+/-]+=*$', `Bearer ${EXAMPLE_TOKEN}`);
+const client = (url: string): MarketplaceClient => new MarketplaceClient(url, EXAMPLE_TOKEN);
+
 describe('Pact consumer · marketplace-web → marketplace-api', () => {
   test('GET /orders/{orderId}: замовлення, яке існує', async () => {
     provider
       .given(STATE.orderExists)
       .uponReceiving('запит наявного замовлення 1001')
-      .withRequest({ method: 'GET', path: '/orders/1001', headers: { Accept: 'application/json' } })
+      .withRequest({ method: 'GET', path: '/orders/1001', headers: { Accept: 'application/json', Authorization: BEARER } })
       .willRespondWith({
         status: 200,
         headers: { 'Content-Type': JSON_TYPE },
@@ -43,7 +52,7 @@ describe('Pact consumer · marketplace-web → marketplace-api', () => {
       });
 
     await provider.executeTest(async (mock) => {
-      const order = await new MarketplaceClient(mock.url).getOrder(1001);
+      const order = await client(mock.url).getOrder(1001);
 
       expect(order.id).toBe(1001);
       expect(order.items[0]).toEqual({ product_id: 501, qty: 2, unit_price_cents: 260_000 });
@@ -57,7 +66,7 @@ describe('Pact consumer · marketplace-web → marketplace-api', () => {
       .withRequest({
         method: 'POST',
         path: '/orders',
-        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'pact-7f3c1d2e-8a44-4b90' },
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'pact-7f3c1d2e-8a44-4b90', Authorization: BEARER },
         body: { items: [{ product_id: 501, qty: 2 }] },
       })
       .willRespondWith({
@@ -75,7 +84,7 @@ describe('Pact consumer · marketplace-web → marketplace-api', () => {
       });
 
     await provider.executeTest(async (mock) => {
-      const { order, location } = await new MarketplaceClient(mock.url).createOrder(
+      const { order, location } = await client(mock.url).createOrder(
         [{ product_id: 501, qty: 2 }],
         'pact-7f3c1d2e-8a44-4b90',
       );
@@ -89,7 +98,7 @@ describe('Pact consumer · marketplace-web → marketplace-api', () => {
     provider
       .given(STATE.orderMissing)
       .uponReceiving('запит замовлення, якого немає')
-      .withRequest({ method: 'GET', path: '/orders/999999', headers: { Accept: 'application/json' } })
+      .withRequest({ method: 'GET', path: '/orders/999999', headers: { Accept: 'application/json', Authorization: BEARER } })
       .willRespondWith({
         status: 404,
         headers: { 'Content-Type': PROBLEM_TYPE },
@@ -103,7 +112,7 @@ describe('Pact consumer · marketplace-web → marketplace-api', () => {
       });
 
     await provider.executeTest(async (mock) => {
-      const failure = await new MarketplaceClient(mock.url).getOrder(999_999).catch((err: unknown) => err);
+      const failure = await client(mock.url).getOrder(999_999).catch((err: unknown) => err);
 
       expect(failure).toBeInstanceOf(ApiProblem);
       expect(failure).toMatchObject({ type: 'https://api.marketplace.example/problems/not-found', status: 404 });

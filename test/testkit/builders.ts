@@ -1,3 +1,4 @@
+import { hashPassword } from '../../src/auth/passwords';
 import type { Queryable } from '../../src/db/queryable';
 import type { OrderStatus } from '../../src/entities/order.entity';
 import type { ProductCategory } from '../../src/entities/product.entity';
@@ -25,6 +26,7 @@ export interface InsertedUser {
 export class UserBuilder {
   private email = `user-${next()}@test.local`;
   private role: UserRole = 'buyer';
+  private password?: string;
 
   withEmail(email: string): this {
     this.email = email;
@@ -36,10 +38,20 @@ export class UserBuilder {
     return this;
   }
 
+  /**
+   * Пароль, з яким можна залогінитись (#24). Без нього — `!`: хеш, під який
+   * не підійде жоден пароль, тобто користувач без входу.
+   */
+  withPassword(password: string): this {
+    this.password = password;
+    return this;
+  }
+
   async insert(db: Queryable): Promise<InsertedUser> {
+    const passwordHash = this.password === undefined ? '!' : await hashPassword(this.password);
     const { rows } = await db.query<{ id: string }>(
-      `INSERT INTO users (email, password_hash, role) VALUES ($1, '!', $2) RETURNING id`,
-      [this.email, this.role],
+      `INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id`,
+      [this.email, passwordHash, this.role],
     );
     return { id: Number(rows[0].id), email: this.email, role: this.role };
   }

@@ -33,18 +33,32 @@ export class ApiProblem extends Error {
   }
 }
 
+/**
+ * Access-токен клієнт отримує з POST /auth/login і кладе в кожен запит до
+ * замовлень (#24). Логін і рефреш у цей контракт не входять: тут фіксується
+ * лише те, що замовлення ходять під `Authorization: Bearer …`.
+ */
 export class MarketplaceClient {
-  constructor(private readonly baseUrl: string) {}
+  constructor(
+    private readonly baseUrl: string,
+    private readonly accessToken: string,
+  ) {}
 
   async getOrder(id: number): Promise<OrderDto> {
-    const res = await fetch(`${this.baseUrl}/orders/${id}`, { headers: { Accept: 'application/json' } });
+    const res = await fetch(`${this.baseUrl}/orders/${id}`, {
+      headers: { Accept: 'application/json', Authorization: `Bearer ${this.accessToken}` },
+    });
     return OrderSchema.parse(await this.body(res));
   }
 
   async createOrder(items: { product_id: number; qty: number }[], idempotencyKey: string): Promise<{ order: OrderDto; location: string | null }> {
     const res = await fetch(`${this.baseUrl}/orders`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': idempotencyKey,
+        Authorization: `Bearer ${this.accessToken}`,
+      },
       body: JSON.stringify({ items }),
     });
     return { order: OrderSchema.parse(await this.body(res)), location: res.headers.get('location') };
