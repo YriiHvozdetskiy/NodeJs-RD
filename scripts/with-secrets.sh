@@ -23,6 +23,11 @@
 #
 #   bash scripts/with-secrets.sh dev node dist/consumer.js
 #
+# З ДЗ #23 — дві адреси Redis: REDIS_CACHE_URL (кеш) і REDIS_QUEUE_URL (черга
+# BullMQ, сесії, rate-limit). Без пароля в .env, пароль — у secrets/redis_password.
+#
+#   bash scripts/with-secrets.sh dev node dist/worker.js
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -34,7 +39,8 @@ ENV_SLUG="${1:-dev}"; shift || true
 
 # грейдер не має доступу до сховища: значення вже в оточенні. Досить одного
 # DATABASE_URL — DB_* для TypeORM виводяться з нього, якщо їх не задали окремо.
-# BROKER_URL приходить повним (amqp://user:pass@host:5672) і йде далі як є.
+# BROKER_URL приходить повним (amqp://user:pass@host:5672) і йде далі як є,
+# так само REDIS_CACHE_URL і REDIS_QUEUE_URL (redis://default:pass@host:port).
 if [ "${SKIP_VAULT:-0}" = "1" ]; then
   if [ -n "${DATABASE_URL:-}" ] && [ -z "${DB_HOST:-}" ]; then
     # shellcheck source=scripts/lib/db.sh
@@ -113,5 +119,26 @@ if [ -n "${BROKER_URL_BASE}" ]; then
   BROKER_URL="${BROKER_URL_BASE%%://*}://${broker_rest%%@*}:$(cat "${BROKER_SECRET_FILE}")@${broker_rest#*@}"
   export BROKER_URL
 fi
+
+# Redis (#23) — два інстанси, кеш і черга, з одним паролем. Формат той самий:
+# redis://user@host:port у .env, пароль — у secrets/redis_password (або у файлі
+# з REDIS_PASSWORD_FILE). Без юзера в URL (redis://host:port) пароль іде як
+# redis://:pass@host:port — так Redis 6+ розуміє користувача `default`.
+REDIS_SECRET_FILE="$(grep -E '^REDIS_PASSWORD_FILE=' "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+REDIS_SECRET_FILE="${REDIS_SECRET_FILE:-./secrets/redis_password}"
+case "${REDIS_SECRET_FILE}" in /*) ;; *) REDIS_SECRET_FILE="${ROOT}/${REDIS_SECRET_FILE}" ;; esac
+for var in REDIS_CACHE_URL REDIS_QUEUE_URL; do
+  base="$(grep -E "^${var}=" "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+  [ -n "${base}" ] || continue
+  if [ ! -f "${REDIS_SECRET_FILE}" ]; then
+    echo "with-secrets: немає ${REDIS_SECRET_FILE}. Спершу: npm run db:up" >&2; exit 1
+  fi
+  scheme="${base%%://*}"; rest="${base#*://}"; pass="$(cat "${REDIS_SECRET_FILE}")"
+  if [[ "${rest}" == *@* ]]; then
+    export "${var}=${scheme}://${rest%%@*}:${pass}@${rest#*@}"
+  else
+    export "${var}=${scheme}://:${pass}@${rest}"
+  fi
+done
 
 exec "$@"

@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { checkout, CheckoutError, type CheckoutOptions, type CheckoutResult } from '../checkout/checkout';
+import { ProductCardsService } from '../catalog/product-cards.service';
 import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 import { OrmService } from '../db/orm.service';
@@ -46,6 +47,7 @@ export class OrdersService {
     private readonly users: UsersRepository,
     private readonly orm: OrmService,
     private readonly events: OrderEventsService,
+    private readonly cards: ProductCardsService,
   ) {}
 
   page(limit: number, cursor?: string): Promise<Page<Order>> {
@@ -87,6 +89,12 @@ export class OrdersService {
       if (err instanceof CheckoutError) throw toProblem(err);
       throw err;
     }
+
+    // Checkout змінив stock цих товарів — їхні картки в кеші (#23) вже брешуть.
+    // Після COMMIT, не всередині транзакції: скинути кеш до коміту означало б,
+    // що паралельне читання встигне закешувати ще старий stock. Помилку Redis
+    // CacheAside ковтає: застарілу картку все одно прибере TTL.
+    await this.cards.invalidate(items.map((item) => item.product_id));
 
     const order = await this.orders.findById(Number(placed.orderId));
     if (!order) throw new Error(`замовлення ${placed.orderId} закомічене, але не читається`);

@@ -37,6 +37,10 @@ strictDepBuilds: true
 #   @parcel/watcher    — jest --watch; збірка з сирців, лише якщо немає prebuilt
 #   @scarf/scarf       — @pact-foundation/pact; postinstall шле телеметрію
 #                        встановлення. Саме той випадок, від якого цей блок і є
+#   msgpackr-extract   — bullmq (#23) → msgpackr; install збирає нативний
+#                        прискорювач через node-gyp, лише якщо немає prebuilt.
+#                        Prebuilt приходить платформною optional-залежністю, а
+#                        без обох msgpackr працює на чистому JS
 #
 # Що додасться далі по курсу, коли справді знадобиться:
 #   argon2 / bcrypt   — #24 authn (нативний біндинг, потребує node-gyp)
@@ -47,6 +51,7 @@ allowBuilds:
   '@parcel/watcher': false
   '@scarf/scarf': false
   cpu-features: false
+  msgpackr-extract: false
   protobufjs: false
   ssh2: false
   unrs-resolver: false

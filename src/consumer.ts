@@ -2,8 +2,11 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import * as amqp from 'amqplib';
 import type { ConsumeMessage } from 'amqplib';
+import Redis from 'ioredis';
 import { Pool } from 'pg';
 import { cliDbConfig, requiredEnv } from './db/cli-env';
+import { enqueueOrderWebhook, openJobsQueue } from './jobs/jobs';
+import { untilReady } from './redis/redis-connections';
 import { accruePointsOnce } from './loyalty/points-accrual';
 import { ContractError, parseOrderPlaced } from './messaging/order-placed.event';
 import { assertLoyaltyTopology, DELIVERY_LIMIT, LOYALTY_QUEUE } from './messaging/topology';
@@ -80,6 +83,16 @@ const log = (line: string) => console.log(`[loyalty ${process.pid}] ${line}`);
 async function main(): Promise<void> {
   const brokerUrl = requiredEnv('BROKER_URL');
   const db = new Pool({ ...cliDbConfig(), max: PREFETCH });
+
+  // Вебхук партнеру (#23) — другий ефект order.placed. Сам HTTP-виклик робить
+  // воркер BullMQ (npm run worker): повільний чужий сервер не має тримати слот
+  // prefetch, а повтори з backoff — робота черги, а не цього циклу.
+  // ORDER_WEBHOOK_URL не секрет і не адреса інфраструктури — звичайна змінна
+  // запуску; немає її — вебхуків немає.
+  const webhookUrl = process.env.ORDER_WEBHOOK_URL;
+  const jobsRedis = webhookUrl ? new Redis(requiredEnv('REDIS_QUEUE_URL'), { connectionName: 'loyalty-consumer:jobs' }) : undefined;
+  if (jobsRedis) await untilReady(jobsRedis);
+  const jobs = jobsRedis ? openJobsQueue(jobsRedis) : undefined;
   const connection = await amqp.connect(brokerUrl);
   const ch = await connection.createChannel();
 
@@ -132,6 +145,15 @@ async function main(): Promise<void> {
       } else {
         report({ t: 'not-eligible', eventId, orderId });
         log(`замовлення ${orderId}: нема чого нараховувати`);
+      }
+
+      // За будь-якого вердикту, і для дубля теж: попередня доставка могла
+      // нарахувати бали й упасти до цього рядка. Повторний add безпечний —
+      // jobId з id замовлення, і друга задача не зʼявиться. Redis недоступний —
+      // виняток веде в той самий requeue, що й лежача база.
+      if (jobs && webhookUrl) {
+        const job = await enqueueOrderWebhook(jobs, { eventId: event.eventId, orderId, url: webhookUrl });
+        log(`замовлення ${orderId}: вебхук у черзі (${job.id})`);
       }
     } catch (err) {
       requeue = !(err instanceof ContractError);
@@ -195,6 +217,8 @@ async function main(): Promise<void> {
     await Promise.allSettled(inFlight);
     await ch.close().catch(() => undefined);
     await connection.close().catch(() => undefined);
+    await jobs?.close().catch(() => undefined);
+    await jobsRedis?.quit().catch(() => undefined);
     await db.end();
     process.exit(0);
   };
