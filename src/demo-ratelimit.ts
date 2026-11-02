@@ -21,6 +21,8 @@ import { openRedis, PodProcess } from './redis/demo-kit';
  */
 const PODS = 2;
 const EXTRA = 5;
+/** Що віддає валідатор спеки на тіло без позицій — єдина чесна відповідь пропущеному запиту. */
+const VALIDATOR_STATUS = 400;
 
 interface Shot {
   pod: number;
@@ -64,6 +66,10 @@ async function main(): Promise<void> {
       console.log(`под ${pod}: пропустив ${mine.filter((s) => s.status !== 429).length}, відкинув ${mine.filter((s) => s.status === 429).length}`);
     }
     const allowedStatuses = [...new Set(allowed.map((s) => s.status))];
+    // «Пропущено» = усе, крім 429, тож 5xx пода теж зійшов би за пропущений
+    // запит і дав би allowed=limit на зламаному поді. Тому окремо рахуємо
+    // відповіді, яких тут бути не може.
+    const otherStatuses = shots.filter((s) => s.status !== 429 && s.status !== VALIDATOR_STATUS);
 
     summary.line('instances', pods.length);
     summary.line('limit', ORDERS_LIMIT);
@@ -75,10 +81,15 @@ async function main(): Promise<void> {
     summary.line('retry-after-seconds', Number.isNaN(retryAfter) ? 0 : retryAfter);
     // 400 — валідатор спеки після лімітера, див. коментар угорі.
     summary.line('allowed-status', allowedStatuses.length === 1 ? allowedStatuses[0] : 0);
+    summary.line('other-status', otherStatuses.length);
 
     summary.expect(`instances=${PODS}`, pods.length === PODS);
     summary.expect('allowed = limit — ліміт спільний для подів, а не на кожен', allowed.length === ORDERS_LIMIT);
     summary.expect(`blocked=${EXTRA}`, blocked.length === EXTRA);
+    summary.expect(
+      `allowed-status=${VALIDATOR_STATUS} — пропущені дійшли до валідатора, жоден под не впав (other-status=0)`,
+      otherStatuses.length === 0 && allowedStatuses.length === 1 && allowedStatuses[0] === VALIDATOR_STATUS,
+    );
     summary.expect('status=429 і цілий Retry-After ≥ 1', last?.status === 429 && Number.isInteger(retryAfter) && retryAfter >= 1);
   } finally {
     await Promise.all(pods.map((pod) => pod.stop()));
