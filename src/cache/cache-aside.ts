@@ -88,46 +88,59 @@ export class CacheAside {
     const redis = this.redis;
     if (!redis) return load();
 
-    const cached = await this.read<T>(redis, key);
-    if (cached !== MISS) return cached;
-
     const lockKey = `lock:${key}`;
-    const token = randomUUID();
-    let mine: boolean;
-    try {
-      mine = await acquireLock(redis, lockKey, token, this.options.lockTtlMs);
-    } catch (err) {
-      this.onError('lock', err);
-      return load();
-    }
-
-    if (mine) {
-      try {
-        // Повторна перевірка під локом. Між нашим промахом і SET NX попередній
-        // власник міг устигнути записати значення й зняти свій лок — тоді ми
-        // взяли вже непотрібний лок і пішли б у базу вдруге.
-        const fresh = await this.read<T>(redis, key);
-        if (fresh !== MISS) return fresh;
-        const value = await load();
-        await this.write(redis, key, value);
-        return value;
-      } finally {
-        await releaseLock(redis, lockKey, token).catch((err: unknown) => this.onError('unlock', err));
-      }
-    }
-
-    // Лок чужий: хтось уже пішов у базу. Чекаємо його результат у кеші.
     const deadline = Date.now() + this.options.lockTtlMs;
-    while (Date.now() < deadline) {
-      await sleep(this.options.pollMs);
-      const value = await this.read<T>(redis, key);
-      if (value !== MISS) return value;
-      // Лока вже немає, а значення так і не зʼявилось — власник упав або не
-      // зміг записати. Чекати більше нічого.
-      const held = await redis.exists(lockKey).catch(() => 0);
-      if (held === 0) break;
+
+    for (;;) {
+      const cached = await this.read<T>(redis, key);
+      if (cached !== MISS) return cached;
+
+      const token = randomUUID();
+      let mine: boolean;
+      try {
+        mine = await acquireLock(redis, lockKey, token, this.options.lockTtlMs);
+      } catch (err) {
+        // Redis не відповідає — писати в нього теж нема сенсу.
+        this.onError('lock', err);
+        return load();
+      }
+
+      if (mine) {
+        try {
+          // Повторна перевірка під локом. Між нашим промахом і SET NX попередній
+          // власник міг устигнути записати значення й зняти свій лок — тоді ми
+          // взяли вже непотрібний лок і пішли б у базу вдруге.
+          const fresh = await this.read<T>(redis, key);
+          if (fresh !== MISS) return fresh;
+          const value = await load();
+          await this.write(redis, key, value);
+          return value;
+        } finally {
+          await releaseLock(redis, lockKey, token).catch((err: unknown) => this.onError('unlock', err));
+        }
+      }
+
+      // Лок чужий: хтось уже пішов у базу. Чекаємо його результат у кеші.
+      let ownerGone = false;
+      while (!ownerGone && Date.now() < deadline) {
+        await sleep(this.options.pollMs);
+        const value = await this.read<T>(redis, key);
+        if (value !== MISS) return value;
+        ownerGone = (await redis.exists(lockKey).catch(() => 0)) === 0;
+      }
+
+      // Власник зник, а значення не записав: упав, завис довше за TTL лока чи
+      // не зміг записати. Якби всі, хто чекав, пішли в базу самі, лавина
+      // повернулася б цілком. Тому — нове коло: знову SET NX, і в базу йде
+      // один, а решта чекає вже на нього.
+      if (ownerGone && Date.now() < deadline) continue;
+
+      // Дедлайн минув. Ідемо в базу самі — і пишемо результат, щоб наступні
+      // запити влучили в кеш, а не повторили цей шлях.
+      const value = await load();
+      await this.write(redis, key, value);
+      return value;
     }
-    return load();
   }
 
   /** Явна інвалідація на записі — додатково до TTL, а не замість нього. */

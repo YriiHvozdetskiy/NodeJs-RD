@@ -21,7 +21,9 @@ import { RedisConnections } from './redis/redis-connections';
  *        single-flight лок (ProductCardsService)          — db-calls;
  *   3. 100 читань теплої картки — db-calls-warm;
  *   4. битий запис у ключі картки — промах, а не 500: corrupt-recovered;
- *   5. чужий токен лок не знімає — foreign-unlock.
+ *   5. власник лока зник, не записавши значення → CONCURRENT читань:
+ *        у базу знову один — db-calls-owner-lost, і картка в кеші після;
+ *   6. чужий токен лок не знімає — foreign-unlock.
  *
  * db-calls рахується на межі з Postgres: репозиторію дано Queryable, який
  * рахує кожен SQL, що реально пішов у пул. Не «скільки разів викликали
@@ -35,6 +37,8 @@ const WARM = 60;
 const CONCURRENT = 50;
 const PODS = 5;
 const WARM_READS = 100;
+/** Скільки живе лок «власника, що впав»: стільки очікувачі чекають даремно. */
+const LOST_OWNER_LOCK_MS = 300;
 
 async function main(): Promise<void> {
   const summary = new Summary();
@@ -82,14 +86,14 @@ async function main(): Promise<void> {
     dbCalls = 0;
     await Promise.all(Array.from({ length: CONCURRENT }, (_, i) => naiveGet(pods[i % PODS], repo, hot)));
     const dbCallsNoLock = dbCalls;
-    console.log(`наївний cache-aside: ${CONCURRENT} одночасних промахів → ${dbCallsNoLock} походів у базу`);
+    console.log(`наївний cache-aside: ${CONCURRENT} одночасних промахів → походів у базу: ${dbCallsNoLock}`);
 
     await expire(pods[0], cardKey(hot));
     dbCalls = 0;
     const answers = await Promise.all(Array.from({ length: CONCURRENT }, (_, i) => services[i % PODS].get(hot)));
     const dbCallsLocked = dbCalls;
     const sameAnswer = answers.every((card) => JSON.stringify(card) === expected);
-    console.log(`single-flight лок: ${CONCURRENT} одночасних промахів → ${dbCallsLocked} похід у базу, решта дочекалась кешу`);
+    console.log(`single-flight лок: ${CONCURRENT} одночасних промахів → походів у базу: ${dbCallsLocked}, решта дочекалась кешу`);
 
     // ── 3. теплий кеш ─────────────────────────────────────────────────────────
     dbCalls = 0;
@@ -107,7 +111,20 @@ async function main(): Promise<void> {
     const repairedRaw = await pods[0].get(cardKey(hot));
     const corruptRecovered = fromCorrupt === expected && dbCalls === 1 && repairedRaw !== null && parses(repairedRaw);
 
-    // ── 5. compare-and-delete: чужий токен лок не знімає ──────────────────────
+    // ── 5. власник лока зник, не записавши значення ──────────────────────────
+    // Лок узяв «под», що впав посеред завантаження: ключа картки немає, а лок
+    // доживає свої LOST_OWNER_LOCK_MS і зникає без запису. Очікувачі мають
+    // знову розіграти лок, а не піти в базу всі разом.
+    await expire(pods[0], cardKey(hot));
+    await pods[0].set(`lock:${cardKey(hot)}`, 'token-of-a-crashed-pod', 'PX', LOST_OWNER_LOCK_MS);
+    dbCalls = 0;
+    const afterLoss = await Promise.all(Array.from({ length: CONCURRENT }, (_, i) => services[i % PODS].get(hot)));
+    const dbCallsOwnerLost = dbCalls;
+    const cachedAfterLoss = (await pods[0].exists(cardKey(hot))) === 1;
+    const sameAfterLoss = afterLoss.every((card) => JSON.stringify(card) === expected);
+    console.log(`власник лока зник без запису: ${CONCURRENT} очікувачів → походів у базу: ${dbCallsOwnerLost}, картка в кеші: ${cachedAfterLoss ? 'так' : 'ні'}`);
+
+    // ── 6. compare-and-delete: чужий токен лок не знімає ──────────────────────
     const lockKey = `lock:${cardKey(hot)}`;
     await acquireLock(pods[0], lockKey, 'token-pod-0', CARD_CACHE.lockTtlMs);
     const foreignUnlock = await releaseLock(pods[1], lockKey, 'token-pod-1');
@@ -129,6 +146,8 @@ async function main(): Promise<void> {
     summary.line('db-ms', round(dbMs));
     summary.line('cache-ms', round(cacheMs));
     summary.line('corrupt-recovered', corruptRecovered ? 1 : 0);
+    summary.line('db-calls-owner-lost', dbCallsOwnerLost);
+    summary.line('cached-after-owner-lost', cachedAfterLoss ? 1 : 0);
     summary.line('foreign-unlock', foreignUnlock ? 1 : 0);
     summary.line('own-unlock', ownUnlock ? 1 : 0);
 
@@ -140,6 +159,8 @@ async function main(): Promise<void> {
     summary.expect('усі одночасні читання отримали ту саму картку', sameAnswer);
     summary.expect('db-calls-warm=0 — теплий кеш у базу не ходить', dbCallsWarm === 0);
     summary.expect('corrupt-recovered=1 — битий запис став промахом і перезаписаний', corruptRecovered);
+    summary.expect('db-calls-owner-lost=1 — після зниклого власника в базу знову один', dbCallsOwnerLost === 1);
+    summary.expect('cached-after-owner-lost=1 — і він записав картку', cachedAfterLoss && sameAfterLoss);
     summary.expect('foreign-unlock=0 і own-unlock=1 — зняти можна лише свій лок', !foreignUnlock && ownUnlock);
   } finally {
     const leftovers = await keysWithPrefix(admin, prefix).catch(() => []);
