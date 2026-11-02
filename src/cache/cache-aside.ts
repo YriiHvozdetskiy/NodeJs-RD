@@ -54,7 +54,12 @@ export function jitteredTtl(baseSeconds: number, spreadSeconds: number): number 
 /** Промах відрізняємо від закешованого null: «товару немає» — теж відповідь. */
 const MISS = Symbol('miss');
 
-type Op = 'read' | 'write' | 'lock' | 'unlock' | 'invalidate';
+type Op = 'read' | 'decode' | 'write' | 'lock' | 'unlock' | 'invalidate';
+
+/** Те, що пише write(): форма значення не перевіряється — лише наша обгортка. */
+function isEntry<T>(value: unknown): value is { v: T | null } {
+  return typeof value === 'object' && value !== null && 'v' in value;
+}
 
 /**
  * Cache-aside з single-flight локом.
@@ -140,8 +145,20 @@ export class CacheAside {
       return MISS;
     }
     if (raw === null) return MISS;
+    // Битий запис (обрізаний байт, ключ, записаний іншою версією коду) — промах,
+    // а не виняток у запиті. Перезапише його той, хто візьме лок і піде в базу.
+    let entry: unknown;
+    try {
+      entry = JSON.parse(raw);
+    } catch (err) {
+      this.onError('decode', err);
+      return MISS;
+    }
     // Обгортка { v }, бо JSON-рядок "null" і відсутній ключ мусять відрізнятись.
-    const entry: { v: T | null } = JSON.parse(raw);
+    if (!isEntry<T>(entry)) {
+      this.onError('decode', new Error(`у ${key} не {"v": …}`));
+      return MISS;
+    }
     return entry.v;
   }
 

@@ -20,7 +20,8 @@ import { RedisConnections } from './redis/redis-connections';
  *        наївний cache-aside (GET → промах → база → SET) — db-calls-no-lock;
  *        single-flight лок (ProductCardsService)          — db-calls;
  *   3. 100 читань теплої картки — db-calls-warm;
- *   4. чужий токен лок не знімає — foreign-unlock.
+ *   4. битий запис у ключі картки — промах, а не 500: corrupt-recovered;
+ *   5. чужий токен лок не знімає — foreign-unlock.
  *
  * db-calls рахується на межі з Postgres: репозиторію дано Queryable, який
  * рахує кожен SQL, що реально пішов у пул. Не «скільки разів викликали
@@ -97,7 +98,16 @@ async function main(): Promise<void> {
     const cacheMs = (performance.now() - warmStarted) / WARM_READS;
     const dbCallsWarm = dbCalls;
 
-    // ── 4. compare-and-delete: чужий токен лок не знімає ──────────────────────
+    // ── 4. битий запис у кеші ─────────────────────────────────────────────────
+    // Обрізаний JSON у ключі: читання має стати промахом — один похід у базу,
+    // та сама картка у відповіді й справний запис у ключі після неї.
+    await pods[0].set(cardKey(hot), '{"v":{"id":', 'EX', CARD_CACHE.ttlSeconds);
+    dbCalls = 0;
+    const fromCorrupt = JSON.stringify(await services[0].get(hot));
+    const repairedRaw = await pods[0].get(cardKey(hot));
+    const corruptRecovered = fromCorrupt === expected && dbCalls === 1 && repairedRaw !== null && parses(repairedRaw);
+
+    // ── 5. compare-and-delete: чужий токен лок не знімає ──────────────────────
     const lockKey = `lock:${cardKey(hot)}`;
     await acquireLock(pods[0], lockKey, 'token-pod-0', CARD_CACHE.lockTtlMs);
     const foreignUnlock = await releaseLock(pods[1], lockKey, 'token-pod-1');
@@ -118,6 +128,7 @@ async function main(): Promise<void> {
     summary.line('db-calls-warm', dbCallsWarm);
     summary.line('db-ms', round(dbMs));
     summary.line('cache-ms', round(cacheMs));
+    summary.line('corrupt-recovered', corruptRecovered ? 1 : 0);
     summary.line('foreign-unlock', foreignUnlock ? 1 : 0);
     summary.line('own-unlock', ownUnlock ? 1 : 0);
 
@@ -128,6 +139,7 @@ async function main(): Promise<void> {
     summary.expect('db-calls=1 — лавина дала один похід у базу', dbCallsLocked === 1);
     summary.expect('усі одночасні читання отримали ту саму картку', sameAnswer);
     summary.expect('db-calls-warm=0 — теплий кеш у базу не ходить', dbCallsWarm === 0);
+    summary.expect('corrupt-recovered=1 — битий запис став промахом і перезаписаний', corruptRecovered);
     summary.expect('foreign-unlock=0 і own-unlock=1 — зняти можна лише свій лок', !foreignUnlock && ownUnlock);
   } finally {
     const leftovers = await keysWithPrefix(admin, prefix).catch(() => []);
@@ -178,6 +190,15 @@ async function createProducts(pool: Pool, count: number): Promise<number[]> {
     [sellers[0].id, count],
   );
   return rows.map((row) => Number(row.id));
+}
+
+function parses(raw: string): boolean {
+  try {
+    JSON.parse(raw);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function round(ms: number): number {
