@@ -40,9 +40,14 @@ export class IdempotencyService {
    * Чесне обмеження: JSON.stringify залежить від порядку ключів. Клієнт, який
    * на retry серіалізує те саме тіло в іншому порядку, отримає 422 на рівному
    * місці. Промислове рішення — канонічний JSON (RFC 8785).
+   *
+   * Покупець у відпечатку (#24): ключ ідемпотентності глобальний, а
+   * покупців тепер багато. Без цього покупець Б із підглянутим ключем
+   * покупця А і тим самим кошиком отримав би replay — тобто ЧУЖЕ замовлення.
+   * Так він отримує 422, як за будь-якого іншого «той самий ключ, інший намір».
    */
-  fingerprint(body: unknown): string {
-    return crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+  fingerprint(buyerId: string, body: unknown): string {
+    return crypto.createHash('sha256').update(JSON.stringify({ buyer: buyerId, body })).digest('hex');
   }
 
   /**

@@ -24,6 +24,7 @@ import {
   Summary,
 } from './messaging/demo-kit';
 import { orderPlacedEventId } from './messaging/order-placed.event';
+import { AccessTokens } from './auth/access-tokens';
 
 /**
  * demo:outbox — happy path #22, від HTTP до ефекту:
@@ -56,7 +57,7 @@ async function main(): Promise<void> {
     const migrations = await migrate(dataSource);
     await resetQueues(broker, { purgeDlq: false });
     const backlog = await flushOutbox(dataSource, broker);
-    const { productId } = await demoFixture(dataSource, 'demo:outbox');
+    const { buyerId, productId } = await demoFixture(dataSource, 'demo:outbox');
 
     const consumer = new ConsumerProcess();
     workers.push(consumer);
@@ -64,13 +65,16 @@ async function main(): Promise<void> {
     api = await startApi();
     console.log('── demo:outbox: 2× POST з тим самим Idempotency-Key → outbox → relay → споживач ──');
 
+    // З #24 POST /v1/orders — під токеном покупця. Логін тут ні до чого:
+    // токен виписує той самий AccessTokens, що й /auth/login.
+    const token = await api.tokenFor(buyerId);
     const key = `demo-outbox-${randomUUID()}`;
     const body = { items: [{ product_id: Number(productId), qty: 1 }] };
     const responses: { status: number; replay: boolean; id: number }[] = [];
     for (let i = 0; i < 2; i++) {
       const res = await fetch(`${api.url}/v1/orders`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'idempotency-key': key },
+        headers: { 'content-type': 'application/json', 'idempotency-key': key, authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
       });
       const json: unknown = await res.json();
@@ -139,6 +143,8 @@ async function main(): Promise<void> {
 
 interface Api {
   url: string;
+  /** Access-токен покупця для `Authorization: Bearer` (#24). */
+  tokenFor(userId: string): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -170,9 +176,13 @@ async function startApi(): Promise<Api> {
   configureApp(app);
   await app.listen(0, '127.0.0.1');
   const url = await app.getUrl();
+  const tokens = app.get(AccessTokens);
 
   return {
     url,
+    // Сімʼя без refresh-рядка: демо потрібен лише access, а гард перевіряє
+    // підпис і денилист — у базу за сімʼєю він не ходить.
+    tokenFor: async (userId) => (await tokens.issue({ id: userId, role: 'buyer' }, randomUUID())).token,
     async close() {
       await app.close();
       await rm(dir, { recursive: true, force: true });

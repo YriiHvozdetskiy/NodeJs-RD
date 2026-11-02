@@ -36,8 +36,14 @@ type PointsEntryRow = Pick<
   'id' | 'userId' | 'orderId' | 'kind' | 'amount' | 'status' | 'maturesAt' | 'createdAt'
 >;
 
-// Не справжній хеш і не пароль: заглушка, поки немає автентифікації (#24).
-const SEED_PASSWORD_HASH = '$argon2id$v=19$seed$not-a-real-hash';
+/**
+ * Пароль усіх сід-користувачів — `marketplace-dev`, той самий дев-креденшел,
+ * що й дефолтні паролі в docker-compose.yml. Хеш справжній (#24,
+ * src/auth/passwords.ts), а сіль фіксована: сід мусить давати побайтово ті
+ * самі рядки на кожному запуску. Для дев-фікстури це прийнятно, для живих
+ * паролів — ні: там сіль випадкова на кожен хеш.
+ */
+export const SEED_PASSWORD_HASH = 'scrypt$32768$8$1$bWFya2V0cGxhY2Utc2VlZA$d42vDGNEJpmQ84noypQ4HKRiFDpoLbxLQVS6ORY_aIQ';
 
 const userSeeds: Pick<User, 'id' | 'email' | 'role'>[] = [
   { id: '1', email: 'admin@marketplace.test', role: 'admin' },

@@ -17,7 +17,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
 import { interval, map, merge, takeUntil, type Observable } from 'rxjs';
-import { GUEST_BUYER_EMAIL, OrdersService, type CreateOrderItem } from './orders.service';
+import { OrdersService, type CreateOrderItem } from './orders.service';
 import type { Order } from './orders.repository';
 import { IdempotencyService, type Verdict } from './idempotency.service';
 import { IdempotencyKeyTaken } from '../checkout/checkout';
@@ -26,6 +26,8 @@ import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 import type { Env } from '../config/env.schema';
 import type { OrderStatus } from '../entities/order.entity';
+import type { Principal } from '../auth/access-tokens';
+import { CurrentPrincipal, Roles } from '../auth/guards';
 
 /**
  * Через скільки EventSource перепідключається після обриву. Без цього поля
@@ -65,27 +67,33 @@ export class OrdersController {
     return { ...rest, totalCents: total_cents };
   }
 
+  /** Лише свої замовлення: фільтр по власнику стоїть у WHERE (src/orders/orders.repository.ts). */
   @Get()
   async list(
+    @CurrentPrincipal() principal: Principal,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
     @Query('cursor') cursor?: string,
   ): Promise<Page<unknown>> {
-    const page = await this.orders.page(limit, cursor);
+    const page = await this.orders.page(principal, limit, cursor);
     return { ...page, items: page.items.map((order) => this.view(order)) };
   }
 
+  /** Чуже — 403 від сервісу, після того як замовлення прочитане (`findFor`). */
   @Get(':orderId')
-  async one(@Param('orderId', ParseIntPipe) orderId: number): Promise<unknown> {
-    const order = await this.orders.find(orderId);
-    if (!order) throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
-    return this.view(order);
+  async one(@CurrentPrincipal() principal: Principal, @Param('orderId', ParseIntPipe) orderId: number): Promise<unknown> {
+    return this.view(await this.orders.findFor(orderId, principal));
   }
 
   /**
    * Тіло перевіряє валідатор спеки (схема `OrderStatusChange`): сюди доходить
    * лише статус з `enum`. Чи дозволений перехід — питання вже не форми, а
    * стану, тому його вирішує сервіс.
+   *
+   * Хто веде замовлення складом — адмін. Продавця сюди не пускаємо: в
+   * одному замовленні товари кількох продавців, і «його» замовлення — вже
+   * питання власності через order_items, а не роль.
    */
+  @Roles('admin')
   @Patch(':orderId')
   async changeStatus(
     @Param('orderId', ParseIntPipe) orderId: number,
@@ -110,21 +118,19 @@ export class OrdersController {
    */
   @Sse(':orderId/events')
   async statusEvents(
+    @CurrentPrincipal() principal: Principal,
     @Param('orderId', ParseIntPipe) orderId: number,
     @Headers('last-event-id') lastEventId?: string,
   ): Promise<Observable<MessageEvent>> {
-    // Та сама перевірка власника, що й на WS-`join`. Особа HTTP-запиту v1 —
-    // гість: від його імені `POST /v1/orders` оформлює замовлення, тож свої
-    // замовлення він слухає без креденшелів, а чужі — ні. Власного заголовка
-    // EventSource не надішле, тому до #24 явної особи тут немає; тоді гостя
-    // замінить JWT із cookie.
+    // Та сама перевірка власника, що й у GET /v1/orders/:id і на WS-`join`:
+    // токен — у заголовку Authorization (його перевірив AuthGuard), власність —
+    // тут, після читання замовлення. Нативний EventSource власних заголовків не
+    // надсилає, тому браузерний клієнт читає потік через fetch; cookie з
+    // токеном — тема L#27 (CSRF).
     //
-    // Чуже й неіснуюче — однакові 404: відповідь не підтверджує, що чуже
-    // замовлення існує. І все це до першого байта потоку, поки заголовки ще не
-    // надіслані, — відмова приходить звичайним problem+json.
-    if (!(await this.orders.isOwnedBy(orderId, GUEST_BUYER_EMAIL))) {
-      throw new HttpProblem(404, `замовлення ${orderId} не існує`, 'not-found');
-    }
+    // Відмова — до першого байта потоку, поки заголовки ще не надіслані, тож
+    // вона приходить звичайним problem+json.
+    await this.orders.findFor(orderId, principal);
 
     // `retry:` їде в кожному блоці події, а не окремим першим блоком. Nest
     // нумерує сам кожне повідомлення без `id`, крім коментарів: блок з одним
@@ -163,11 +169,14 @@ export class OrdersController {
   @Post()
   @HttpCode(201)
   async create(
+    @CurrentPrincipal() principal: Principal,
     @Headers('idempotency-key') key: string,
     @Body() body: { items: CreateOrderItem[] },
     @Res({ passthrough: true }) res: Response,
   ): Promise<unknown> {
-    const fingerprint = this.idempotency.fingerprint(body);
+    // Покупець — з токена, і тільки звідти. У тілі `CreateOrder` поля покупця
+    // немає свідомо: інакше будь-хто оформлював би від чужого імені.
+    const fingerprint = this.idempotency.fingerprint(principal.userId, body);
     let verdict = await this.idempotency.decide(key, fingerprint);
 
     if (verdict.kind === 'proceed') {
@@ -179,7 +188,7 @@ export class OrdersController {
         const delay = this.config.get('SLOW_MS', { infer: true });
         if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 
-        const order = await this.orders.create(body.items, { key, fingerprint });
+        const order = await this.orders.create(principal.userId, body.items, { key, fingerprint });
         res.setHeader('Location', `/v1/orders/${order.id}`);
         return this.view(order);
       } catch (err) {

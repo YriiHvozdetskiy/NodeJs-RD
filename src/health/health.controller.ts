@@ -1,5 +1,6 @@
 import { Controller, Get } from '@nestjs/common';
 import { DatabaseService } from '../db/database.service';
+import { Public } from '../auth/guards';
 
 interface DbProbeRow {
   current_user: string;
@@ -14,6 +15,8 @@ interface DbProbeRow {
  * `uptime` віддається у відповіді не для краси: він — доказ, що ротація
  * пароля БД не перезапустила процес. Впав би процес — лічильник почався б з нуля.
  */
+// Оркестратор і грейдер читають health без токена.
+@Public()
 @Controller('health')
 export class HealthController {
   constructor(private readonly db: DatabaseService) {}

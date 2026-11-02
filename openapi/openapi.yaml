@@ -21,8 +21,10 @@ info:
       * версія API живе в `servers.url` (`/v1`), а не в шляхах. v1 і v2 у шляхах
         поруч зʼявляться тільки тоді, коли обидві реально працюватимуть.
 
-# Авторизації в API поки свідомо немає — порожній масив закриває redocly-правило
-# security-defined і водночас документує це рішення явно.
+# Глобально — порожньо: кожна операція сама каже, чи потрібен їй токен.
+# Відкрите — каталог на читання, логін і рефреш; решта — `bearerAuth`.
+# Перевіряє токен не валідатор спеки, а AuthGuard застосунку (src/auth/guards.ts):
+# підпис, exp і денилист — це не форма запиту.
 security: []
 
 servers:
@@ -33,13 +35,18 @@ servers:
 
 tags:
   - name: products
-    description: Каталог товарів — тільки читання в v1
+    description: Каталог товарів — читання відкрите, запис для продавця й адміна
   - name: orders
     description: Замовлення покупця
   - name: sessions
     description: |
       Гостьова сесія в cookie `sid`. Стан живе в Redis, і кожен запит із
-      cookie продовжує його на `idle_timeout_seconds`. Логін додасться на #24.
+      cookie продовжує його на `idle_timeout_seconds`.
+  - name: auth
+    description: |
+      Логін, ротація refresh-токена і логаут. Access-токен — JWT ES256 на
+      10 хвилин у заголовку `Authorization: Bearer …`; refresh — непрозорий
+      рядок на 30 днів, що міняється на кожному рефреші.
 
 paths:
   /products:
@@ -61,6 +68,42 @@ paths:
                 $ref: '#/components/schemas/ProductPage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        default:
+          $ref: '#/components/responses/Unexpected'
+    post:
+      operationId: createProduct
+      tags: [products]
+      summary: Виставити товар
+      description: |
+        Лише для ролей `seller` і `admin`; покупець отримує `403`. Продавцем
+        товару стає власник токена — поля продавця в тілі немає.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProduct'
+      responses:
+        '201':
+          description: Товар створено
+          headers:
+            Location:
+              description: Шлях до створеного товару
+              schema:
+                type: string
+                example: /v1/products/26
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         default:
           $ref: '#/components/responses/Unexpected'
 
@@ -96,6 +139,9 @@ paths:
       summary: Список замовлень
       description: |
         Сторінка замовлень у порядку від найновішого. Пагінація — cursor (keyset).
+        Покупець бачить лише свої замовлення, адмін — усі.
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -108,6 +154,8 @@ paths:
                 $ref: '#/components/schemas/OrderPage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         default:
           $ref: '#/components/responses/Unexpected'
 
@@ -116,8 +164,11 @@ paths:
       tags: [orders]
       summary: Створити замовлення
       description: |
-        Створює замовлення з позицій кошика. Операція НЕ ідемпотентна за природою
-        HTTP, тому безпечність повтору забезпечує заголовок `Idempotency-Key`.
+        Створює замовлення з позицій кошика від імені власника токена. Операція
+        НЕ ідемпотентна за природою HTTP, тому безпечність повтору забезпечує
+        заголовок `Idempotency-Key`.
+      security:
+        - bearerAuth: []
       parameters:
         # Оголошено ІНЛАЙНОМ, а не через $ref, свідомо: `redocly bundle` не
         # розкриває внутрішні $ref, а перевірка з acceptance criteria читає
@@ -182,6 +233,8 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
@@ -196,6 +249,10 @@ paths:
       operationId: getOrder
       tags: [orders]
       summary: Одне замовлення за ідентифікатором
+      description: |
+        Лише власник замовлення або адмін. Чуже замовлення — `403`, неіснуюче — `404`.
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -207,6 +264,10 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         default:
@@ -227,6 +288,10 @@ paths:
         WebSocket-кімнату `orders:<id>` (socket.io, шлях `/socket.io/`) і в
         SSE-потік `GET /orders/{orderId}/events`. Обидва транспорти живуть поза
         `/v1` і цією спекою не описуються.
+
+        Лише роль `admin`.
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -244,6 +309,10 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -318,7 +387,119 @@ paths:
         default:
           $ref: '#/components/responses/Unexpected'
 
+  /auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: Увійти — нова сесія і перша пара токенів
+      description: |
+        Немає такого email і не той пароль — однакова відповідь `401`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Пара токенів
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /auth/refresh:
+    post:
+      operationId: refreshTokens
+      tags: [auth]
+      summary: Обміняти refresh-токен на нову пару
+      description: |
+        Кожен refresh-токен працює рівно один раз: успішний рефреш видає нову
+        пару, а старий токен позначає використаним. Повторне предʼявлення вже
+        використаного токена — ознака крадіжки: сервер відкликає всю сесію
+        (усі refresh-токени цього логіна) і відповідає `401`. Після цього `401`
+        отримує й новий токен з тієї ж сесії — потрібен новий логін.
+
+        Клієнт має рефрешити ПОСЛІДОВНО: один запит на рефреш на всі вкладки й
+        паралельні виклики. Два одночасні рефреші того самого токена сервер
+        бачить як повтор.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Нова пара токенів
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Вийти — закрити сесію і відкликати access-токен
+      description: |
+        Дві дії: усі refresh-токени сесії стають недійсними, а access-токен, з
+        яким прийшли, — і решта access-токенів цієї сесії — відкликаються до
+        свого `exp`. `503` означає, що друга дія не вдалась: повторити логаут з
+        тим самим токеном безпечно.
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Сесію закрито
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /auth/me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Хто я
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Власник токена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
 components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access-токен із `POST /auth/login` або `POST /auth/refresh` — JWT,
+        підписаний ES256, живе 10 хвилин.
 
   parameters:
     Limit:
@@ -391,6 +572,7 @@ components:
             - https://api.marketplace.example/problems/idempotency-key-reused
             - https://api.marketplace.example/problems/unknown-product
             - https://api.marketplace.example/problems/unauthenticated
+            - https://api.marketplace.example/problems/forbidden
             - https://api.marketplace.example/problems/rate-limited
             - https://api.marketplace.example/problems/service-unavailable
             - https://api.marketplace.example/problems/internal
@@ -522,6 +704,99 @@ components:
         idle_timeout_seconds:
           type: integer
           example: 1800
+
+    CreateProduct:
+      type: object
+      description: Новий товар. Продавець — власник токена, ціна — у копійках.
+      required: [title, category, price_cents, stock]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          example: Клавіатура Keychron K2
+        category:
+          type: string
+          enum: [shoes, clothing, electronics, home, sports, books]
+          example: electronics
+        price_cents:
+          type: integer
+          minimum: 1
+          example: 260000
+        stock:
+          type: integer
+          minimum: 0
+          example: 14
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: olena@marketplace.test
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          example: marketplace-dev
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          maxLength: 512
+          example: Zq3x1u0kQ8m6dB9nW2rT5yH7cJ4vL1pA0sE3fG6hK9o
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      additionalProperties: false
+      properties:
+        access_token:
+          type: string
+          description: 'JWT ES256. Іде в заголовок `Authorization: Bearer …`.'
+        refresh_token:
+          type: string
+          description: |
+            Непрозорий рядок. Працює один раз — у відповідь на рефреш приходить новий.
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Скільки секунд живе access-токен.
+          example: 600
+
+    Me:
+      type: object
+      required: [id, email, role, token_role]
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          example: 4
+        email:
+          type: string
+          example: olena@marketplace.test
+        role:
+          type: string
+          enum: [buyer, seller, admin]
+          description: Роль у базі зараз — джерело правди.
+        token_role:
+          type: string
+          enum: [buyer, seller, admin]
+          description: |
+            Роль, зашита в access-токен на момент видачі. Гарди вірять саме їй,
+            тож після зміни ролі вона відстає до наступного рефрешу.
 
     ProductPage:
       type: object
@@ -699,7 +974,20 @@ components:
             $ref: '#/components/schemas/Problem'
 
     Unauthenticated:
-      description: Сесії немає, її закрито або вона протухла.
+      description: |
+        Немає чинних креденшелів: токена немає, він зіпсований, протух,
+        відкликаний — або сесію закрито. Клієнт рефрешить токен або логіниться
+        заново.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Forbidden:
+      description: |
+        Особа відома, але права немає: не та роль або чужий ресурс. Рефреш
+        токена тут не допоможе — новий токен тієї самої особи отримає ту саму
+        відмову.
       content:
         application/problem+json:
           schema:

@@ -1,6 +1,15 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { cursorAt, decodeCursor, toPage, type KeysetRow, type Page } from '../common/cursor';
 import { DB, type Queryable } from '../db/queryable';
+import type { ProductCategory } from '../entities/product.entity';
+
+/** Тіло `POST /products` — схема `CreateProduct` зі спеки. */
+export interface NewProduct {
+  title: string;
+  category: ProductCategory;
+  price_cents: number;
+  stock: number;
+}
 
 /** Товар у формі схеми `Product` зі спеки: snake_case, id числом. */
 export interface Product {
@@ -102,6 +111,17 @@ export class ProductsRepository {
       rating_count: row.rating_count,
       units_ordered: row.units_ordered,
     };
+  }
+
+  /** Новий товар продавця `sellerId` — тіло вже перевірив валідатор спеки (`CreateProduct`). */
+  async create(sellerId: string, input: NewProduct): Promise<Product> {
+    const { rows } = await this.db.query<ProductRow>(
+      `INSERT INTO products (seller_id, category, title, price_cents, stock)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING ${COLUMNS}`,
+      [sellerId, input.category, input.title, input.price_cents, input.stock],
+    );
+    return toProduct(rows[0]);
   }
 
   /** Найновіші спершу; id — tie-breaker, той самий, що всередині курсора. */

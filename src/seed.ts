@@ -2,6 +2,7 @@ import type { EntityManager, EntityTarget, ObjectLiteral } from 'typeorm';
 import dataSource from './data-source';
 import { Order, OrderItem, Payment, PointsEntry, Product, Promotion, User } from './entities';
 import * as data from './seed-data';
+import { sql } from './db/sql';
 
 /**
  * Детермінований ідемпотентний seed: `npm run seed && npm run seed` дає ту
@@ -81,12 +82,24 @@ async function main() {
         const [{ count }] = await manager.query(`SELECT count(*)::int AS count FROM "${table}"`);
         rows.push({ table, inserted, total: count });
       }
-      return rows;
+      // Бази, засіяні до #24, мають у сід-користувачів заглушку замість хешу, і
+      // insertFixed їх не перезапише: рядки вже є. Вирівнюємо лише заглушки —
+      // справжній хеш, якщо хтось змінив пароль, лишається.
+      // sql(), а не manager.query: на UPDATE той повертає [rows, rowCount].
+      const upgraded = await sql<{ id: string }>(
+        manager,
+        `UPDATE users SET password_hash = $1
+          WHERE id = ANY($2::bigint[]) AND password_hash NOT LIKE 'scrypt$%'
+          RETURNING id`,
+        [data.SEED_PASSWORD_HASH, data.users.map((user) => user.id)],
+      );
+      return { rows, upgraded: upgraded.length };
     });
 
-    console.table(report);
-    const insertedTotal = report.reduce((sum, r) => sum + r.inserted, 0);
+    console.table(report.rows);
+    const insertedTotal = report.rows.reduce((sum, r) => sum + r.inserted, 0);
     console.log(insertedTotal === 0 ? 'Seed уже застосовано — нових рядків немає.' : `Вставлено рядків: ${insertedTotal}.`);
+    if (report.upgraded > 0) console.log(`Сід-користувачам виставлено пароль marketplace-dev: ${report.upgraded}.`);
   } finally {
     await dataSource.destroy();
   }

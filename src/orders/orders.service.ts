@@ -5,7 +5,7 @@ import { HttpProblem } from '../common/http-problem';
 import type { Page } from '../common/cursor';
 import { OrmService } from '../db/orm.service';
 import type { OrderStatus } from '../entities/order.entity';
-import { UsersRepository } from '../users/users.repository';
+import type { Principal } from '../auth/access-tokens';
 import { OrderEventsService } from './order-events.service';
 import { OrdersRepository, type Order } from './orders.repository';
 
@@ -28,38 +28,41 @@ const PREVIOUS: Partial<Record<OrderStatus, OrderStatus>> = {
   cancelled: 'pending',
 };
 
-/**
- * Власник усіх замовлень v1. Авторизації поки немає (`security: []` у спеці),
- * і тіло `CreateOrder` покупця не містить свідомо — інакше клієнт міг би
- * оформлювати від чужого імені. На #24 id прийде з токена, і цей рядок зникне.
- *
- * Від імені гостя діє будь-який HTTP-запит v1: `POST` оформлює замовлення на
- * нього, SSE-потік віддає лише його замовлення.
- */
-export const GUEST_BUYER_EMAIL = 'guest@marketplace.local';
-
 @Injectable()
 export class OrdersService {
-  private guestBuyerId?: Promise<string>;
-
   constructor(
     private readonly orders: OrdersRepository,
-    private readonly users: UsersRepository,
     private readonly orm: OrmService,
     private readonly events: OrderEventsService,
     private readonly cards: ProductCardsService,
   ) {}
 
-  page(limit: number, cursor?: string): Promise<Page<Order>> {
-    return this.orders.page(limit, cursor);
+  /** Покупець бачить лише свої замовлення, адмін — усі. Фільтр — у WHERE репозиторію. */
+  page(principal: Principal, limit: number, cursor?: string): Promise<Page<Order>> {
+    return this.orders.page(limit, cursor, principal.role === 'admin' ? null : principal.userId);
   }
 
   find(id: number): Promise<Order | null> {
     return this.orders.findById(id);
   }
 
-  isOwnedBy(id: number, email: string): Promise<boolean> {
-    return this.orders.isOwnedBy(id, email);
+  /**
+   * Замовлення для цієї особи — рівень ВЛАСНОСТІ. Перевірка стоїть тут, а не
+   * в гарді, свідомо: гард виконується до того, як ресурс завантажено, і щоб
+   * дізнатись покупця, мусив би сам іти в базу — тобто той самий запит двічі.
+   * Тут рядок уже прочитаний, і `buyer_id` у ньому є.
+   *
+   * Неіснуюче — 404, чуже — 403. Ціна 403: відповідь підтверджує, що
+   * замовлення з таким id існує. Id і так послідовні, тому тут це свідомий
+   * компроміс на користь зрозумілої клієнту відмови (README, розділ «Auth»).
+   */
+  async findFor(id: number, principal: Principal): Promise<Order> {
+    const found = await this.orders.findWithBuyer(id);
+    if (!found) throw new HttpProblem(404, `замовлення ${id} не існує`, 'not-found');
+    if (found.buyerId !== principal.userId && principal.role !== 'admin') {
+      throw new HttpProblem(403, `замовлення ${id} належить іншому покупцю`, 'forbidden');
+    }
+    return found.order;
   }
 
   /**
@@ -74,9 +77,8 @@ export class OrdersService {
    * замовленням, а в брокер її везе relay (src/outbox/). Ключ ідемпотентності
    * — теж у цій транзакції; `IdempotencyKeyTaken` звідси летить у контролер.
    */
-  async create(items: CreateOrderItem[], idempotency?: CheckoutOptions['idempotency']): Promise<Order> {
+  async create(buyerId: string, items: CreateOrderItem[], idempotency?: CheckoutOptions['idempotency']): Promise<Order> {
     const dataSource = await this.orm.get();
-    const buyerId = await this.guestBuyer();
 
     let placed: CheckoutResult;
     try {
@@ -125,15 +127,6 @@ export class OrdersService {
       throw new HttpProblem(409, `замовлення ${id} у статусі ${order.status}, перейти в ${to} не можна`, 'conflict');
     }
     return order;
-  }
-
-  /** Раз на процес: гість не змінюється, а кожен upsert лишав би мертву версію рядка. */
-  private guestBuyer(): Promise<string> {
-    this.guestBuyerId ??= this.users.ensureBuyer(GUEST_BUYER_EMAIL).catch((err: unknown) => {
-      this.guestBuyerId = undefined;
-      throw err;
-    });
-    return this.guestBuyerId;
   }
 }
 

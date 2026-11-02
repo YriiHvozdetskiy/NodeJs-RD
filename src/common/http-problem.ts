@@ -16,6 +16,7 @@ export type ProblemCode =
   | 'idempotency-key-reused'
   | 'unknown-product'
   | 'unauthenticated'
+  | 'forbidden'
   | 'rate-limited'
   | 'service-unavailable'
   | 'internal';

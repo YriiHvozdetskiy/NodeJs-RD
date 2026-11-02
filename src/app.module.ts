@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
-import { validate } from './config/env.schema';
+import { APP_GUARD } from '@nestjs/core';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { validate, type Env } from './config/env.schema';
 import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
 import { ProductsRepository } from './catalog/products.repository';
@@ -18,6 +19,12 @@ import { ProductCardsService } from './catalog/product-cards.service';
 import { SessionsService } from './sessions/sessions.service';
 import { SessionsController } from './sessions/sessions.controller';
 import { OrdersRateLimit } from './rate-limit/orders-rate-limit';
+import { AuthKeys } from './auth/keys';
+import { AccessTokens } from './auth/access-tokens';
+import { AccessDenylist } from './auth/access-denylist';
+import { AuthService } from './auth/auth.service';
+import { AuthController } from './auth/auth.controller';
+import { AuthGuard, RolesGuard } from './auth/guards';
 
 /**
  * Один модуль на весь сервіс. Розрізати на CatalogModule / OrdersModule варто
@@ -46,7 +53,7 @@ import { OrdersRateLimit } from './rate-limit/orders-rate-limit';
     DbModule,
     RedisModule,
   ],
-  controllers: [HealthController, ProductsController, OrdersController, SessionsController],
+  controllers: [HealthController, ProductsController, OrdersController, SessionsController, AuthController],
   // OrderEventsService — один екземпляр на весь модуль: у нього публікує
   // OrdersService і з нього читають і gateway, і SSE-контролер. Два екземпляри
   // означали б дві шини, і подія з однієї не дійшла б до підписників іншої.
@@ -62,6 +69,16 @@ import { OrdersRateLimit } from './rate-limit/orders-rate-limit';
     OutboxRelayService,
     SessionsService,
     OrdersRateLimit,
+    // Ключі розбираються один раз на старті, із конфігу, який zod уже перевірив.
+    { provide: AuthKeys, inject: [ConfigService], useFactory: (config: ConfigService<Env, true>) => AuthKeys.fromConfig(config) },
+    AccessTokens,
+    AccessDenylist,
+    AuthService,
+    // Глобальні гарди виконуються в порядку реєстрації: спершу «хто це»
+    // (401), потім «чи можна» (403). Обернути порядок — і анонім отримував
+    // би 403 замість 401, а клієнт не знав би, що треба залогінитись.
+    { provide: APP_GUARD, useClass: AuthGuard },
+    { provide: APP_GUARD, useClass: RolesGuard },
   ],
 })
 export class AppModule {}
