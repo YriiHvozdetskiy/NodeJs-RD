@@ -1,7 +1,7 @@
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import type { AccessDenylist } from '../../src/auth/access-denylist';
+import { DenylistUnavailable, type AccessDenylist } from '../../src/auth/access-denylist';
 import { ACCESS_TTL_SECONDS, type Principal } from '../../src/auth/access-tokens';
 import type { Queryable } from '../../src/db/queryable';
 import { aUser } from './builders';
@@ -39,13 +39,26 @@ export function authEnv(): Record<string, string> {
 export class MemoryDenylist implements Pick<AccessDenylist, 'revoke' | 'revokeFamily' | 'isRevoked'> {
   private readonly until = new Map<string, number>();
 
+  /**
+   * «Запис до Redis не доходить» — так тест відтворює dual write, що впав на
+   * другому кроці: читання працюють, записи кидають DenylistUnavailable, як
+   * справжній денилист на помилці Redis.
+   */
+  writesFail = false;
+
   async revoke(principal: Principal): Promise<void> {
+    this.write();
     this.until.set(`jti:${principal.jti}`, principal.expiresAt * 1000);
     await this.revokeFamily(principal.familyId);
   }
 
-  async revokeFamily(familyId: string): Promise<void> {
-    this.until.set(`fid:${familyId}`, Date.now() + ACCESS_TTL_SECONDS * 1000);
+  async revokeFamily(familyId: string, ttlSeconds: number = ACCESS_TTL_SECONDS): Promise<void> {
+    this.write();
+    this.until.set(`fid:${familyId}`, Date.now() + ttlSeconds * 1000);
+  }
+
+  private write(): void {
+    if (this.writesFail) throw new DenylistUnavailable('запис не дійшов (тест)');
   }
 
   async isRevoked(principal: Principal): Promise<boolean> {
