@@ -54,6 +54,30 @@ if [ "${SKIP_VAULT:-0}" = "1" ]; then
     export DB_HOST="${DBU_HOST}" DB_PORT="${DBU_PORT}" DB_USER="${DBU_USER}" \
            DB_PASSWORD="${DBU_PASS}" DB_NAME="${DBU_NAME}"
   fi
+
+  # Сам застосунок (src/db/connection.ts) читає не DB_*, а DB_URL без пароля і
+  # файл із паролем — контракт #11. Без цього блоку `npm run start:vault` під
+  # SKIP_VAULT падав на `DB_URL: expected string`: у свіжому клоні .env немає, а
+  # демо цього не бачили, бо їхній startApi() ставить DB_URL сам.
+  #
+  # Обидва значення — з того самого DATABASE_URL. Файл secrets/db_password цієї
+  # машини тут не годиться: він належить app_user, а адреса грейдера — admin.
+  # Файл тимчасовий (0600), і саме тому тут немає exec: після exec прибрати його
+  # було б нікому, а так його видаляє trap, коли команда завершилась.
+  if [ -n "${DATABASE_URL:-}" ] && [ -z "${DB_URL:-}" ]; then
+    # shellcheck source=scripts/lib/db.sh
+    source "${ROOT}/scripts/lib/db.sh"
+    parse_database_url "${DATABASE_URL}"
+    export DB_URL="postgres://${DBU_USER}@${DBU_HOST}:${DBU_PORT}/${DBU_NAME}"
+    if [ -z "${DB_PASSWORD_FILE:-}" ]; then
+      DB_PASSWORD_FILE="$(umask 077 && mktemp "${TMPDIR:-/tmp}/marketplace-db-password.XXXXXX")"
+      export DB_PASSWORD_FILE
+      trap 'rm -f "${DB_PASSWORD_FILE}"' EXIT
+      printf '%s' "${DBU_PASS}" > "${DB_PASSWORD_FILE}"
+      "$@"
+      exit 0
+    fi
+  fi
   exec "$@"
 fi
 
