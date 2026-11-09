@@ -9,7 +9,7 @@ import { DB, type Queryable } from '../db/queryable';
 import { sql } from '../db/sql';
 import type { UserRole } from '../entities/user.entity';
 import { AccessDenylist, DenylistUnavailable } from './access-denylist';
-import { AccessTokens, type Principal } from './access-tokens';
+import { ACCESS_TTL_SECONDS, AccessTokens, type Principal } from './access-tokens';
 import { dummyHash, verifyPassword } from './passwords';
 
 /** Скільки живе сесія від логіна. Ротація цю межу не відсуває. */
@@ -24,16 +24,17 @@ export interface TokenPair {
 }
 
 /**
- * Чим закінчився рефреш. Усі гілки, крім `rotated`, — 401 для клієнта, але
- * для сервера вони різні: `reuse` — єдина, що змінює стан бази (відкликає
- * сімʼю), і саме тому транзакція повертає результат, а не кидає виняток —
- * виняток відкотив би це відкликання разом із транзакцією.
+ * Чим закінчився рефреш. Усі гілки, крім `rotated`, — 401 для клієнта (або
+ * 503, якщо не вдалось дописати денилист), але для сервера вони різні:
+ * `reuse` — єдина, що змінює стан бази (відкликає сімʼю), і саме тому
+ * транзакція повертає результат, а не кидає виняток — виняток відкотив би це
+ * відкликання разом із транзакцією.
  */
 type RefreshOutcome =
   | { kind: 'rotated'; pair: TokenPair }
   | { kind: 'unknown' }
   | { kind: 'expired' }
-  | { kind: 'revoked' }
+  | { kind: 'revoked'; familyId: string; denyTtl: number }
   | { kind: 'reuse'; familyId: string; userId: string; tokenId: string; revoked: number };
 
 interface RefreshRow {
@@ -44,6 +45,8 @@ interface RefreshRow {
   revoked: boolean;
   expired: boolean;
   expires_at: Date;
+  /** Скільки секунд ще може жити останній access-токен відкликаної сімʼї; null — не відкликана. */
+  deny_ttl: number | null;
   role: UserRole;
 }
 
@@ -114,13 +117,16 @@ export class AuthService {
             `сімʼю відкликано, живих refresh-токенів у ній було: ${outcome.revoked}`,
         );
         // Access-токен злодія ще живий до exp — закриваємо сімʼю й у денилисті.
-        // Redis упав — сімʼя в базі вже мертва, новий access ніхто не отримає,
-        // а наявні доживуть щонайбільше ACCESS_TTL_SECONDS.
-        await this.denylist.revokeFamily(outcome.familyId).catch((err: unknown) => {
-          this.logger.error(`family=${outcome.familyId}: денилист недоступний (${err instanceof Error ? err.message : String(err)})`);
-        });
+        await this.denyFamily(outcome.familyId, ACCESS_TTL_SECONDS);
         throw new HttpProblem(401, 'refresh-токен уже використано — сесію відкликано, потрібен новий логін', 'unauthenticated');
       case 'revoked':
+        // Після ревʼю #24. Сюди приходить і повтор після 503 з гілки вище:
+        // сімʼя в базі вже мертва, а запис у денилист міг не дійти. Тому й тут
+        // сімʼя пишеться в денилист — ідемпотентно, на залишок життя її
+        // останнього access-токена. Без цього повтор клієнта отримав би 401,
+        // а токен злодія жив би до exp. Давно відкликані сімʼї (denyTtl ≤ 0)
+        // не чіпаємо: їхніх живих токенів уже немає.
+        if (outcome.denyTtl > 0) await this.denyFamily(outcome.familyId, outcome.denyTtl);
         throw new HttpProblem(401, 'сесію відкликано — потрібен новий логін', 'unauthenticated');
       case 'expired':
         throw new HttpProblem(401, 'refresh-токен протух — потрібен новий логін', 'unauthenticated');
@@ -143,6 +149,10 @@ export class AuthService {
    * змінює, крок 2 нарешті проходить. Зворотний порядок був би гірший: Redis
    * встиг, Postgres ні — і клієнт із живим refresh просто взяв би новий
    * access, тобто логаут не відбувся б узагалі.
+   *
+   * Клієнт, що так і не повторив логаут, теж не лишає дірки: revoked_at уже в
+   * базі, і `AccessDenylist.resync()` допише сімʼю в денилист, щойно Redis
+   * підніметься (після ревʼю #24).
    */
   async logout(principal: Principal): Promise<void> {
     const { rowCount } = await this.db.query(
@@ -177,17 +187,18 @@ export class AuthService {
               rt.used_at IS NOT NULL AS used,
               rt.revoked_at IS NOT NULL AS revoked,
               rt.expires_at <= now() AS expired,
+              ceil(extract(epoch FROM rt.revoked_at + make_interval(secs => $2) - now()))::int AS deny_ttl,
               u.role
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
         WHERE rt.token_hash = $1
           FOR UPDATE OF rt`,
-      [this.hash(refreshToken)],
+      [this.hash(refreshToken), ACCESS_TTL_SECONDS],
     );
     if (!row) return { kind: 'unknown' };
     // Порядок перевірок важливий: відкликаний токен міг бути й використаним,
     // і тоді це не новий сигнал компрометації, а відгомін уже обробленого.
-    if (row.revoked) return { kind: 'revoked' };
+    if (row.revoked) return { kind: 'revoked', familyId: row.family_id, denyTtl: row.deny_ttl ?? 0 };
     if (row.used) {
       const revoked = await sql<{ id: string }>(
         manager,
@@ -210,6 +221,27 @@ export class AuthService {
     // отримав, і наступна спроба клієнта виглядала б як повтор.
     const issued = await this.access.issue({ id: row.user_id, role: row.role }, row.family_id);
     return { kind: 'rotated', pair: pair(issued.token, next, issued.expiresIn) };
+  }
+
+  /**
+   * Сімʼя в денилист — або 503. Після ревʼю #24: раніше помилку Redis тут
+   * ковтав `.catch`, і access злодія жив до exp без жодного повтору. Тепер
+   * клієнт отримує 503 і повторює рефреш; той самий токен приходить у гілку
+   * `revoked`, яка дописує сімʼю вдруге. Якщо не повторить ніхто — запис
+   * відновить `AccessDenylist.resync()`, щойно Redis підніметься.
+   */
+  private async denyFamily(familyId: string, ttlSeconds: number): Promise<void> {
+    try {
+      await this.denylist.revokeFamily(familyId, ttlSeconds);
+    } catch (err) {
+      if (!(err instanceof DenylistUnavailable)) throw err;
+      this.logger.error(`family=${familyId}: денилист недоступний (${err.message}) — 503, чекаю на повтор або resync`);
+      throw new HttpProblem(
+        503,
+        `сесію відкликано, але access-токени цієї сесії ще не закриті: денилист недоступний (${err.message}) — повтори запит`,
+        'service-unavailable',
+      );
+    }
   }
 
   /** HMAC, а не голий SHA-256: без перцю зі сховища хеш у дампі не перевірити. */

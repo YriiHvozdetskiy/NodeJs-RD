@@ -429,6 +429,10 @@ paths:
         Клієнт має рефрешити ПОСЛІДОВНО: один запит на рефреш на всі вкладки й
         паралельні виклики. Два одночасні рефреші того самого токена сервер
         бачить як повтор.
+
+        `503` — сесію відкликано, але access-токени цієї сесії ще не закриті:
+        сховище відкликаних токенів недоступне. Повтор того самого запиту
+        безпечний і доводить відкликання до кінця.
       requestBody:
         required: true
         content:
@@ -446,6 +450,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Unexpected'
 

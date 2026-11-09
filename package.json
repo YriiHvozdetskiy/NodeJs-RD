@@ -49,6 +49,7 @@
     "demo:auth": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-auth.js",
     "demo:reuse": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-reuse.js",
     "demo:rbac": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-rbac.js",
+    "demo:resync": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-resync.js",
     "keys:init": "node scripts/jwt-keys.mjs init",
     "keys:rotate": "node scripts/jwt-keys.mjs rotate",
     "keys:retire": "node scripts/jwt-keys.mjs retire",

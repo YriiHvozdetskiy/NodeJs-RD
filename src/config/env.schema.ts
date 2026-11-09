@@ -81,9 +81,14 @@ export const envSchema = z.object({
   REDIS_CACHE_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
 
   /**
-   * Redis під чергу BullMQ, сесії й вікна rate-limit (#23) — БЕЗ пароля.
-   * Інстанс із noeviction + AOF: тут лежить те, що не можна губити мовчки.
-   * Без нього немає сесій (503) і ліміту на POST /v1/orders.
+   * Redis під чергу BullMQ, сесії, вікна rate-limit (#23) і денилист
+   * access-токенів (#24) — БЕЗ пароля. Інстанс із noeviction + AOF: тут
+   * лежить те, що не можна губити мовчки.
+   *
+   * У схемі опційна, бо сесії й ліміт без неї просто вимкнені, а тести
+   * ходять без Redis. Але застосунок без неї не стартує: денилист
+   * (src/auth/access-denylist.ts) падає на збиранні DI з назвою цієї змінної —
+   * логаут без денилиста не відкликав би access-токени.
    */
   REDIS_QUEUE_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
 
