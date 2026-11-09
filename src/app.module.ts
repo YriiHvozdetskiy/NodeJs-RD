@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { validate, type Env } from './config/env.schema';
 import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
+import { Lifecycle } from './health/lifecycle';
 import { ProductsRepository } from './catalog/products.repository';
 import { ProductsController } from './catalog/products.controller';
 import { OrdersRepository } from './orders/orders.repository';
@@ -62,6 +63,8 @@ import { FilesController } from './files/files.controller';
   // OrdersService і з нього читають і gateway, і SSE-контролер. Два екземпляри
   // означали б дві шини, і подія з однієї не дійшла б до підписників іншої.
   providers: [
+    // Стан для readinessProbe (#28): прогрів скінчився / почався дренаж.
+    Lifecycle,
     ProductsRepository,
     ProductCardsService,
     OrdersRepository,

@@ -89,9 +89,45 @@ if [ "${SKIP_VAULT:-0}" = "1" ]; then
   exec "$@"
 fi
 
+# Оточення kind (#28): npm run up / destroy / demo:rollout. Значення їдуть у
+# Pulumi-програму (infra/), а вона кладе їх у K8s Secret — не в процес застосунку.
+#
+#   bash scripts/with-secrets.sh kind bash scripts/infra.sh up
+#
+# Адреси — топологія кластера, яку створює сама програма: сервіси marketplace-db
+# і marketplace-redis у namespace marketplace. Секрети — ті самі файли, що для dev:
+# пароль БД, пароль Redis, ключі JWT і перець, плюс ключ шифрування стану Pulumi.
+# Брокера, кешу й сховища файлів у kind немає — їхні змінні експортуються
+# порожніми: порожнє значення застосунок читає як «вимкнено», а відсутню змінну
+# програма вважає зламаним експортом і падає з її назвою (infra/vault.ts).
+if [ "${ENV_SLUG}" = "kind" ]; then
+  for f in db_password redis_password pulumi_passphrase jwt/dev/private.pem jwt/dev/public.pem jwt/dev/kid jwt/dev/refresh_pepper; do
+    [ -f "${ROOT}/secrets/${f}" ] || { echo "with-secrets: немає secrets/${f}. Спершу: npm run db:up" >&2; exit 1; }
+  done
+  export DB_URL="postgres://marketplace@marketplace-db:5432/marketplace"
+  DB_PASSWORD="$(cat "${ROOT}/secrets/db_password")"
+  REDIS_QUEUE_URL="redis://default:$(cat "${ROOT}/secrets/redis_password")@marketplace-redis:6379"
+  JWT_PRIVATE_KEY="$(base64 < "${ROOT}/secrets/jwt/dev/private.pem" | tr -d '\n')"
+  JWT_PUBLIC_KEY="$(base64 < "${ROOT}/secrets/jwt/dev/public.pem" | tr -d '\n')"
+  JWT_KID="$(cat "${ROOT}/secrets/jwt/dev/kid")"
+  REFRESH_TOKEN_PEPPER="$(cat "${ROOT}/secrets/jwt/dev/refresh_pepper")"
+  JWT_PREVIOUS_PUBLIC_KEY=""; JWT_PREVIOUS_KID=""
+  if [ -f "${ROOT}/secrets/jwt/dev/previous_public.pem" ]; then
+    JWT_PREVIOUS_PUBLIC_KEY="$(base64 < "${ROOT}/secrets/jwt/dev/previous_public.pem" | tr -d '\n')"
+    JWT_PREVIOUS_KID="$(cat "${ROOT}/secrets/jwt/dev/previous_kid")"
+  fi
+  PULUMI_CONFIG_PASSPHRASE="$(cat "${ROOT}/secrets/pulumi_passphrase")"
+  export DB_PASSWORD REDIS_QUEUE_URL JWT_PRIVATE_KEY JWT_PUBLIC_KEY JWT_KID REFRESH_TOKEN_PEPPER \
+         JWT_PREVIOUS_PUBLIC_KEY JWT_PREVIOUS_KID PULUMI_CONFIG_PASSPHRASE
+  export BROKER_URL="" REDIS_CACHE_URL="" \
+         STORAGE_ENDPOINT="" STORAGE_BUCKET="" STORAGE_ACCESS_KEY="" STORAGE_SECRET_KEY=""
+  export PULUMI_BACKEND_URL="${PULUMI_BACKEND_URL:-file://${ROOT}/.pulumi}"
+  exec "$@"
+fi
+
 case "${ENV_SLUG}" in
   dev) ;;
-  *) echo "with-secrets: невідоме оточення '${ENV_SLUG}' (є лише dev)" >&2; exit 2 ;;
+  *) echo "with-secrets: невідоме оточення '${ENV_SLUG}' (є dev і kind)" >&2; exit 2 ;;
 esac
 
 ENV_FILE="${ROOT}/.env"

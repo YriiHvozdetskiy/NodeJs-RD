@@ -24,6 +24,23 @@ export const envSchema = z.object({
   /** Порт HTTP-сервера. */
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
 
+  /**
+   * Прогрів до `listen()`, мс (#28). Імітує те, що в справжнього сервісу займає
+   * секунди: міграції, прогрів пулу, кешу. Поки слухача немає, запит отримує
+   * «connection refused» — і саме це вікно видно під час rolling update без
+   * readinessProbe. Локально 0; у кластері розгортання ставить 4000.
+   */
+  WARMUP_MS: z.coerce.number().int().min(0).max(120_000).default(0),
+
+  /**
+   * Дренаж після SIGTERM, мс (#28): скільки процес ще відповідає, уже кажучи
+   * readinessProbe «не готовий», перш ніж закрити сокет. Цей час потрібен
+   * kube-proxy, щоб прибрати под з балансування. Має бути меншим за
+   * terminationGracePeriodSeconds, інакше SIGKILL прийде посеред дренажу.
+   * Локально 0: Ctrl+C і демо зупиняють процес одразу.
+   */
+  DRAIN_MS: z.coerce.number().int().min(0).max(60_000).default(0),
+
   /** Рівень логування. Поки читається лише на старті — логер приїде пізніше. */
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 

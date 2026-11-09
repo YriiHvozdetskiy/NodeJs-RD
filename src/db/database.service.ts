@@ -55,7 +55,7 @@ export class DatabaseService implements OnModuleDestroy, Queryable {
   }
 
   /**
-   * `app.enableShutdownHooks()` у main.ts доводить сюди SIGTERM: пул дочікує
+   * Обробник SIGTERM у main.ts після дренажу викликає `app.close()`, і той доводить сюди: пул дочікує
    * активні запити й закриває сокети сам, замість того щоб їх обірвало SIGKILL.
    */
   async onModuleDestroy(): Promise<void> {

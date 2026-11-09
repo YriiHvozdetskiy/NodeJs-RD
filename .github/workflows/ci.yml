@@ -12,6 +12,27 @@ permissions:
   contents: read
 
 jobs:
+  # ДЗ #28: production-образ і сканування з порогом. Вердикт рахує сам
+  # scripts/scan.sh із JSON-звіту Trivy; поріг — ratchet «не гірше, ніж зараз»
+  # (README, розділ Kubernetes). Джоба червона, щойно знахідок CRITICAL+HIGH
+  # стало більше за SCAN_MAX.
+  image-scan:
+    name: image + scan gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Приватного реєстру немає — секрет етапу збірки тут приманка. Значення
+      # унікальне на прогін і в образ не потрапляє (перевіряє demo:image).
+      - name: секрет етапу збірки
+        run: printf 'ci-decoy-%s' "${{ github.run_id }}" > .npm_token
+      - run: npm run image:build
+      - run: npm run demo:image
+      - name: scan gate
+        run: SCAN_MAX=12 npm run scan
+
   tests:
     name: integration + e2e
     runs-on: ubuntu-latest

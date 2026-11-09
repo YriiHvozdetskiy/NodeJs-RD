@@ -363,6 +363,10 @@ docker inspect --format '{{.Config.Env}}' marketplace-api
 docker history --no-trunc marketplace-api | grep -i password   # порожньо
 ```
 
+З #28 образ один — `docker/Dockerfile` (`npm run image:build`), і в distroless немає
+навіть `ls`. Ті самі канали — історію, конфіг і байти шарів — тепер перевіряє
+`npm run demo:image` (розділ Kubernetes).
+
 Перший канал — файл із build-контексту, що заїхав у шар; його ріже
 `.dockerignore`. Другий — `ENV SECRET=…` у самому `Dockerfile`: він живе не у
 файловій системі, а в **конфігу образу**, і `.dockerignore` до нього не має
@@ -2867,6 +2871,402 @@ Glacier ламає RTO: обʼєкт спершу треба відновити,
   `s3:ListMultipartUploadParts` на `uploads/*`, а в CloudFront — лише
   `s3:GetObject` на `assets/*`, як у політиці вище.
 
+## Kubernetes
+
+На #5 питання було «чи запуститься образ». Тепер інше: чи переживе сервіс
+оновлення під навантаженням. Відповідь на нього — не «у нас проби», а число з
+лічильника: скільки запитів під час rolling update лишились без відповіді 200.
+
+```
+npm run image:build ─► marketplace-api:hw28 (distroless, uid 65532) ─► kind load
+                                                                          │
+kind «marketplace», один вузол                                           ▼
+ └─ namespace marketplace
+     ├─ marketplace-db       Postgres 17, emptyDir         ◄─ Secret marketplace-db-*
+     ├─ marketplace-redis    Redis черги (денилист #24)    ◄─ Secret marketplace-redis-*
+     ├─ marketplace-migrate  Job: typeorm migration:run
+     └─ marketplace-api      Deployment ×3 ◄─ envFrom: Secret marketplace-api-env-*
+          ├─ Service NodePort 30880 ─► 127.0.0.1:22880 на хості
+          ├─ PodDisruptionBudget maxUnavailable: 1
+          └─ HorizontalPodAutoscaler autoscaling/v2, 2…6, CPU 70 %
+```
+
+Усе в кластері описує Pulumi-програма `infra/` (TypeScript). `kubectl apply`
+не використовується ніде: `kubectl` у скриптах лише читає стан і виселяє под у
+`demo:pdb`.
+
+### Запуск
+
+```bash
+printf 'npm_decoy_%s' "$(openssl rand -hex 12)" > .npm_token   # секрет етапу збірки, у git його немає
+npm run image:build     # docker/Dockerfile → marketplace-api:hw28
+npm run demo:image      # stages · shell-inside · runtime-uid · token-in-history|config|layers
+npm run scan            # Trivy з порогом: gate=pass|fail
+npm run cluster:up      # kind create + kind load docker-image
+npm run up              # pulumi up; секрети — через scripts/with-secrets.sh kind
+npm run demo:rollout    # rolling update під навантаженням: failed=0
+npm run demo:pdb        # evict-1=201 · evict-2=429
+npm run destroy && npm run cluster:down
+```
+
+Після кожного `image:build` — знову `cluster:up`: образ, зібраний на хості, у
+кластері не існує, і без `kind load` под висить в `ErrImagePull`.
+
+### Інструменти: kind і Pulumi без установки
+
+kind і Pulumi CLI я на машину не ставив. Якщо їх немає в `PATH`, скрипти
+запускають ті самі версії з контейнера `marketplace-tools:hw28`
+(`docker/tools.Dockerfile`: kind v0.32.0 з перевіркою sha256, Pulumi CLI
+3.272.0 — та сама версія, що `@pulumi/pulumi` в `infra/`). Є в системі — беруться
+звідти, і контейнер не потрібен.
+
+Це працює, бо kind кластер не запускає — він лише командує Docker. Контейнер
+отримує сокет Docker, і вузол kind стає сусіднім контейнером у тому самому Docker,
+а не вкладеним. Pulumi з контейнера ходить до API-сервера через Docker-мережу
+`kind` (`.kind/kubeconfig-internal`, адреса `marketplace-control-plane:6443`):
+`127.0.0.1` із хостового kubeconfig у контейнері — це сам контейнер. Змінні
+сховища обгортка передає іменами (`docker run -e NAME`): незадана на хості не
+з'являється в контейнері, порожня приходить порожньою — на цій різниці тримається
+перевірка конфігу (нижче).
+
+Ціна: сокет Docker — це повний доступ до Docker. Рівно стільки ж має kind,
+встановлений на машину; образ збирається з запінених версій.
+
+Щоб команди з README на кшталт `cd infra && pulumi preview` знаходили обгортку:
+
+```bash
+export PATH="$PWD/scripts/bin:$PATH"
+```
+
+### Кластер
+
+Підіймав на **kind v0.32.0** (Kubernetes 1.36.1), один вузол. Docker Desktop має
+7,7 ГіБ; окремого ліміту вузлу kind не задає, тож пам'ять — виміряна, а не виділена:
+весь вузол разом із control-plane займає **1,49 ГіБ**. З них kube-apiserver — 345 МБ,
+кожен под API — 74–77 МБ, Postgres — 33 МБ, Redis — 10 МБ. Межі подів задано в
+програмі: API `requests 160Mi / limits 384Mi` (×3, на rollout ×4), Postgres
+`64Mi / 256Mi`, Redis `16Mi / 128Mi`. Кластер готовий за 18 с після `kind create`;
+перший раз — 48 с разом із pull образу вузла.
+
+kind, а не minikube. На лекції обидва міряли послідовно на Docker із 3,8 ГіБ:
+kind стартує за ≈ 10 с проти 18,7 с, вузол займає 522–545 МіБ проти 617–767 МіБ,
+знесення 0,5 с проти 1,8 с, Kubernetes 1.36 проти 1.33, а minikube менше ніж на
+1800 МБ не стартує взагалі. Для запуску без установки є ще одна причина: kind —
+один бінарник, що лише командує Docker, і його легко загорнути в контейнер.
+У minikube перевага одна — `addons enable metrics-server` вмикає HPA наживо; у kind
+HPA показує `cpu: <unknown>/70%`, і для цього ДЗ це очікувано.
+
+### Змінні
+
+Pulumi-програма читає їх першою дією, до будь-якого звернення в кластер
+(`infra/vault.ts`). Значення приїжджають через ту саму обгортку, що з #11:
+`npm run up` = `bash scripts/with-secrets.sh kind bash scripts/infra.sh up`.
+Програма кладе їх у K8s Secret, а Deployment бере посиланням — у маніфесті
+Deployment значень немає.
+
+| Змінна | Джерело | У кластері |
+| --- | --- | --- |
+| `DB_URL` | сховище (#11); для kind — адреса сервісу `marketplace-db` | Secret `marketplace-api-env-*` → `envFrom` |
+| `DB_PASSWORD` | сховище (#11): `secrets/db_password` | Secret `marketplace-db-*`: Postgres бере `secretKeyRef`, API — файлом (`DB_PASSWORD_FILE`, ротація #11 без рестарту) |
+| `REDIS_QUEUE_URL` | сховище (#11): пароль із `secrets/redis_password` усередині URL | Secret API; пароль із URL — ще й у Secret `marketplace-redis-*` для `--requirepass` |
+| `JWT_PRIVATE_KEY` | сховище (#11): `secrets/jwt/dev/private.pem` | Secret API |
+| `JWT_PUBLIC_KEY` | сховище (#11): `secrets/jwt/dev/public.pem` | Secret API |
+| `JWT_KID` | сховище (#11): `secrets/jwt/dev/kid` | Secret API |
+| `REFRESH_TOKEN_PEPPER` | сховище (#11): `secrets/jwt/dev/refresh_pepper` | Secret API |
+| `JWT_PREVIOUS_PUBLIC_KEY` | сховище (#11), лише під час overlap; інакше порожня | Secret API, якщо непорожня |
+| `JWT_PREVIOUS_KID` | сховище (#11), лише під час overlap; інакше порожня | Secret API, якщо непорожня |
+| `BROKER_URL` | сховище (#11); у kind порожня — брокера там немає | Secret API, якщо непорожня |
+| `REDIS_CACHE_URL` | сховище (#11); у kind порожня — кешу там немає | Secret API, якщо непорожня |
+| `STORAGE_ENDPOINT` | сховище (#11); у kind порожня | Secret API, якщо непорожня |
+| `STORAGE_BUCKET` | сховище (#11); у kind порожня | Secret API, якщо непорожня |
+| `STORAGE_ACCESS_KEY` | сховище (#11); у kind порожня | Secret API, якщо непорожня |
+| `STORAGE_SECRET_KEY` | сховище (#11); у kind порожня | Secret API, якщо непорожня |
+| `PULUMI_CONFIG_PASSPHRASE` | сховище (#11): `secrets/pulumi_passphrase`, генерує `npm run db:up` | ключ шифрування стану Pulumi в `.pulumi/` |
+| `PULUMI_BACKEND_URL` | оточення; за замовчуванням `file://<репо>/.pulumi` | локальний бекенд стану, без `pulumi login` |
+
+Два види «немає значення». Без змінної з першої групи (`DB_URL`, `DB_PASSWORD`,
+`REDIS_QUEUE_URL`, ключі JWT, перець) застосунок не стартує — програма падає й
+називає її. Брокер, кеш, сховище файлів і overlap-ключ застосунок уміє вимикати:
+порожній рядок означає «вимкнено», і обгортка для kind експортує їх саме
+порожніми. Але відсутня змінна — це вже зламаний експорт сховища, і програма
+теж падає з її назвою. Інакше друкарська помилка в обгортці мовчки вимкнула б
+фічу. Дефолтів у програмі немає жодного: `?? "changeme"` перетворив би «забули
+пароль» на «задеплоїли з відомим паролем».
+
+Помилки збираються всі одразу, як у `env.schema.ts`:
+
+```
+error: Конфіг розгортання неповний (1):
+  REFRESH_TOKEN_PEPPER: не задано — без неї застосунок не стартує
+```
+
+`DB_URL` і `REDIS_QUEUE_URL` мусять вказувати на сервіси, які піднімає сама
+програма: інший хост — падіння з поясненням ще до кластера. На #31 Postgres стане
+RDS, `DB_URL` зі сховища вказуватиме туди, а `infra/backing.ts` для того оточення
+просто не створюватиметься.
+
+### Образ
+
+`docker/Dockerfile` — дві стадії. Збірка — `node:24-slim` з npm і tsc; запуск —
+`gcr.io/distroless/nodejs24-debian12:nonroot`: лише node, glibc і сертифікати.
+Кореневий односхідцевий `Dockerfile` з #11 видалено — образ тепер один.
+
+```
+$ npm run demo:image
+image=marketplace-api:hw28
+size-mb=241
+stages=2
+shell-inside=0
+runtime-uid=65532
+token-in-history=0
+token-in-config=0
+token-in-layers=0
+```
+
+Distroless тут не заради розміру. Виграш у тому, чого бракує після RCE: у
+контейнері немає ні `sh`, ні `apt`, ні `curl`. `shell-inside` демо перевіряє
+запуском `docker run --entrypoint sh`, а не читанням Dockerfile: база від чужого
+образу могла б принести shell без мого відома. `USER 65532:65532` — числом:
+kubelet при `runAsNonRoot` імена не резолвить і падає з
+`CreateContainerConfigError`. HEALTHCHECK — exec-формою через сам node, бо
+shell-форми в distroless немає.
+
+**Секрет етапу збірки.** Приватного реєстру в проєкту немає, тож `.npm_token` —
+приманка з випадковим рядком. Вона доходить до `npm ci` лише через
+`RUN --mount=type=secret,id=npm_token`, а `docker/npmrc` (скоуп
+`@marketplace-private` → приватний реєстр, `_authToken=${NPM_TOKEN}`) —
+bind-mount-ом. У шарах немає ні файла, ні значення; у `docker history` лишається
+текст команди з `$(cat …)`, а не токен.
+
+`demo:image` шукає токен у трьох місцях, бо жоден інструмент не бачить обидва
+витоки: `ARG` видно в історії й конфігу, а `COPY` + `rm` наступним шаром — лише в
+байтах шару (rm додає whiteout, а попередній шар лишається). Шари — з
+розпакованого `docker save`, список — з його `manifest.json`. Щоб показати, що
+лічильник витік бачить, `CONTROL=1 npm run demo:image` збирає навмисно дірявий
+образ (`ARG` → `ENV` і `COPY` токена) на тій самій базі:
+
+```
+control-token-in-history=2
+control-token-in-config=1
+control-token-in-layers=1
+```
+
+Історія — два рядки (`ARG` і `ENV`), конфіг — `ENV`, шари — шар із `COPY`. На
+справжньому образі ті самі лічильники дають нулі, і це вже не «нічого не знайшов,
+бо не вміє шукати».
+
+`npm ci --ignore-scripts`: для збірки потрібен лише tsc, а install-скрипти
+залежностей — найкоротший шлях supply-chain атаки. Те саме правило, що
+`allowBuilds` у `pnpm-workspace.yaml`.
+
+### Сканування з порогом
+
+`npm run scan` — Trivy 0.74.0 контейнером. Образ іде в сканер архівом `docker save`,
+а не через сокет Docker: сканеру не потрібен доступ до демона. Скрипт рахує
+знахідки з JSON-звіту й порівнює з `SCAN_MAX`; вердикт і код виходу — з цього
+порівняння:
+
+```
+$ SCAN_MAX=-1 npm run scan        $ SCAN_MAX=99999 npm run scan
+image=marketplace-api:hw28        image=marketplace-api:hw28
+severity=CRITICAL,HIGH            severity=CRITICAL,HIGH
+found=12                          found=12
+fixable=12                        fixable=12
+max-allowed=-1                    max-allowed=99999
+gate=fail          → exit 1       gate=pass          → exit 0
+```
+
+12 знахідок CRITICAL + HIGH, і всі мають виправлену версію:
+
+- 7 — `libssl3 3.0.18` у базі distroless. Лікується новим digest-ом бази, коли Google
+  його перезбере; власний `apt upgrade` у distroless неможливий — там немає apt.
+- 5 — `multer 2.2.0` і `body-parser 2.3.0`, які тягне `@nestjs/platform-express`
+  і `express`. Лікується оновленням Nest, окремим кроком із перевіркою контракту.
+
+Робочий поріг у CI — `SCAN_MAX=12`, «не гірше, ніж зараз» (ratchet): джоба
+`image + scan gate` у `.github/workflows/ci.yml` червоніє, щойно знахідок стало
+більше. Нульовий поріг зробив би CI червоним через базу, на яку я не впливаю, а
+база вразливостей оновлюється щодоби — тому і число в README, і `found` завтра
+можуть бути інші.
+
+### Проби й rolling update
+
+Три проби на два різні питання:
+
+| Проба | Шлях | Питання | Що робить kubelet, коли «ні» |
+| --- | --- | --- | --- |
+| `startupProbe` | `/health` | застосунок уже стартував? | чекає до 60 × 1 с; liveness і readiness поки не виконуються |
+| `readinessProbe` | `/health/ready` | можна слати трафік? | прибирає под з балансування (EndpointSlice) |
+| `livenessProbe` | `/health` | треба вбити? | перезапускає контейнер |
+
+`/health/ready` відповідає 200 лише після прогріву й першого вдалого зʼєднання з
+БД і стає 503 з першої миті після SIGTERM. У БД на кожній пробі він не ходить: при
+короткому збої бази неготовими стали б УСІ поди одразу, і частково зламаний
+сервіс перетворився б на «connection refused» для кожного запиту. Стан бази окремо
+показує `/health/db`. Liveness на `/health/ready` перезапускала б под щоразу, коли
+він тимчасово не готовий, — і під час дренажу теж.
+
+`startupProbe` замість `initialDelaySeconds` у liveness: з ним у застосунку є до
+60 с на старт, а після старту зависання liveness ловить за 30 с
+(`periodSeconds: 10 × failureThreshold: 3`). З `initialDelaySeconds: 60` ловила б
+за 60 + 30 с на кожному рестарті, а старт довший за 60 с однаково вбивав би под.
+
+**SIGTERM — у правильному порядку** (`src/main.ts`):
+
+1. `readiness` → 503. kubelet побачить це на наступній пробі (`periodSeconds: 1`),
+   EndpointSlice втратить под, kube-proxy перепише правила — усе це не миттєво;
+2. дренаж `DRAIN_MS=5000`: процес відповідає на все, що ще встигло прийти;
+3. `app.close()`: сокет закривається, прийняті запити дороблюються, пули БД і Redis
+   закриваються в хуках модулів, вихід 0.
+
+`app.enableShutdownHooks()` з #11 прибрано: він на SIGTERM одразу робив `close()` —
+відмову новим зʼєднанням у той момент, коли балансувальник ще шле трафік. Node у
+distroless — PID 1, і без власного обробника SIGTERM ігнорувався б до SIGKILL.
+
+`WARMUP_MS=4000` — пауза до `listen()`, як у сервісу з міграціями й прогрівом пулу.
+Без неї поганий профіль показав би нуль збоїв лише тому, що застосунок стартує
+швидше, ніж встигає зламатись.
+
+Чотири налаштування, які дають нуль (`infra/api.ts`, профіль `good`):
+
+1. `maxUnavailable: 0`, `maxSurge: 1` — старий под іде, лише коли новий сказав «готовий»;
+2. `terminationGracePeriodSeconds: 20` — більше за дренаж 5 с плюс `close()`;
+3. `readinessProbe` з `periodSeconds: 1`;
+4. `livenessProbe` на інший шлях.
+
+Профіль `bad` — для порівняння: без проб, `maxUnavailable: 1`, без дренажу.
+Проби в програмі — окремим типізованим обʼєктом, а не умовним spread усередині
+контейнера: у spread TypeScript не перевіряє зайвих полів, і одруківка
+`readinesProbe` пройшла б `tsc` мовчки.
+
+**Вимір.** `demo:rollout` б'є в `GET /v1/products?limit=1` чотирма потоками, кожен
+запит — нове TCP-зʼєднання (keep-alive приклеїв би генератор до одного пода).
+Генератор пише в файл код кожної відповіді; `000` — відповіді не було. Нова ревізія
+— `rev` у конфігу стеку і `pulumi up`: rollout запускає зміна pod-шаблону, а не
+образ під тим самим тегом. Числа рахуються з файла:
+
+| Профіль | Запитів | 200 | Без відповіді | rollout |
+| --- | ---: | ---: | ---: | ---: |
+| good | 9093 | 9093 | **0** | 15,9 с |
+| good | 9146 | 9146 | **0** | 16,0 с |
+| good | 9111 | 9111 | **0** | 16,0 с |
+| bad | 8685 | 8122 | 563 (6,5 %) | 0,8 с |
+| bad | 8680 | 8141 | 539 (6,2 %) | 0,7 с |
+| bad | 8863 | 8136 | 727 (8,2 %): 720 `ECONNRESET`, 7 `ETIMEDOUT` | 0,7 с |
+
+Нуль на `good` відтворюється, а не випадає раз. Частка збоїв на `bad` плаває —
+6–8 % на цій машині. Тривалість стабільна в межах профілю, і `good` у двадцять
+разів довший. Це ціна нуля, а не баг. `bad` «завершується» за секунду, бо без
+readinessProbe новий под вважається доступним, щойно стартував контейнер, —
+хоча слухача ще 4+ с немає. А старі поди з `DRAIN_MS=0` закривають сокет одразу.
+`good` чекає на кожен новий под (`maxUnavailable: 0`), і дренаж додає 5 с на
+кожен старий.
+
+Збої на `bad` приходять як `ECONNRESET`, а не `ECONNREFUSED`. Між генератором і
+подом стоїть проброс порту Docker Desktop: він уже прийняв зʼєднання від клієнта,
+і відмову пода без слухача віддає далі як обрив. Ще один шар проксі — і той самий
+збій став би 502.
+
+**Чому генератор обмежено 200 запитами/с.** Перший прогін `good` без обмеження
+дав `failed=5` на 59 540 запитів, другий — `failed=2`, усі `ETIMEDOUT`. Перш ніж
+щось крутити, я прогнав те саме навантаження **без rollout**: 6 таймаутів на 27 110
+запитів. Отже, rollout ні до чого. Затримки успішних запитів були квантовані:
+медіана 1 мс, але 108 із 34 тисяч — рівно ~1,0 с, кілька — ~2 і ~3 с. Так ядро
+повторює загублений SYN. У подах `ListenOverflows=0`, у conntrack вузла
+`insert_failed=0`, зате в кожному поді 42–46 тисяч зʼєднань у `TIME_WAIT`.
+Генератор відкривав ~1300 нових зʼєднань/с з однієї IP. ~28 тисяч клієнтських
+портів закінчувались за ~20 с, а под тримає закрите зʼєднання 60 с, тож новий SYN
+інколи влучав у чужий `TIME_WAIT`. Закривати зʼєднання першим на клієнті не
+допомагає: `TIME_WAIT` переїжджає на клієнт, і порти закінчуються вже там.
+При 250 запитах/с за 90 с — 0 збоїв на 22,5 тисячі, найдовша відповідь ≈ 1 с при
+таймауті 2 с. 200/с — темп curl-генератора лекції, і 45 с дають ~9000 запитів,
+удвічі більше за поріг 5000.
+
+Ми ходимо в NodePort напряму, тож збій видно як «зʼєднання не встановилось»
+(`000`), а не як 502/503 — їх дав би Ingress чи балансувальник. Тому критерій —
+«не 200», а не «5xx».
+
+### PDB
+
+`maxUnavailable: 1`, а не `minAvailable: 3`. `minAvailable == replicas` блокує
+будь-який drain: адмін не оновить вузол узагалі. І навіть `minAvailable: 2` ламається
+разом із HPA: HPA зменшив deployment до двох — і бюджет знову нульовий.
+`maxUnavailable` рахується від поточного масштабу.
+
+```
+$ npm run demo:pdb
+healthy=3
+minAvailable=2
+maxUnavailable=1
+disruptions-allowed=1
+evict-1=201
+evict-2=429
+# evict-2: Cannot evict pod as it would violate the pod's disruption budget.
+```
+
+Перше виселення вкладається в бюджет (3 здорових − 2 = 1). Друге одразу — вже ні:
+здорових два, а замінний под ще прогрівається. Наприкінці демо чекає, поки Deployment
+поверне под, і бюджет знову `1` — кластер лишається в тому стані, в якому був.
+
+`minAvailable` у виводі — те, що порахував сам контролер PDB (`status.desiredHealthy`).
+Коди 201 і 429 — HTTP-статуси Eviction API через `kubectl proxy`, тобто те саме, що
+бачить `kubectl drain`. Звичайний `kubectl delete pod` бюджет не зупиняє: PDB діє
+лише на Eviction API і захищає від добровільних порушень, а не від падінь.
+
+### HPA і `replicas`: хто володіє полем
+
+HPA — `autoscaling/v2`, 2…6 реплік за CPU 70 % від `requests`. У kind немає
+metrics-server, тож HPA нічого не масштабує: `TARGETS cpu: <unknown>/70%`. Тому
+`spec.replicas: 3` у програмі лишається — без нього Deployment мав би одну репліку.
+
+У бойовому кластері з metrics-server це вже конфлікт володіння полем. Pulumi пише
+`spec.replicas` через server-side apply, а HPA — через subresource `scale`, і
+Kubernetes записує в `managedFields` обох менеджерів. HPA збільшив до п'яти, наступний
+`pulumi up` повертає три — або падає з конфліктом SSA, якщо HPA вже забрав поле.
+Деплой прибиває автоскейлінг саме в пік навантаження. Правильний вихід — не
+оголошувати `replicas`, коли HPA існує (або `ignoreChanges: ["spec.replicas"]`):
+початкову кількість дає `minReplicas`, далі поле належить лише HPA.
+
+### Секрет рантайму: сховище → K8s Secret
+
+Значення приходять у Pulumi з обгортки сховища, програма кладе їх у Secret через
+`data` у base64 (`stringData` — поле лише для запису: API його не повертає, і
+провайдер бачив би різницю на кожному `up`) і обгортає `pulumi.secret`, щоб у
+стані Pulumi вони лежали зашифрованими passphrase. Імʼя Secret — з суфіксом від
+Pulumi: новий вміст дає нове імʼя в pod-шаблоні, а отже rollout. Без цього поди
+жили б зі старими значеннями до першого рестарту.
+
+Але base64 — не шифрування. У kind Secret лежить в etcd відкритим текстом:
+encryption at rest за замовчуванням не ввімкнено. «Поклав у Secret» означає
+«прибрав із git», а не «зашифрував». І право створювати Deployment у namespace —
+це право прочитати будь-який його Secret: змонтувати й вивести в лог.
+
+BuildKit-секрет і K8s Secret не замінюють один одного. Перший живе під час
+`docker build` і захищає образ: токен не має доїхати до реєстру. Другий живе в
+рантаймі й захищає репозиторій: пароль не має доїхати до git.
+
+**Промислові шляхи — ESO і CSI.** Тут значення проходить через процес Pulumi і
+лежить у його стані. External Secrets Operator прибирає цю ланку: у кластері живе
+`ExternalSecret`, що посилається на ключ у сховищі (Vault, Infisical, AWS Secrets
+Manager), а оператор сам синхронізує його в K8s Secret і оновлює за розкладом —
+ротація без `pulumi up`, але значення однаково лежить в etcd. Secrets Store CSI
+Driver іде далі: монтує секрет файлом прямо зі сховища в под, і в etcd його немає
+взагалі; ціна — без синхронізації в Secret значення не можна взяти через `env`.
+Для курсового з паролем БД, який застосунок і так читає з файла (#11), природний
+наступний крок — CSI. Оператор у кластер не ставив: ще один Deployment на вузлі, а
+ДЗ просить назвати шлях, не ставити.
+
+### Свідомо не зроблено
+
+- **Ingress і LoadBalancer** — ходимо в NodePort. За балансувальником збій виглядав
+  би як 502/503; на #31 там буде ALB.
+- **metrics-server** — HPA оголошено, але не масштабує (вище).
+- **Кілька вузлів, anti-affinity, drain іншого вузла** — вузол один.
+- **Постійні томи** — Postgres і Redis у kind на `emptyDir`: дані живуть, доки живе под.
+  На #31 база стане RDS.
+- **Брокер, кеш, сховище файлів у кластері** — їхні змінні в kind порожні,
+  застосунок працює без них.
+
 ## Grading
 
 З ДЗ #24 застосунок не стартує без ключа підпису, а маршрути під токеном
@@ -3221,6 +3621,78 @@ npm run demo:cdn          # direct=403 · edge-miss=200 · edge-hit=200 · cache
 npm run build && npm run edge    # кеш-шар окремим процесом на 127.0.0.1:22660, роздає лише assets/
 ```
 
+ДЗ #28 (розділ Kubernetes). Свіжий клон, без доступу до сховища, кластер — kind.
+Хмарного акаунта й `pulumi login` не потрібно: стан Pulumi — у локальному файлі.
+Якщо kind і pulumi в системі немає, `npm run cluster:up` і `npm run up` самі
+запускають ті самі версії з контейнера `marketplace-tools:hw28`; для команд
+критеріїв, що викликають `pulumi` напряму, тоді потрібен ще
+`export PATH="$PWD/scripts/bin:$PATH"`. Postgres, Redis і міграції піднімає сама
+Pulumi-програма — `docker compose` тут не потрібен.
+
+```bash
+export SKIP_VAULT=1            # у грейдера немає доступу до сховища
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi"
+export PULUMI_CONFIG_PASSPHRASE=hw28-grading
+
+# адреси — сервіси, які створює infra/; паролі — будь-які
+export DB_URL=postgres://marketplace@marketplace-db:5432/marketplace
+export DB_PASSWORD=hw28-db-7f3a9c
+export REDIS_QUEUE_URL=redis://default:hw28-redis-5e1b@marketplace-redis:6379
+
+# одноразова пара ES256 (EC P-256), як у блоці #24
+node -e 'const {generateKeyPairSync}=require("node:crypto");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},
+  publicKeyEncoding:{type:"spki",format:"pem"}});
+const fs=require("node:fs");
+fs.writeFileSync("/tmp/hw28-priv.b64",Buffer.from(k.privateKey).toString("base64"));
+fs.writeFileSync("/tmp/hw28-pub.b64",Buffer.from(k.publicKey).toString("base64"));'
+export JWT_PRIVATE_KEY="$(cat /tmp/hw28-priv.b64)"
+export JWT_PUBLIC_KEY="$(cat /tmp/hw28-pub.b64)"
+export JWT_KID=hw28-kid-a1
+export REFRESH_TOKEN_PEPPER=hw28-pepper-c4d2
+
+# вимкнені фічі: брокера, кешу й сховища файлів у kind немає, overlap-ротації ключа теж.
+# Порожньо = вимкнено; відсутня змінна — падіння з її назвою (розділ Kubernetes, «Змінні»)
+export BROKER_URL= REDIS_CACHE_URL= JWT_PREVIOUS_PUBLIC_KEY= JWT_PREVIOUS_KID=
+export STORAGE_ENDPOINT= STORAGE_BUCKET= STORAGE_ACCESS_KEY= STORAGE_SECRET_KEY=
+
+npm --prefix infra ci
+printf 'dummy-npm-token' > .npm_token   # секрет етапу збірки; у git його немає
+npm run image:build            # docker/Dockerfile -> marketplace-api:hw28
+npm run cluster:up             # kind create + kind load docker-image
+npm run up                     # pulumi up
+```
+
+Імена для критеріїв: namespace `marketplace`; Deployment, PDB і HPA —
+`marketplace-api`. Далі — команди з acceptance criteria як є:
+
+```bash
+cd infra && npm ci && npx tsc --noEmit; echo "exit=$?"; cd ..
+npm run demo:image            # stages=2 · shell-inside=0 · runtime-uid=65532 · token-in-history|config|layers=0
+SCAN_MAX=-1    npm run scan; echo "exit(max=-1)=$?"      # gate=fail, exit 1
+SCAN_MAX=99999 npm run scan; echo "exit(max=99999)=$?"   # gate=pass, exit 0
+npm run demo:rollout          # profile=good · requests≈9100 · failed=0 · rollout-seconds≈16
+kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptionsAllowed}{"\n"}'   # 1, ДО demo:pdb
+npm run demo:pdb              # healthy=3 · minAvailable=2 · evict-1=201 · evict-2=429
+```
+
+`demo:rollout` триває близько 1,5 хв: базовий `pulumi up`, 45 с навантаження з
+rollout посередині, дренаж старих подів. `demo:pdb` наприкінці чекає, поки
+Deployment поверне виселений под, тож після нього кластер знову в повному складі.
+Понад критерії, для порівняння:
+
+```bash
+PROFILE=bad npm run demo:rollout   # без проб і дренажу: failed > 0; наприкінці кластер повертається в good
+CONTROL=1 npm run demo:image       # навмисно дірявий образ: control-token-in-history=2 · config=1 · layers=1
+```
+
+Знести після перевірки:
+
+```bash
+npm run destroy && npm run cluster:down
+```
+
 ## Журнал рішень
 
 Дописую знизу, розділи вище не переписую. На захисті історія рішень цінніша за
@@ -3347,6 +3819,17 @@ npm run build && npm run edge    # кеш-шар окремим процесом
 | 2026-11-09 | `intent` відповідає `200`, а не `201` | Файла ще немає, є лише дозвіл його покласти. Критерій теж читає `intent=200` |
 | 2026-11-09 | `expired=403` перевіряється на URL зі строком 3 с, підписаному тим самим `presignPut` | Строк intent для PNG із демо — 61 с; хвилина очікування в кожному прогоні нічого не додає до доказу |
 | 2026-11-09 | Бакет на емуляторі створює застосунок на старті й самі демо; lifecycle `AbortIncompleteMultipartUpload: 7` — лише на бакет без lifecycle | Грейдер не запускає init-кроку. На AWS бакет — IaC, і в ролі застосунку немає `s3:CreateBucket`. `Put…Lifecycle` замінює конфігурацію цілком, тож чужі правила не чіпаються |
+| 2026-11-09 | Production-образ — `docker/Dockerfile`: збірка на `node:24-slim`, запуск на `distroless/nodejs24-debian12:nonroot`, `USER 65532:65532`; кореневий односхідцевий `Dockerfile` видалено | Після RCE в образі немає чим скористатись: ні `sh`, ні `apt`. Числовий uid — бо kubelet при `runAsNonRoot` імена не резолвить. Два Dockerfile означали б два різні образи |
+| 2026-11-09 | Токен реєстру — лише `RUN --mount=type=secret`, `npmrc` — bind-mount; `npm ci --ignore-scripts` | `ARG` осідає в історії, `COPY` + `rm` — у байтах шару. `demo:image` міряє всі три канали й на контрольному дірявому образі бачить `2/1/1` |
+| 2026-11-09 | Поріг сканера `SCAN_MAX=12` у CI — ratchet | 12 виправних знахідок: 7 у `libssl3` бази distroless, 5 у `multer`/`body-parser` через Nest. Нульовий поріг червонів би через базу, на яку я не впливаю |
+| 2026-11-09 | kind, а не minikube; kind і Pulumi CLI — з контейнера `marketplace-tools`, якщо їх немає в системі | Лекція: kind удвічі швидший, на 150–200 МіБ легший, свіжіший Kubernetes. Інструментів на машину не ставлю; грейдер зі своїми kind і pulumi контейнера не торкається |
+| 2026-11-09 | Postgres, Redis черги й Job міграцій піднімає та сама Pulumi-програма; брокер, кеш і сховище файлів у kind вимкнені порожніми змінними | Без бази под не стає справді готовим, без `REDIS_QUEUE_URL` застосунок не стартує. Job, а не initContainer: три репліки накочували б схему одночасно |
+| 2026-11-09 | Програма вимагає КОЖНУ змінну сховища з таблиць README: порожня — фічу вимкнено, відсутня — падіння з назвою | Критерій 5 бере імена з усіх таблиць, де є «сховище», — їх 16, а не 2. Відсутність замість порожнього рядка — це зламаний експорт, і мовчки вимкнена фіча в проді гірша за падіння |
+| 2026-11-09 | `enableShutdownHooks` прибрано; SIGTERM: readiness=503 → дренаж 5 с → `close()`, grace 20 с | Хук робив `close()` одразу — відмова новим зʼєднанням, поки kube-proxy ще шле трафік |
+| 2026-11-09 | Readiness не ходить у БД на кожній пробі; лише прогрів + перше зʼєднання + не дренаж | Короткий збій бази зробив би неготовими всі поди одразу. Стан бази — `/health/db` |
+| 2026-11-09 | PDB `maxUnavailable: 1`, не `minAvailable` | `minAvailable == replicas` блокує drain; з HPA, що зменшив deployment до двох, `minAvailable: 2` — те саме блокування |
+| 2026-11-09 | Генератор навантаження — 200 запитів/с, кожен — нове зʼєднання | Без обмеження (~1300/с) клієнтські порти зациклювались швидше за `TIME_WAIT` у подах: 6 таймаутів на 27 тис. запитів без жодного rollout. При 250/с — 0 на 22,5 тис. |
+| 2026-11-09 | `Pulumi.<stack>.yaml` не в git; конфіг стеку з типами й дефолтами — у `config:` файлу `Pulumi.yaml` | Файл стеку несе `encryptionsalt` під passphrase конкретної машини: грейдер зі своєю passphrase його б не розшифрував. А `rev` перемикає `demo:rollout` |
 
 ## Запуск
 
@@ -3378,6 +3861,10 @@ npm run demo:auth && npm run demo:reuse && npm run demo:rbac      # auth: лог
 npm run demo:resync                                               # денилист відновлюється з revoked_at після реконекту Redis
 npm run demo:upload && npm run demo:multipart && npm run demo:cdn # файли: байти повз API, довантаження multipart, кеш перед закритим бакетом (розділ Files)
 npm run edge                                                      # кеш-шар перед сховищем на :22660 (після npm run build)
+npm run image:build && npm run demo:image && npm run scan          # production-образ, секрет збірки, скан з порогом (розділ Kubernetes)
+npm run cluster:up && npm run up                                  # kind + Pulumi: Postgres, Redis, міграції, API ×3, PDB, HPA
+npm run demo:rollout && npm run demo:pdb                          # rolling update під навантаженням: failed=0; evict-1=201 · evict-2=429
+npm run destroy && npm run cluster:down                           # знести стек і кластер
 
 npm run check:env          # .env.example звірений зі схемою
 npm run lint:spec          # redocly lint openapi/openapi.yaml

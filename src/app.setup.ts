@@ -64,7 +64,7 @@ export function configureApp(app: NestExpressApplication): NestExpressApplicatio
   // транспорт подій, як і `/socket.io/` поруч. OpenAPI 3.0 його не описує, і
   // версія JSON-контракту до нього не стосується.
   app.setGlobalPrefix('v1', {
-    exclude: ['health', 'health/db', { path: 'orders/:orderId/events', method: RequestMethod.GET }],
+    exclude: ['health', 'health/db', 'health/ready', { path: 'orders/:orderId/events', method: RequestMethod.GET }],
   });
 
   app.use(
@@ -94,10 +94,10 @@ export function configureApp(app: NestExpressApplication): NestExpressApplicatio
   // Express-level error handler не потрібен: одна точка на всі помилки.
   app.useGlobalFilters(new ProblemFilter());
 
-  // На SIGTERM Nest перестає приймати нові з'єднання, дороблює поточні й
-  // викликає onModuleDestroy у провайдерів — зокрема закриває обидва пули.
-  // Без цього рядка Node помирає миттєво і запит у польоті обривається.
-  app.enableShutdownHooks();
-
+  // `app.enableShutdownHooks()` тут більше немає (#28). Він вішав на SIGTERM
+  // одразу `app.close()`: сокет закривався в ту мить, коли балансувальник ще
+  // слав трафік на цей под, і кожне нове зʼєднання отримувало відмову. Сигнали
+  // тепер обробляє main.ts у правильному порядку: спершу readiness=503, потім
+  // дренаж, і лише потім `app.close()`. Тести закривають застосунок самі.
   return app;
 }

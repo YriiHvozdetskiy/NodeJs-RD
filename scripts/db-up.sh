@@ -29,6 +29,9 @@ mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 [ -f ./secrets/storage_secret_key ] || printf '%s' "$(openssl rand -hex 24)" > ./secrets/storage_secret_key
 # Адреса Pact Broker зі сховища (#16) — за замовчуванням брокер із цього compose.
 [ -f ./secrets/pact_broker_url ] || printf 'http://127.0.0.1:9292' > ./secrets/pact_broker_url
+# Ключ шифрування стану Pulumi (#28): ним зашифровані секрети стеку kind у
+# .pulumi/. Наявний не чіпається — новий не розшифрував би вже записаний стан.
+[ -f ./secrets/pulumi_passphrase ] || printf 'pulumi-%s' "$(openssl rand -hex 16)" > ./secrets/pulumi_passphrase
 # Пари ES256 для dev і prod, їхні kid і перці refresh-токенів (#24). Наявні не
 # чіпаються: перегенерація ключа вбила б усі живі токени.
 node scripts/jwt-keys.mjs init
