@@ -47,6 +47,10 @@ tags:
       Логін, ротація refresh-токена і логаут. Access-токен — JWT ES256 на
       10 хвилин у заголовку `Authorization: Bearer …`; refresh — непрозорий
       рядок на 30 днів, що міняється на кожному рефреші.
+  - name: files
+    description: |
+      Файли у сховищі S3: намір → байти напряму у сховище за presigned URL →
+      commit. Байти файла через API не проходять.
 
 paths:
   /products:
@@ -496,6 +500,182 @@ paths:
         default:
           $ref: '#/components/responses/Unexpected'
 
+  /uploads/intent:
+    post:
+      operationId: createUploadIntent
+      tags: [files]
+      summary: Намір завантажити файл — ключ обʼєкта і presigned URL
+      description: |
+        Перший крок двокрокового контракту. Сервер перевіряє тип за allowlist,
+        сам складає ключ `uploads/{userId}/{uuid}.{ext}` і створює рядок
+        `pending`. Байти клієнт кладе напряму у сховище за `url` (до 10 МіБ) або
+        за `parts[].url` (понад 10 МіБ, multipart) — через цей API байти файла
+        не проходять. Далі — `POST /uploads/{fileId}/commit`.
+
+        `filename` у ключ не потрапляє і не зберігається: ключ із нього означав
+        би право клієнта писати за будь-яким шляхом у бакеті.
+
+        Строк URL — `expires_in`: час передачі на аплінку 1 Мбіт/с плюс 60 с,
+        не більше години. Presigned не відкликається, тому строк короткий.
+
+        `200`, а не `201`: файла ще немає, є лише дозвіл його покласти.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Подвійний тап по кнопці з тим самим ключем повертає той самий
+            `file_id` і ключ обʼєкта зі свіжими підписами, а не другий файл.
+            Той самий ключ з іншим типом чи розміром — `422`.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 200
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadIntentRequest'
+      responses:
+        '200':
+          description: Дозвіл покласти байти у сховище
+          headers:
+            Cache-Control:
+              description: '`no-store` — presigned URL є носієм доступу і в кеш не потрапляє.'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadIntent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /uploads/{fileId}/parts:
+    get:
+      operationId: getUploadParts
+      tags: [files]
+      summary: Відновити multipart — які частини вже у сховищі і URL на решту
+      description: |
+        Сервер питає сховище ListParts і підписує свіжі URL лише на частини, яких
+        бракує. Новий процес клієнта після обриву починає звідси й доливає тільки
+        відсутнє. Той самий виклик рятує завантаження, якому не вистачило строку
+        URL. Файл без multipart або вже завершений — `409`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '200':
+          description: Стан завантаження у сховищі
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadParts'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /uploads/{fileId}/commit:
+    post:
+      operationId: commitUpload
+      tags: [files]
+      summary: Зафіксувати завантаження — сервер перевіряє обʼєкт сам
+      description: |
+        Для multipart спершу CompleteMultipartUpload зі списком частин, який
+        сервер бере в сховища (ListParts), а не в клієнта. Далі HeadObject:
+        обʼєкта немає або розмір не збігається із заявленим — `409`. Перші байти
+        не схожі на заявлений тип — `422`, обʼєкт видаляється. Лише після цього
+        статус `completed`. Повтор commit завершеного файла — `200` з тим самим
+        станом.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '200':
+          description: Файл у сховищі і звірений
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredFile'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+  /files/{fileId}:
+    get:
+      operationId: downloadFile
+      tags: [files]
+      summary: Завантажити файл — 302 на presigned GET на хвилину
+      description: |
+        Власник файла або адмін. Довгоживучий presigned у листі не відкликати
+        нічим; тут кожне відкриття проходить гард, а URL у `Location` живе 60 с.
+        Сервіс лишається на шляху авторизації, але не на шляху даних.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '302':
+          description: Редірект на presigned GET у сховищі
+          headers:
+            Location:
+              description: Presigned URL на 60 с.
+              schema:
+                type: string
+                format: uri
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/Unexpected'
+
+
 components:
 
   securitySchemes:
@@ -549,6 +729,15 @@ components:
       schema:
         type: integer
         minimum: 1
+
+    FileId:
+      name: fileId
+      in: path
+      required: true
+      description: Ідентифікатор файла — той самий UUID, що в ключі обʼєкта.
+      schema:
+        type: string
+        format: uuid
 
   schemas:
 
@@ -941,6 +1130,133 @@ components:
           description: Позиції кошика. Порожній масив — помилка валідації.
           items:
             $ref: '#/components/schemas/OrderItem'
+
+    UploadIntentRequest:
+      type: object
+      required: [content_type, size]
+      additionalProperties: false
+      properties:
+        filename:
+          type: string
+          maxLength: 255
+          description: Імʼя файла в клієнта. Не потрапляє ні в ключ, ні в базу.
+          example: ../../etc/passwd
+        content_type:
+          type: string
+          description: |
+            Тип із allowlist: `image/jpeg`, `image/png`, `image/webp` (до 20 МіБ),
+            `application/pdf` (до 50 МіБ), `video/mp4` (до 1 ГіБ). Розширення ключа
+            сервер бере звідси. Commit звіряє перші байти файла з цим типом.
+          example: image/png
+        size:
+          type: integer
+          minimum: 1
+          description: Розмір у байтах. Commit звіряє його з HeadObject.
+          example: 204800
+
+    PartUrl:
+      type: object
+      required: [part_number, url]
+      additionalProperties: false
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        url:
+          type: string
+          format: uri
+          description: Presigned PUT однієї частини. Тіло — рівно `part_size` байтів (остання — залишок).
+
+    UploadIntent:
+      type: object
+      required: [file_id, key, status, mode, expires_in]
+      additionalProperties: false
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+          description: Ключ обʼєкта, який склав сервер.
+          example: uploads/42/1c5f2a0e-6c1d-4a59-9e57-4f3b7f2d9a10.png
+        status:
+          type: string
+          enum: [pending, completed]
+          description: '`completed` — лише на повторі intent із тим самим Idempotency-Key після commit; тоді URL немає.'
+        mode:
+          type: string
+          enum: [single, multipart]
+        expires_in:
+          type: integer
+          minimum: 0
+          description: Скільки секунд живуть URL у цій відповіді.
+        url:
+          type: string
+          format: uri
+          description: '`mode: single` — presigned PUT усього файла.'
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: '`mode: single` — заголовки, які PUT мусить надіслати: `content-type` накритий підписом.'
+        part_size:
+          type: integer
+          description: '`mode: multipart` — розмір кожної частини, крім останньої: max(5 МіБ, файл / 10 000).'
+        part_count:
+          type: integer
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartUrl'
+
+    UploadParts:
+      type: object
+      required: [file_id, part_size, part_count, uploaded, parts, expires_in]
+      additionalProperties: false
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        part_size:
+          type: integer
+        part_count:
+          type: integer
+        uploaded:
+          type: array
+          description: Номери частин, які вже лежать у сховищі з правильним розміром.
+          items:
+            type: integer
+        parts:
+          type: array
+          description: Свіжі URL лише на ті частини, яких бракує.
+          items:
+            $ref: '#/components/schemas/PartUrl'
+        expires_in:
+          type: integer
+          minimum: 0
+
+    StoredFile:
+      type: object
+      required: [file_id, key, status, content_type, size, etag]
+      additionalProperties: false
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+        status:
+          type: string
+          enum: [pending, completed]
+        content_type:
+          type: string
+        size:
+          type: integer
+        etag:
+          type: string
+          nullable: true
+          description: ETag зі сховища. У multipart це `"…-N"`, де N — кількість частин, а не MD5 файла.
 
   responses:
     BadRequest:

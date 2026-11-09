@@ -33,6 +33,14 @@
 #
 #   bash scripts/with-secrets.sh dev npm run start
 #
+# З ДЗ #26 — сховище файлів. Адреса й бакет (STORAGE_ENDPOINT, STORAGE_BUCKET,
+# STORAGE_REGION) лежать у .env, як DB_URL. Ключі доступу STORAGE_ACCESS_KEY і
+# STORAGE_SECRET_KEY — у secrets/storage_access_key і secrets/storage_secret_key.
+# Ціна їхнього витоку вища, ніж у пароля БД: це право читати й переписувати
+# кожен файл у бакеті, і в журналі запитів сховища зловмисник виглядатиме як ми.
+#
+#   bash scripts/with-secrets.sh dev node dist/demo-upload.js
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -190,6 +198,21 @@ if [ -f "${JWT_DIR}/private.pem" ]; then
     JWT_PREVIOUS_KID="$(cat "${JWT_DIR}/previous_kid")"
     export JWT_PREVIOUS_PUBLIC_KEY JWT_PREVIOUS_KID
   fi
+fi
+
+# Сховище файлів (#26). Адреси — з .env по одному ключу, як DB_URL вище.
+# Немає ключа в .env — немає змінної, і застосунок відповідає 503 на маршрутах
+# файлів, а демо падають із назвою змінної.
+for var in STORAGE_ENDPOINT STORAGE_BUCKET STORAGE_REGION; do
+  value="$(grep -E "^${var}=" "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+  [ -n "${value}" ] || continue
+  export "${var}=${value}"
+done
+STORAGE_DIR="${ROOT}/secrets"
+if [ -f "${STORAGE_DIR}/storage_access_key" ] && [ -f "${STORAGE_DIR}/storage_secret_key" ]; then
+  STORAGE_ACCESS_KEY="$(cat "${STORAGE_DIR}/storage_access_key")"
+  STORAGE_SECRET_KEY="$(cat "${STORAGE_DIR}/storage_secret_key")"
+  export STORAGE_ACCESS_KEY STORAGE_SECRET_KEY
 fi
 
 exec "$@"

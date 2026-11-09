@@ -25,6 +25,10 @@ import { AccessDenylist } from './auth/access-denylist';
 import { AuthService } from './auth/auth.service';
 import { AuthController } from './auth/auth.controller';
 import { AuthGuard, RolesGuard } from './auth/guards';
+import { FileStorage } from './files/file-storage';
+import { FilesRepository } from './files/files.repository';
+import { FilesService } from './files/files.service';
+import { FilesController } from './files/files.controller';
 
 /**
  * Один модуль на весь сервіс. Розрізати на CatalogModule / OrdersModule варто
@@ -53,7 +57,7 @@ import { AuthGuard, RolesGuard } from './auth/guards';
     DbModule,
     RedisModule,
   ],
-  controllers: [HealthController, ProductsController, OrdersController, SessionsController, AuthController],
+  controllers: [HealthController, ProductsController, OrdersController, SessionsController, AuthController, FilesController],
   // OrderEventsService — один екземпляр на весь модуль: у нього публікує
   // OrdersService і з нього читають і gateway, і SSE-контролер. Два екземпляри
   // означали б дві шини, і подія з однієї не дійшла б до підписників іншої.
@@ -74,6 +78,10 @@ import { AuthGuard, RolesGuard } from './auth/guards';
     AccessTokens,
     AccessDenylist,
     AuthService,
+    // Файли (#26): без STORAGE_BUCKET сховище не створюється, і маршрути файлів відповідають 503.
+    FileStorage,
+    FilesRepository,
+    FilesService,
     // Глобальні гарди виконуються в порядку реєстрації: спершу «хто це»
     // (401), потім «чи можна» (403). Обернути порядок — і анонім отримував
     // би 403 замість 401, а клієнт не знав би, що треба залогінитись.

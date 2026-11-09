@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Піднімає Postgres, PgBouncer, RabbitMQ і два Redis і готує файли-секрети. Ідемпотентний: можна запускати скільки завгодно разів.
+# Піднімає Postgres, PgBouncer, RabbitMQ, два Redis і сховище файлів і готує файли-секрети. Ідемпотентний: можна запускати скільки завгодно разів.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -22,6 +22,11 @@ mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 # Пароль обох Redis (#23). requirepass приходить аргументом redis-server, тож
 # береться заново на кожному старті контейнера — вирівнювати після up нічого.
 [ -f "${REDIS_SECRET_FILE}" ] || printf 'redis-%s' "$(openssl rand -hex 16)" > "${REDIS_SECRET_FILE}"
+# Ключі доступу до сховища файлів (#26). Це root-пара RustFS: compose бере її з
+# STORAGE_ACCESS_KEY/STORAGE_SECRET_KEY, які експортуються нижче. Наявні файли не
+# чіпаються — інша пара на тому самому томі означала б іншого власника даних.
+[ -f ./secrets/storage_access_key ] || printf 'marketplace-%s' "$(openssl rand -hex 4)" > ./secrets/storage_access_key
+[ -f ./secrets/storage_secret_key ] || printf '%s' "$(openssl rand -hex 24)" > ./secrets/storage_secret_key
 # Адреса Pact Broker зі сховища (#16) — за замовчуванням брокер із цього compose.
 [ -f ./secrets/pact_broker_url ] || printf 'http://127.0.0.1:9292' > ./secrets/pact_broker_url
 # Пари ES256 для dev і prod, їхні kid і перці refresh-токенів (#24). Наявні не
@@ -34,6 +39,9 @@ RABBITMQ_PASSWORD="$(cat "${BROKER_SECRET_FILE}")"
 export RABBITMQ_PASSWORD
 REDIS_PASSWORD="$(cat "${REDIS_SECRET_FILE}")"
 export REDIS_PASSWORD
+STORAGE_ACCESS_KEY="$(cat ./secrets/storage_access_key)"
+STORAGE_SECRET_KEY="$(cat ./secrets/storage_secret_key)"
+export STORAGE_ACCESS_KEY STORAGE_SECRET_KEY
 # PgBouncer отримує userlist зі згенерованих паролів, а не дев-файл із репо.
 NO_RELOAD=1 bash scripts/pgbouncer-userlist.sh
 export PGBOUNCER_USERLIST=./secrets/pgbouncer_userlist.txt
@@ -60,7 +68,8 @@ docker compose exec -T rabbit rabbitmqctl -q change_password app "${RABBITMQ_PAS
 
 echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:6432, Pact Broker — на 127.0.0.1:9292,"
 echo "RabbitMQ — на 127.0.0.1:5672 (UI: http://127.0.0.1:15672), Redis кешу — на 127.0.0.1:6379,"
-echo "Redis черги — на 127.0.0.1:6380; паролі вирівняні з secrets/."
+echo "Redis черги — на 127.0.0.1:6380, сховище файлів (S3 API) — на 127.0.0.1:22650 (консоль: http://127.0.0.1:22651);"
+echo "паролі й ключі вирівняні з secrets/."
 echo "Далі:"
 echo "  npm run start:vault                 # застосунок на :3000; ключі підпису — з secrets/jwt/dev/"
 echo "  curl -s localhost:3000/health/db    # запит через пул"
@@ -68,3 +77,4 @@ echo "  npm run rotate                      # ротація пароля без
 echo "  npm run build && npm run migrate    # схема через міграції TypeORM"
 echo "  npm run consumer                    # споживач order.placed (#19)"
 echo "  npm run worker                      # воркер черги BullMQ (#23)"
+echo "  npm run edge                        # кеш-шар перед сховищем на :22660 (#26)"

@@ -9,13 +9,28 @@ import { ProcessedMessage } from './processed-message.entity';
 import { Product } from './product.entity';
 import { Promotion } from './promotion.entity';
 import { RefreshToken } from './refresh-token.entity';
+import { StoredFile } from './stored-file.entity';
 import { User } from './user.entity';
 
-export { IdempotencyKey, Job, Order, OrderItem, OutboxEvent, Payment, PointsEntry, ProcessedMessage, Product, Promotion, RefreshToken, User };
+export { IdempotencyKey, Job, Order, OrderItem, OutboxEvent, Payment, PointsEntry, ProcessedMessage, Product, Promotion, RefreshToken, StoredFile, User };
 
 /**
  * Повний перелік для DataSource — сім таблиць схеми з #12, черга задач з #14,
  * три таблиці доставки подій з #22 (outbox, inbox споживача, ключі
- * ідемпотентності) і refresh-токени з #24.
+ * ідемпотентності), refresh-токени з #24 і файли сховища з #26.
  */
-export const entities = [User, Product, Promotion, Order, OrderItem, Payment, PointsEntry, Job, OutboxEvent, ProcessedMessage, IdempotencyKey, RefreshToken];
+export const entities = [
+  User,
+  Product,
+  Promotion,
+  Order,
+  OrderItem,
+  Payment,
+  PointsEntry,
+  Job,
+  OutboxEvent,
+  ProcessedMessage,
+  IdempotencyKey,
+  RefreshToken,
+  StoredFile,
+];

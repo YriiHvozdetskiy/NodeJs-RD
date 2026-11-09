@@ -2,7 +2,7 @@
   "name": "marketplace-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder. ДЗ#22: transactional outbox + relay на SKIP LOCKED, ідемпотентний споживач (природний ключ + inbox), Idempotency-Key у транзакції замовлення. ДЗ#24: JWT ES256 + refresh-ротація з детекцією повтору, денилист у Redis, RBAC і власність.",
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder. ДЗ#22: transactional outbox + relay на SKIP LOCKED, ідемпотентний споживач (природний ключ + inbox), Idempotency-Key у транзакції замовлення. ДЗ#24: JWT ES256 + refresh-ротація з детекцією повтору, денилист у Redis, RBAC і власність. ДЗ#26: файли в S3-сумісному сховищі — presigned intent/commit, multipart із довантаженням через ListParts, приватний бакет за кеш-шаром, ассети з хешем в імені.",
   "engines": {
     "node": ">=20"
   },
@@ -50,6 +50,10 @@
     "demo:reuse": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-reuse.js",
     "demo:rbac": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-rbac.js",
     "demo:resync": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-resync.js",
+    "demo:upload": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-upload.js",
+    "demo:multipart": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-multipart.js",
+    "demo:cdn": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-cdn.js",
+    "edge": "bash scripts/with-secrets.sh dev node dist/edge.js",
     "keys:init": "node scripts/jwt-keys.mjs init",
     "keys:rotate": "node scripts/jwt-keys.mjs rotate",
     "keys:retire": "node scripts/jwt-keys.mjs retire",
@@ -63,6 +67,8 @@
     "pact:gate": "bash scripts/pact-broker.sh gate"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1161.0",
+    "@aws-sdk/s3-request-presigner": "3.1161.0",
     "@nestjs/common": "11.2.1",
     "@nestjs/config": "4.0.4",
     "@nestjs/core": "11.2.1",

@@ -35,7 +35,7 @@ export interface Tokens {
 }
 
 /** Домен пошти демо-користувачів: за ним прибирання знаходить і свої, і забуті рядки. */
-const domain = (demo: string): string => `${demo}.demo.marketplace.test`;
+export const demoDomain = (demo: string): string => `${demo}.demo.marketplace.test`;
 
 export async function call(
   api: Api,
@@ -88,7 +88,7 @@ export function detailOf(reply: Reply): string {
  * справжні. Email — під доменом цього демо: прибирання знаходить його за ним.
  */
 export async function createUser(dataSource: DataSource, demo: string, name: string, role: UserRole): Promise<DemoUser> {
-  const email = `${name}-${randomBytes(3).toString('hex')}@${domain(demo)}`;
+  const email = `${name}-${randomBytes(3).toString('hex')}@${demoDomain(demo)}`;
   const password = randomBytes(12).toString('base64url');
   const rows: { id: string }[] = await dataSource.query(
     `INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id`,
@@ -107,11 +107,11 @@ export async function cleanup(dataSource: DataSource, demo: string): Promise<voi
   await dataSource.query(
     `DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE buyer_id IN (${users}))
         OR product_id IN (SELECT id FROM products WHERE seller_id IN (${users}))`,
-    [domain(demo)],
+    [demoDomain(demo)],
   );
-  await dataSource.query(`DELETE FROM orders WHERE buyer_id IN (${users})`, [domain(demo)]);
-  await dataSource.query(`DELETE FROM products WHERE seller_id IN (${users})`, [domain(demo)]);
-  await dataSource.query(`DELETE FROM users WHERE email LIKE '%@' || $1`, [domain(demo)]);
+  await dataSource.query(`DELETE FROM orders WHERE buyer_id IN (${users})`, [demoDomain(demo)]);
+  await dataSource.query(`DELETE FROM products WHERE seller_id IN (${users})`, [demoDomain(demo)]);
+  await dataSource.query(`DELETE FROM users WHERE email LIKE '%@' || $1`, [demoDomain(demo)]);
 }
 
 export function login(api: Api, user: DemoUser): Promise<Reply> {
