@@ -110,9 +110,15 @@ export class RedisConnections implements OnApplicationShutdown {
   /**
    * Після закриття HTTP-сервера, а не в onModuleDestroy: запити, що
    * дороблюються під час зупинки, ще можуть читати кеш і сесії.
+   *
+   * `quit()` — ввічливе QUIT, і воно можливе лише з живим зʼєднанням. Якщо
+   * Redis лежить, `quit()` з `enableOfflineQueue: false` одразу відхиляється,
+   * а клієнт лишається в стані перепідключення: таймер ретраїв тримає event
+   * loop, і процес після `app.close()` не завершується. `disconnect()` рве
+   * зʼєднання і зупиняє ретраї без розмови з сервером.
    */
   async onApplicationShutdown(): Promise<void> {
-    await Promise.all([this.cache, this.queue].map((client) => client?.quit().catch(() => undefined)));
+    await Promise.all([this.cache, this.queue].map((client) => client?.quit().catch(() => client.disconnect())));
   }
 }
 

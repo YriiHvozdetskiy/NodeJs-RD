@@ -11,6 +11,8 @@ import type { Subscription } from 'rxjs';
 import type { Server, Socket } from 'socket.io';
 import { OrderEventsService } from './order-events.service';
 import { OrdersRepository } from './orders.repository';
+import { AccessDenylist } from '../auth/access-denylist';
+import { AccessTokens, type Principal } from '../auth/access-tokens';
 
 /** Відповідь на `join` — те, що клієнт отримує в ack. */
 export type JoinAck =
@@ -20,13 +22,13 @@ export type JoinAck =
 export const roomOf = (orderId: number): string => `orders:${orderId}`;
 
 /**
- * Хто підключився. До #24 клієнт називає себе сам — `io(url, { auth: { email } })`
- * у handshake. Це декларація, а не доказ; але перевірка власника вже стоїть
- * там, де на #24 стане перевірка JWT, і `join` від цього не зміниться.
+ * Access-токен із handshake: `io(url, { auth: { token } })`. Не з query-рядка:
+ * URL із токеном осідає в логах проксі й в історії, а `auth` їде тілом
+ * першого пакета socket.io.
  */
-function emailOf(socket: Socket): string | undefined {
-  const email: unknown = socket.handshake.auth?.email;
-  return typeof email === 'string' && email.length > 0 ? email : undefined;
+function tokenOf(socket: Socket): string | undefined {
+  const token: unknown = socket.handshake.auth?.token;
+  return typeof token === 'string' && token.length > 0 ? token : undefined;
 }
 
 /** Тіло `join` — `{ order_id: 42 }`. Валідатора спеки тут немає, перевіряємо самі. */
@@ -52,6 +54,8 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
   constructor(
     private readonly events: OrderEventsService,
     private readonly orders: OrdersRepository,
+    private readonly tokens: AccessTokens,
+    private readonly denylist: AccessDenylist,
   ) {}
 
   /**
@@ -76,21 +80,41 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
     const orderId = orderIdOf(body);
     if (orderId === undefined) return { ok: false, error: 'bad-request' };
 
-    const email = emailOf(socket);
-    if (!email) {
-      this.logger.warn(`${socket.id}: join ${roomOf(orderId)} без email — відмова`);
+    const principal = await this.principalOf(socket);
+    if (!principal) {
+      this.logger.warn(`${socket.id}: join ${roomOf(orderId)} без чинного токена — відмова`);
       return { ok: false, error: 'unauthorized' };
     }
-    if (!(await this.orders.isOwnedBy(orderId, email))) {
-      this.logger.warn(`${socket.id}: ${email} → ${roomOf(orderId)} — не власник, відмова`);
+    // Ті самі два рівні, що в HTTP: «хто це» — вище, «чи його це замовлення» —
+    // тут, по buyer_id прочитаного рядка. Неіснуюче й чуже — однаково forbidden:
+    // кімнати неіснуючого замовлення однаково ніхто не почує.
+    const found = await this.orders.findWithBuyer(orderId);
+    if (!found || (found.buyerId !== principal.userId && principal.role !== 'admin')) {
+      this.logger.warn(`${socket.id}: user=${principal.userId} → ${roomOf(orderId)} — не власник, відмова`);
       return { ok: false, error: 'forbidden' };
     }
 
     // Кімнату сокет покидає сам при відключенні — окремого leave для цього
     // не треба.
     await socket.join(roomOf(orderId));
-    this.logger.log(`${socket.id}: ${email} → ${roomOf(orderId)}`);
+    this.logger.log(`${socket.id}: user=${principal.userId} → ${roomOf(orderId)}`);
     return { ok: true, room: roomOf(orderId) };
+  }
+
+  /**
+   * Той самий контроль, що в AuthGuard: підпис, exp, денилист. На кожен
+   * `join`, а не раз на handshake: сокет живе годинами, а токен — 10 хвилин,
+   * і логаут має закривати й нові підписки.
+   */
+  private async principalOf(socket: Socket): Promise<Principal | undefined> {
+    const token = tokenOf(socket);
+    if (!token) return undefined;
+    try {
+      const principal = await this.tokens.verify(token);
+      return (await this.denylist.isRevoked(principal)) ? undefined : principal;
+    } catch {
+      return undefined;
+    }
   }
 
   onModuleDestroy(): void {

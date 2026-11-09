@@ -1,10 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import type { RequestHandler } from 'express';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Verifier, type VerifierOptions } from '@pact-foundation/pact';
+import { AccessTokens } from '../../src/auth/access-tokens';
 import { bootApp } from '../testkit/app';
 import { startPostgres, type TestPostgres } from '../testkit/postgres';
 import { PACT_FILE, PROVIDER, providerBranch, providerVersion } from './pact.config';
-import { providerStates } from './provider-states';
+import { PACT_BUYER_ID, providerStates } from './provider-states';
 
 /**
  * Звідки брати контракт — вирішує оточення, а не прапорець у коді:
@@ -28,6 +31,29 @@ function pactSource(): Partial<VerifierOptions> {
     publishVerificationResult: true,
     providerVersion: providerVersion(),
     providerVersionBranch: providerBranch(),
+  };
+}
+
+/**
+ * Токен у контракті — приклад консюмера, і підпис у нього, звісно, не наш:
+ * AuthGuard відповів би 401 на кожну interaction. Тому верифаєр перед
+ * кожним запитом підставляє справжній access-токен покупця з provider
+ * states — виписаний тим самим AccessTokens застосунку, тим самим ключем.
+ * Логін тут не потрібен: перевіряється контракт замовлень, а не вхід.
+ *
+ * Підміна лише там, де консюмер заголовок надіслав: запит без нього мусить
+ * і далі отримувати 401, а не мовчки ставати автентифікованим.
+ */
+function asPactBuyer(tokens: AccessTokens): RequestHandler {
+  return (req, _res, next) => {
+    if (!req.headers.authorization) {
+      next();
+      return;
+    }
+    tokens.issue({ id: PACT_BUYER_ID, role: 'buyer' }, randomUUID()).then((issued) => {
+      req.headers.authorization = `Bearer ${issued.token}`;
+      next();
+    }, next);
   };
 }
 
@@ -59,6 +85,7 @@ describe('Pact provider · справжній marketplace-api проти кон�
       provider: PROVIDER,
       providerBaseUrl: baseUrl,
       stateHandlers: providerStates(pg.pool),
+      requestFilter: asPactBuyer(app.get(AccessTokens)),
       logLevel: 'warn',
       ...source,
     }).verifyProvider();

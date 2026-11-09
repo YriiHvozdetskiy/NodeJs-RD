@@ -48,11 +48,20 @@ export class OrdersRepository {
   constructor(@Inject(DB) private readonly db: Queryable) {}
 
   async findById(id: number): Promise<Order | null> {
+    return (await this.findWithBuyer(id))?.order ?? null;
+  }
+
+  /**
+   * Замовлення разом із його покупцем — для перевірки власності в сервісі.
+   * `buyer_id` у відповідь API не йде (схема `Order` його не має), тому він
+   * поруч із замовленням, а не всередині.
+   */
+  async findWithBuyer(id: number): Promise<{ order: Order; buyerId: string } | null> {
     if (!Number.isSafeInteger(id) || id < 1) return null;
     // GROUP BY o.id досить: id — первинний ключ, решта колонок orders від нього
     // функціонально залежні, і Postgres це знає.
-    const { rows } = await this.db.query<OrderRow>(
-      `SELECT o.id, o.status, o.currency, o.total_cents, o.created_at,
+    const { rows } = await this.db.query<OrderRow & { buyer_id: string }>(
+      `SELECT o.id, o.buyer_id, o.status, o.currency, o.total_cents, o.created_at,
               ${cursorAt('o.created_at')} AS cursor_at,
               ${ITEMS} AS items
          FROM orders o
@@ -61,7 +70,7 @@ export class OrdersRepository {
         GROUP BY o.id`,
       [id],
     );
-    return rows[0] ? toOrder(rows[0]) : null;
+    return rows[0] ? { order: toOrder(rows[0]), buyerId: rows[0].buyer_id } : null;
   }
 
   /**
@@ -81,34 +90,27 @@ export class OrdersRepository {
   }
 
   /**
-   * Чи оформлене замовлення покупцем із цим email. Відсутнє замовлення й чуже
-   * дають однакове `false` — той, хто питає, не має дізнатися, що чуже існує.
-   */
-  async isOwnedBy(id: number, email: string): Promise<boolean> {
-    if (!Number.isSafeInteger(id) || id < 1) return false;
-    const { rows } = await this.db.query<{ owned: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1 FROM orders o JOIN users u ON u.id = o.buyer_id
-          WHERE o.id = $1 AND u.email = $2
-       ) AS owned`,
-      [id, email],
-    );
-    return rows[0].owned;
-  }
-
-  /**
    * Спершу сторінка замовлень (CTE з LIMIT), і лише потім JOIN позицій. Якби
    * LIMIT стояв після JOIN, він рахував би рядки order_items, а не замовлення:
    * сторінка «2 замовлення» по 3 позиції обрізала б друге посередині.
    * У CTE немає первинного ключа, тому GROUP BY перелічує всі колонки.
+   *
+   * `buyerId` — власність прямо в WHERE: чужі замовлення до коду навіть не
+   * доходять, і забути відфільтрувати їх після читання неможливо. Під цю
+   * умову вже є idx_orders_buyer_created (buyer_id, created_at, id) — keyset
+   * по ньому той самий. `null` — усі замовлення (адмін).
    */
-  async page(limit: number, cursor?: string): Promise<Page<Order>> {
+  async page(limit: number, cursor: string | undefined, buyerId: string | null): Promise<Page<Order>> {
     const after = cursor ? decodeCursor(cursor) : undefined;
+    const params: unknown[] = [limit + 1];
+    const where: string[] = [];
+    if (buyerId !== null) where.push(`buyer_id = $${params.push(buyerId)}`);
+    if (after) where.push(`(created_at, id) < ($${params.push(after.c)}::timestamptz, $${params.push(after.id)}::bigint)`);
     const { rows } = await this.db.query<OrderRow>(
       `WITH page AS (
          SELECT id, status, currency, total_cents, created_at, ${cursorAt('created_at')} AS cursor_at
            FROM orders
-          ${after ? 'WHERE (created_at, id) < ($2::timestamptz, $3::bigint)' : ''}
+          ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
           ORDER BY created_at DESC, id DESC
           LIMIT $1
        )
@@ -117,7 +119,7 @@ export class OrdersRepository {
          LEFT JOIN order_items oi ON oi.order_id = p.id
         GROUP BY p.id, p.status, p.currency, p.total_cents, p.created_at, p.cursor_at
         ORDER BY p.created_at DESC, p.id DESC`,
-      after ? [limit + 1, after.c, after.id] : [limit + 1],
+      params,
     );
     return toPage(rows, limit, toOrder);
   }

@@ -1,3 +1,4 @@
+import { createPrivateKey, createPublicKey } from 'node:crypto';
 import { z } from 'zod';
 
 /**
@@ -80,9 +81,14 @@ export const envSchema = z.object({
   REDIS_CACHE_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
 
   /**
-   * Redis під чергу BullMQ, сесії й вікна rate-limit (#23) — БЕЗ пароля.
-   * Інстанс із noeviction + AOF: тут лежить те, що не можна губити мовчки.
-   * Без нього немає сесій (503) і ліміту на POST /v1/orders.
+   * Redis під чергу BullMQ, сесії, вікна rate-limit (#23) і денилист
+   * access-токенів (#24) — БЕЗ пароля. Інстанс із noeviction + AOF: тут
+   * лежить те, що не можна губити мовчки.
+   *
+   * У схемі опційна, бо сесії й ліміт без неї просто вимкнені, а тести
+   * ходять без Redis. Але застосунок без неї не стартує: денилист
+   * (src/auth/access-denylist.ts) падає на збиранні DI з назвою цієї змінної —
+   * логаут без денилиста не відкликав би access-токени.
    */
   REDIS_QUEUE_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
 
@@ -109,7 +115,91 @@ export const envSchema = z.object({
     ),
 });
 
-export type Env = z.infer<typeof envSchema>;
+/**
+ * PEM у змінній оточення — base64 від цілого файла: багаторядковий PEM в
+ * `export` виживає не в кожному середовищі, і розплата за це —
+ * `error:1E08010C:DECODER routines::unsupported` на першому ж підписі.
+ * Тут же перевіряється, що це справді ключ ES256 (EC P-256), а не будь-що, —
+ * інакше помилка випливла б лише на першому логіні.
+ */
+function ecKey(kind: 'private' | 'public') {
+  return z
+    .string()
+    .min(1)
+    .refine(
+      (b64) => {
+        try {
+          const pem = Buffer.from(b64, 'base64').toString('utf8');
+          const key = kind === 'private' ? createPrivateKey(pem) : createPublicKey(pem);
+          return key.asymmetricKeyType === 'ec' && key.asymmetricKeyDetails?.namedCurve === 'prime256v1';
+        } catch {
+          return false;
+        }
+      },
+      { message: `потрібен base64 від PEM ${kind === 'private' ? 'PKCS#8' : 'SPKI'} ключа EC P-256 (ES256)` },
+    );
+}
+
+/** Ідентифікатор ключа в заголовку JWT: `dev-2026-11`, `grader`. */
+const kid = z.string().regex(/^[A-Za-z0-9._-]{1,64}$/, 'kid: 1–64 символи з [A-Za-z0-9._-]');
+
+/**
+ * Секрети автентифікації (#24). Окремою схемою з однієї причини: вони
+ * приходять ЛИШЕ зі сховища — `scripts/with-secrets.sh` кладе їх у оточення
+ * процесу з `secrets/jwt/<env>/`. У `.env.example` їх немає свідомо, тому
+ * `scripts/check-env-example.mjs` звіряє файл лише з `envSchema`, а цю схему
+ * перевіряє протилежно: жоден ключ звідси не має права зʼявитись у `.env.example`.
+ *
+ * Жодного `.default()` тут немає і бути не може: дефолт ключа підпису — це
+ * ключ, зашитий у код, тобто будь-хто з доступом до репозиторію виписує собі
+ * токен будь-кого. Голий `npm run start` без обгортки падає тут, назвавши
+ * змінні, — до першого зʼєднання з базою.
+ */
+export const vaultSchema = z.object({
+  /** Приватний ключ підпису access-токенів. Ним володіє лише видавець — цей сервіс. */
+  JWT_PRIVATE_KEY: ecKey('private'),
+  /** Публічна половина тієї самої пари — нею перевіряється підпис. */
+  JWT_PUBLIC_KEY: ecKey('public'),
+  /** `kid` активної пари: іде в заголовок кожного виданого токена. */
+  JWT_KID: kid,
+  /**
+   * Overlap-ротація: публічний ключ ПОПЕРЕДНЬОЇ пари і його `kid`. Токени,
+   * підписані старим ключем до ротації, доживають свої хвилини, а нові вже
+   * підписуються новим. Обидві змінні разом або жодної.
+   */
+  JWT_PREVIOUS_PUBLIC_KEY: z.preprocess((v) => (v === '' ? undefined : v), ecKey('public').optional()),
+  JWT_PREVIOUS_KID: z.preprocess((v) => (v === '' ? undefined : v), kid.optional()),
+  /**
+   * «Перець» для HMAC-хешу refresh-токенів у базі. Без нього дамп таблиці
+   * `refresh_tokens` нічого не дає: хеш не перевірити, не знаючи перцю.
+   * Мінімум тут — лише запобіжник від порожнього чи обрізаного значення;
+   * стійкість дає `npm run keys:init`, який кладе в сховище 32 випадкові байти.
+   */
+  REFRESH_TOKEN_PEPPER: z.string().min(8, 'щонайменше 8 символів'),
+});
+
+/** Повна схема процесу: оточення + секрети сховища. */
+const fullSchema = envSchema.extend(vaultSchema.shape).superRefine((env, ctx) => {
+  // Пара, зібрана з двох різних ключів, підписувала б токени, які сам сервіс
+  // не зміг би перевірити: кожен запит — 401 без жодної зрозумілої причини.
+  try {
+    const derived = createPublicKey(Buffer.from(env.JWT_PRIVATE_KEY, 'base64').toString('utf8'));
+    const given = createPublicKey(Buffer.from(env.JWT_PUBLIC_KEY, 'base64').toString('utf8'));
+    if (!derived.equals(given)) {
+      ctx.addIssue({ code: 'custom', path: ['JWT_PUBLIC_KEY'], message: 'не є публічною половиною JWT_PRIVATE_KEY' });
+    }
+  } catch {
+    // Формат кожного ключа вже перевірив свій refine вище.
+  }
+  if ((env.JWT_PREVIOUS_PUBLIC_KEY === undefined) !== (env.JWT_PREVIOUS_KID === undefined)) {
+    ctx.addIssue({ code: 'custom', path: ['JWT_PREVIOUS_KID'], message: 'JWT_PREVIOUS_PUBLIC_KEY і JWT_PREVIOUS_KID задаються разом' });
+  }
+  if (env.JWT_PREVIOUS_KID !== undefined && env.JWT_PREVIOUS_KID === env.JWT_KID) {
+    ctx.addIssue({ code: 'custom', path: ['JWT_PREVIOUS_KID'], message: 'збігається з JWT_KID — після ротації kid має бути новий' });
+  }
+});
+
+export type Env = z.infer<typeof fullSchema>;
 
 /**
  * `ConfigModule.forRoot({ validate })` викликає це РІВНО ОДИН РАЗ і ДО того,
@@ -120,15 +210,21 @@ export type Env = z.infer<typeof envSchema>;
  * цикл «запустив — впало на одній змінній — виправив — впало на наступній».
  */
 export function validate(raw: Record<string, unknown>): Env {
-  const parsed = envSchema.safeParse(raw);
+  const parsed = fullSchema.safeParse(raw);
   if (parsed.success) return parsed.data;
 
   const lines = parsed.error.issues
     .map((issue) => `  ${issue.path.join('.') || '(root)'}: ${issue.message}`)
     .join('\n');
 
+  const vaultKeys = Object.keys(vaultSchema.shape);
+  const fromVault = parsed.error.issues.some((issue) => vaultKeys.includes(String(issue.path[0])));
   throw new Error(
     `Невалідна конфігурація середовища:\n${lines}\n\n` +
-      'Повний список змінних із коментарями — у .env.example (`cp .env.example .env`).',
+      'Повний список змінних із коментарями — у .env.example (`cp .env.example .env`).' +
+      (fromVault
+        ? '\nКлюч підпису й перець приходять лише зі сховища, не з .env: `npm run start:vault` ' +
+          '(bash scripts/with-secrets.sh dev …); ключі в сховищі створює `npm run keys:init`.'
+        : ''),
   );
 }

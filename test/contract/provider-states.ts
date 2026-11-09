@@ -12,11 +12,21 @@ import { STATE } from './pact.config';
  * `ON CONFLICT DO NOTHING` — щоб обробник можна було викликати скільки завгодно
  * разів: верифаєр кличе його перед КОЖНОЮ interaction зі своїм станом, а
  * `order 1001 exists` спирається ще й на товар із `product 501 is in stock`.
+ *
+ * Покупець 9002 — особа кожного запиту верифікації: requestFilter
+ * (provider.verify.test.ts) підставляє його токен. Тому він є в обох станах:
+ * замовлення 1001 — його, і POST з контракту оформлюється на нього ж.
  */
+export const PACT_BUYER_ID = '9002';
+
 async function seedProduct501(pool: Pool): Promise<void> {
   await pool.query(`
     INSERT INTO users (id, email, password_hash, role) OVERRIDING SYSTEM VALUE
     VALUES (9001, 'seller-9001@pact.local', '!', 'seller')
+    ON CONFLICT DO NOTHING;
+
+    INSERT INTO users (id, email, password_hash, role) OVERRIDING SYSTEM VALUE
+    VALUES (9002, 'buyer-9002@pact.local', '!', 'buyer')
     ON CONFLICT DO NOTHING;
 
     INSERT INTO products (id, seller_id, category, title, price_cents, stock) OVERRIDING SYSTEM VALUE
@@ -28,10 +38,6 @@ async function seedProduct501(pool: Pool): Promise<void> {
 async function seedOrder1001(pool: Pool): Promise<void> {
   await seedProduct501(pool);
   await pool.query(`
-    INSERT INTO users (id, email, password_hash, role) OVERRIDING SYSTEM VALUE
-    VALUES (9002, 'buyer-9002@pact.local', '!', 'buyer')
-    ON CONFLICT DO NOTHING;
-
     INSERT INTO orders (id, buyer_id, region, status, currency, subtotal_cents, discount_cents, total_cents, created_at)
     OVERRIDING SYSTEM VALUE
     VALUES (1001, 9002, 'UA', 'paid', 'UAH', 520000, 0, 520000, '2026-09-30T10:00:00Z')

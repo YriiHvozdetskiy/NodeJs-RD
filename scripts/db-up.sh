@@ -24,6 +24,9 @@ mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 [ -f "${REDIS_SECRET_FILE}" ] || printf 'redis-%s' "$(openssl rand -hex 16)" > "${REDIS_SECRET_FILE}"
 # Адреса Pact Broker зі сховища (#16) — за замовчуванням брокер із цього compose.
 [ -f ./secrets/pact_broker_url ] || printf 'http://127.0.0.1:9292' > ./secrets/pact_broker_url
+# Пари ES256 для dev і prod, їхні kid і перці refresh-токенів (#24). Наявні не
+# чіпаються: перегенерація ключа вбила б усі живі токени.
+node scripts/jwt-keys.mjs init
 
 PG_ADMIN_PASSWORD="$(cat "${ADMIN_SECRET_FILE}")"
 export PG_ADMIN_PASSWORD
@@ -59,7 +62,7 @@ echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:
 echo "RabbitMQ — на 127.0.0.1:5672 (UI: http://127.0.0.1:15672), Redis кешу — на 127.0.0.1:6379,"
 echo "Redis черги — на 127.0.0.1:6380; паролі вирівняні з secrets/."
 echo "Далі:"
-echo "  npm run start                       # застосунок на :3000"
+echo "  npm run start:vault                 # застосунок на :3000; ключі підпису — з secrets/jwt/dev/"
 echo "  curl -s localhost:3000/health/db    # запит через пул"
 echo "  npm run rotate                      # ротація пароля без рестарту"
 echo "  npm run build && npm run migrate    # схема через міграції TypeORM"

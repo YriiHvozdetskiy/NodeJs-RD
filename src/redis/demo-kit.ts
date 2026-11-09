@@ -1,5 +1,6 @@
 import { fork, type ChildProcess } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { NestFactory } from '@nestjs/core';
@@ -79,9 +80,7 @@ export interface Api {
  */
 export async function startApi(): Promise<Api> {
   const db = cliDbConfig();
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'demo-api-'));
-  const passwordFile = path.join(dir, 'db_password');
-  await writeFile(passwordFile, db.password, { mode: 0o600 });
+  const passwordFile = await demoPasswordFile(db.password);
 
   Object.assign(process.env, {
     DB_URL: `postgres://${encodeURIComponent(db.user)}@${db.host}:${db.port}/${encodeURIComponent(db.database)}`,
@@ -104,9 +103,31 @@ export async function startApi(): Promise<Api> {
     url,
     async close() {
       await app.close();
-      await rm(dir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Файл пароля БД — один на процес демо, а не на кожен startApi(). Причина в
+ * тому самому моменті валідації: ConfigModule.forRoot() перевіряє оточення раз,
+ * під час першого імпорту AppModule, і кожен наступний застосунок у цьому ж
+ * процесі бачить DB_PASSWORD_FILE ПЕРШОГО. demo:session перезапускає
+ * застосунок посеред прогону; поки файл видалявся разом із першим, другий
+ * ходив у базу з ENOENT. Сесіям це не заважало (вони в Redis), а resync
+ * денилиста (#24) на старті ходить у базу — і pg лишав напіввідкритий сокет,
+ * через який процес демо не завершувався. Тож файл живе, доки живе процес.
+ */
+let sharedPasswordFile: Promise<string> | undefined;
+
+function demoPasswordFile(password: string): Promise<string> {
+  sharedPasswordFile ??= (async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'demo-api-'));
+    process.once('exit', () => rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, 'db_password');
+    await writeFile(file, password, { mode: 0o600 });
+    return file;
+  })();
+  return sharedPasswordFile;
 }
 
 /** Повідомлення пода батьківському процесу демо (IPC). */

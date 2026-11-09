@@ -28,6 +28,11 @@
 #
 #   bash scripts/with-secrets.sh dev node dist/worker.js
 #
+# З ДЗ #24 — ключ підпису JWT, його kid і перець refresh-токенів із
+# secrets/jwt/dev/. `npm run start:vault` і demo:auth|reuse|rbac — саме так.
+#
+#   bash scripts/with-secrets.sh dev npm run start
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -48,6 +53,30 @@ if [ "${SKIP_VAULT:-0}" = "1" ]; then
     parse_database_url "${DATABASE_URL}"
     export DB_HOST="${DBU_HOST}" DB_PORT="${DBU_PORT}" DB_USER="${DBU_USER}" \
            DB_PASSWORD="${DBU_PASS}" DB_NAME="${DBU_NAME}"
+  fi
+
+  # Сам застосунок (src/db/connection.ts) читає не DB_*, а DB_URL без пароля і
+  # файл із паролем — контракт #11. Без цього блоку `npm run start:vault` під
+  # SKIP_VAULT падав на `DB_URL: expected string`: у свіжому клоні .env немає, а
+  # демо цього не бачили, бо їхній startApi() ставить DB_URL сам.
+  #
+  # Обидва значення — з того самого DATABASE_URL. Файл secrets/db_password цієї
+  # машини тут не годиться: він належить app_user, а адреса грейдера — admin.
+  # Файл тимчасовий (0600), і саме тому тут немає exec: після exec прибрати його
+  # було б нікому, а так його видаляє trap, коли команда завершилась.
+  if [ -n "${DATABASE_URL:-}" ] && [ -z "${DB_URL:-}" ]; then
+    # shellcheck source=scripts/lib/db.sh
+    source "${ROOT}/scripts/lib/db.sh"
+    parse_database_url "${DATABASE_URL}"
+    export DB_URL="postgres://${DBU_USER}@${DBU_HOST}:${DBU_PORT}/${DBU_NAME}"
+    if [ -z "${DB_PASSWORD_FILE:-}" ]; then
+      DB_PASSWORD_FILE="$(umask 077 && mktemp "${TMPDIR:-/tmp}/marketplace-db-password.XXXXXX")"
+      export DB_PASSWORD_FILE
+      trap 'rm -f "${DB_PASSWORD_FILE}"' EXIT
+      printf '%s' "${DBU_PASS}" > "${DB_PASSWORD_FILE}"
+      "$@"
+      exit 0
+    fi
   fi
   exec "$@"
 fi
@@ -140,5 +169,27 @@ for var in REDIS_CACHE_URL REDIS_QUEUE_URL; do
     export "${var}=${scheme}://:${pass}@${rest}"
   fi
 done
+
+# Ключ підпису access-токенів і перець refresh-хешів (#24) — із
+# secrets/jwt/<оточення>/, які генерує scripts/jwt-keys.mjs. PEM їде base64-ом
+# цілого файла: багаторядковий PEM в export виживає не скрізь. `tr -d '\n'` —
+# бо GNU base64 переносить рядки, а macOS ні.
+#
+# Немає теки — немає змінних, і застосунок падає з їхніми назвами (fail-fast
+# у src/config/env.schema.ts). Міграціям, seed і решті CLI ключ не потрібен.
+JWT_DIR="${ROOT}/secrets/jwt/${ENV_SLUG}"
+if [ -f "${JWT_DIR}/private.pem" ]; then
+  JWT_PRIVATE_KEY="$(base64 < "${JWT_DIR}/private.pem" | tr -d '\n')"
+  JWT_PUBLIC_KEY="$(base64 < "${JWT_DIR}/public.pem" | tr -d '\n')"
+  JWT_KID="$(cat "${JWT_DIR}/kid")"
+  REFRESH_TOKEN_PEPPER="$(cat "${JWT_DIR}/refresh_pepper")"
+  export JWT_PRIVATE_KEY JWT_PUBLIC_KEY JWT_KID REFRESH_TOKEN_PEPPER
+  # Overlap-ротація: стара публічна половина ще перевіряє токени, виписані до ротації.
+  if [ -f "${JWT_DIR}/previous_public.pem" ]; then
+    JWT_PREVIOUS_PUBLIC_KEY="$(base64 < "${JWT_DIR}/previous_public.pem" | tr -d '\n')"
+    JWT_PREVIOUS_KID="$(cat "${JWT_DIR}/previous_kid")"
+    export JWT_PREVIOUS_PUBLIC_KEY JWT_PREVIOUS_KID
+  fi
+fi
 
 exec "$@"

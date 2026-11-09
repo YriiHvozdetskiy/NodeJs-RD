@@ -20,7 +20,8 @@ const PROBLEM_BASE = 'https://api.marketplace.example/problems';
 // Назва КЛАСУ проблеми — однакова для всіх випадків цього статусу.
 const TITLES: Record<number, string> = {
   400: 'Некоректний запит',
-  401: 'Потрібна сесія',
+  401: 'Потрібна автентифікація',
+  403: 'Доступ заборонено',
   404: 'Ресурс не знайдено',
   409: 'Конфлікт зі станом ресурсу',
   422: 'Запит неможливо опрацювати',
@@ -32,6 +33,7 @@ const TITLES: Record<number, string> = {
 const SLUGS: Record<number, ProblemCode> = {
   400: 'bad-request',
   401: 'unauthenticated',
+  403: 'forbidden',
   404: 'not-found',
   409: 'conflict',
   422: 'unprocessable-entity',

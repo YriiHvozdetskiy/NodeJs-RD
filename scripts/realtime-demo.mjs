@@ -10,14 +10,20 @@
 // Код виходу: 0 — результат збігся з очікуваним, 1 — ні (ізоляцію порушено
 // або подія не дійшла), 2 — демо не змогло відбутися (сервер, HTTP, join).
 //
-// Сервер має бути запущений (`npm run start`). API_URL і BUYER_EMAIL
-// перевизначають адресу й покупця.
+// Сервер має бути запущений (`npm run start:vault`), база — засіяна (`npm run
+// seed`): з #24 усе під токеном, і демо логіниться сід-користувачами з
+// паролем `marketplace-dev`. API_URL, BUYER_EMAIL і SEED_PASSWORD
+// перевизначають адресу, покупця й пароль.
 import { randomUUID } from 'node:crypto';
 import { io } from 'socket.io-client';
 
 const BASE = process.env.API_URL ?? 'http://localhost:3000';
-// Власник замовлень, які створює v1 без авторизації (src/orders/orders.service.ts).
-const BUYER = process.env.BUYER_EMAIL ?? 'guest@marketplace.local';
+// Власник замовлень — покупець із сіду (src/seed-data.ts); чужий — інший
+// покупець звідти ж; статус замовлення міняє лише адмін.
+const BUYER = process.env.BUYER_EMAIL ?? 'olena@marketplace.test';
+const STRANGER = 'taras@marketplace.test';
+const ADMIN = 'admin@marketplace.test';
+const PASSWORD = process.env.SEED_PASSWORD ?? 'marketplace-dev';
 const SAME_ROOM = process.argv.includes('--same-room');
 
 const ACK_TIMEOUT_MS = 3000;
@@ -39,12 +45,12 @@ setTimeout(() => {
   process.exit(2);
 }, DEADLINE_MS).unref();
 
-async function api(method, path, body, headers = {}) {
+async function api(method, path, body, headers = {}, token) {
   let res;
   try {
     res = await fetch(`${BASE}/v1${path}`, {
       method,
-      headers: { 'content-type': 'application/json', ...headers },
+      headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (err) {
@@ -54,8 +60,15 @@ async function api(method, path, body, headers = {}) {
   return { status: res.status, json };
 }
 
-/** Нове замовлення від гостя. Залишку у товару може не бути (409) — тоді наступний. */
-async function createOrder() {
+/** Access-токен сід-користувача. */
+async function tokenOf(email) {
+  const { status, json } = await api('POST', '/auth/login', { email, password: PASSWORD });
+  if (status !== 200) throw new SetupError(`login ${email} → ${status} ${json?.detail ?? ''} — спершу npm run seed`);
+  return json.access_token;
+}
+
+/** Нове замовлення покупця. Залишку у товару може не бути (409) — тоді наступний. */
+async function createOrder(token) {
   const { status, json } = await api('GET', '/products?limit=50');
   if (status !== 200) throw new SetupError(`GET /products → ${status}`);
   for (const product of json.items) {
@@ -64,6 +77,7 @@ async function createOrder() {
       '/orders',
       { items: [{ product_id: product.id, qty: 1 }] },
       { 'Idempotency-Key': randomUUID() },
+      token,
     );
     if (created.status === 201) return created.json.id;
     if (created.status !== 409) throw new SetupError(`POST /orders → ${created.status} ${created.json?.detail ?? ''}`);
@@ -103,21 +117,22 @@ async function joinOrFail(name, socket, orderId) {
 const sockets = [];
 
 async function main() {
-  const orderA = await createOrder();
-  const orderB = await createOrder();
+  const [buyer, strangerToken, admin] = [await tokenOf(BUYER), await tokenOf(STRANGER), await tokenOf(ADMIN)];
+  const orderA = await createOrder(buyer);
+  const orderB = await createOrder(buyer);
   const roomB = SAME_ROOM ? orderA : orderB;
   log(`режим: ${SAME_ROOM ? 'контрольний, обидва в кімнаті A' : 'ізоляція, різні кімнати'}`);
 
-  const a = await connect('A', { email: BUYER });
-  const b = await connect('B', { email: BUYER });
+  const a = await connect('A', { token: buyer });
+  const b = await connect('B', { token: buyer });
   sockets.push(a, b);
 
   // Перевірка власника: ні анонім, ні чужий у кімнату A не потрапляють.
   const anonymous = await connect('anon', {});
-  const stranger = await connect('stranger', { email: 'stranger@marketplace.test' });
+  const stranger = await connect('stranger', { token: strangerToken });
   sockets.push(anonymous, stranger);
   const refused = [await join(anonymous, orderA), await join(stranger, orderA)];
-  log(`join orders:${orderA} без email → ${refused[0].error ?? 'ПРИЙНЯТО'}, чужим → ${refused[1].error ?? 'ПРИЙНЯТО'}`);
+  log(`join orders:${orderA} без токена → ${refused[0].error ?? 'ПРИЙНЯТО'}, чужим → ${refused[1].error ?? 'ПРИЙНЯТО'}`);
 
   // Спершу ack від join — і лише потім зміна статусу. Інакше подія вилетить
   // раніше, ніж сервер поклав клієнта в кімнату, і «не отримав» означатиме
@@ -136,7 +151,7 @@ async function main() {
     if (event.order_id === orderA) received.B += 1;
   });
 
-  const patched = await api('PATCH', `/orders/${orderA}`, { status: 'paid' });
+  const patched = await api('PATCH', `/orders/${orderA}`, { status: 'paid' }, {}, admin);
   if (patched.status !== 200) throw new SetupError(`PATCH /orders/${orderA} → ${patched.status} ${patched.json?.detail ?? ''}`);
   log(`замовлення ${orderA}: pending → paid`);
 

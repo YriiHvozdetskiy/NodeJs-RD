@@ -19,8 +19,9 @@ const schemaPath = path.join(root, 'dist', 'config', 'env.schema.js');
 const examplePath = path.join(root, '.env.example');
 
 let envSchema;
+let vaultSchema;
 try {
-  ({ envSchema } = require(schemaPath));
+  ({ envSchema, vaultSchema } = require(schemaPath));
 } catch (err) {
   console.error(`✗ Не вдалось прочитати схему з ${path.relative(root, schemaPath)}`);
   console.error(`  ${err.message}`);
@@ -33,7 +34,12 @@ const schemaKeys = Object.keys(envSchema.shape).sort();
 const fileKeys = Object.keys(parse(raw)).sort();
 
 const missing = schemaKeys.filter((key) => !fileKeys.includes(key)); // є в схемі, нема у файлі
-const extra = fileKeys.filter((key) => !schemaKeys.includes(key)); // є у файлі, нема в схемі
+// Секрети сховища (#24) — ключ підпису й перець — у env-файлі бути не можуть
+// навіть плейсхолдером: `cp .env.example .env` і вписане «тимчасово» значення
+// — рівно той шлях, яким ключ опиняється поза сховищем.
+const vaultKeys = Object.keys(vaultSchema.shape);
+const leaked = fileKeys.filter((key) => vaultKeys.includes(key));
+const extra = fileKeys.filter((key) => !schemaKeys.includes(key) && !vaultKeys.includes(key)); // є у файлі, нема в схемі
 
 // Друга половина конвенції: змінна без пояснення нічим не краща за відсутню.
 // Коментарем вважається найближчий непорожній рядок вище — саме так файл і читають.
@@ -48,8 +54,9 @@ const undocumented = fileKeys.filter((key) => {
   return true;
 });
 
-if (missing.length || extra.length || undocumented.length) {
+if (missing.length || extra.length || undocumented.length || leaked.length) {
   if (missing.length) console.error(`✗ Нема в .env.example: ${missing.join(', ')}`);
+  if (leaked.length) console.error(`✗ Секрет сховища у .env.example (йому місце лише в secrets/): ${leaked.join(', ')}`);
   if (extra.length) console.error(`✗ Зайве у .env.example (у схемі відсутнє): ${extra.join(', ')}`);
   if (undocumented.length) console.error(`✗ Без коментаря у .env.example: ${undocumented.join(', ')}`);
   process.exit(1);

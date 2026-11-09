@@ -3,6 +3,11 @@
  * трансформерів на льоту: esbuild-транспілятори не емітять декоратор-метадані,
  * і Nest без них не збере DI-граф. `npm run build:test` компілює src/ і test/
  * разом за tsconfig.test.json.
+ *
+ * `NODE_OPTIONS=--experimental-vm-modules` у npm-скриптах тестів — з #24:
+ * `jose` має лише ESM-збірку. Сам Node 22+ підвантажує її через require(esm),
+ * а модульна система Jest — лише коли є `vm.SourceTextModule`, тобто з цим
+ * прапорцем. Без нього: `Must use import to load ES Module: …/jose/…`.
  */
 
 // Ядро Pact (Rust) шле анонімну телеметрію в google-analytics на кожен прогін:

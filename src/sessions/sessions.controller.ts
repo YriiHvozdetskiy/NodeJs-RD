@@ -1,6 +1,7 @@
 import { Controller, Delete, Get, HttpCode, Post, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { HttpProblem } from '../common/http-problem';
+import { Public } from '../auth/guards';
 import type { Session } from './session-store';
 import { readCookie, SESSION_COOKIE, sessionOf, SessionsService, sessionUnreadable } from './sessions.service';
 
@@ -12,18 +13,20 @@ interface SessionView {
 }
 
 /**
- * Гостьова сесія (#23). Логіну ще немає — його приносить #24 і пише userId у
- * ту саму сесію. Тут — лише механіка: де живе стан, як він подовжується і як
- * його відкликати.
+ * Гостьова сесія (#23): механіка серверного стану — де він живе, як
+ * подовжується і як його відкликати. Логін #24 пішов іншим шляхом — JWT +
+ * refresh-токени (src/auth/), — тож сесія лишилась гостьовою і токена не
+ * потребує.
  */
+@Public()
 @Controller('sessions')
 export class SessionsController {
   constructor(private readonly sessions: SessionsService) {}
 
   /**
-   * Нова сесія завжди з НОВИМ id; стара, якщо була, видаляється. На #24 саме
-   * тут стане логін, і це захист від session fixation: id, який хтось
-   * підсунув браузеру до входу, після входу нічого не означає.
+   * Нова сесія завжди з НОВИМ id; стара, якщо була, видаляється. Це захист
+   * від session fixation: id, який хтось підсунув браузеру раніше, після
+   * створення сесії нічого не означає.
    */
   @Post()
   @HttpCode(201)

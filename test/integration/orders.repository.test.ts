@@ -47,8 +47,9 @@ describe('OrdersRepository · Postgres 16 у testcontainers', () => {
     }
     const repo = new OrdersRepository(db());
 
-    const first = await repo.page(2);
-    const second = await repo.page(2, first.next_cursor ?? undefined);
+    // null — без фільтра по покупцю, як для адміна.
+    const first = await repo.page(2, undefined, null);
+    const second = await repo.page(2, first.next_cursor ?? undefined, null);
 
     expect(first.items.map((o) => [o.id, o.items.length])).toEqual([
       [orders[2].id, 3],
@@ -56,6 +57,17 @@ describe('OrdersRepository · Postgres 16 у testcontainers', () => {
     ]);
     expect(second.items.map((o) => [o.id, o.items.length])).toEqual([[orders[0].id, 3]]);
     expect(second.next_cursor).toBeNull();
+  });
+
+  test('page з buyerId: власність у WHERE — чужі замовлення в сторінку не потрапляють', async () => {
+    // Кожен anOrder() без byBuyer створює власного покупця: три замовлення — три власники.
+    const orders = [await anOrder().insert(db()), await anOrder().insert(db()), await anOrder().insert(db())];
+    const mine = await anOrder().byBuyer(orders[1].buyerId).insert(db());
+
+    const page = await new OrdersRepository(db()).page(10, undefined, String(orders[1].buyerId));
+
+    expect(page.items.map((o) => o.id).sort((a, b) => a - b)).toEqual([orders[1].id, mine.id].sort((a, b) => a - b));
+    expect(page.next_cursor).toBeNull();
   });
 
   test('FOREIGN KEY RESTRICT: товар, який хтось купив, не видалити (23503)', async () => {
