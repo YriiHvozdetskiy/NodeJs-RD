@@ -62,7 +62,7 @@ echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:
 echo "RabbitMQ — на 127.0.0.1:5672 (UI: http://127.0.0.1:15672), Redis кешу — на 127.0.0.1:6379,"
 echo "Redis черги — на 127.0.0.1:6380; паролі вирівняні з secrets/."
 echo "Далі:"
-echo "  npm run start                       # застосунок на :3000"
+echo "  npm run start:vault                 # застосунок на :3000; ключі підпису — з secrets/jwt/dev/"
 echo "  curl -s localhost:3000/health/db    # запит через пул"
 echo "  npm run rotate                      # ротація пароля без рестарту"
 echo "  npm run build && npm run migrate    # схема через міграції TypeORM"
