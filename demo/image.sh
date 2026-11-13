@@ -5,6 +5,8 @@
 #   stages            — скільки FROM у docker/Dockerfile (єдине, що читається з файла);
 #   shell-inside      — спроба запустити sh / bash / busybox sh у контейнері;
 #   runtime-uid       — uid процесу node, яким образ стартує;
+#   build-token-verified — .npm_token той самий, яким зібрано образ (відбиток
+#                       .image-build від image:build); інакше демо падає;
 #   token-in-history  — рядків `docker history --no-trunc` із токеном;
 #   token-in-config   — входжень токена в `docker image inspect` (ENV, LABEL, Cmd…);
 #   token-in-layers   — шарів розпакованого `docker save`, у байтах яких є токен.
@@ -23,6 +25,20 @@ DOCKERFILE="docker/Dockerfile"
 
 [ -s "${TOKEN_FILE}" ] || { echo "demo:image: немає ${TOKEN_FILE} — нема чого шукати в образі" >&2; exit 1; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || { echo "demo:image: немає образу ${IMAGE} — спершу npm run image:build" >&2; exit 1; }
+
+# Шукати є сенс лише тим токеном, яким образ справді збирали: перегенерований
+# .npm_token на старому образі дав би token-in-*=0, хоча нічого не перевірено.
+# image:build лишає відбиток — id образу і sha256 токена; обидва мають збігтися.
+STAMP_FILE="${IMAGE_STAMP_FILE:-.image-build}"
+[ -s "${STAMP_FILE}" ] || { echo "demo:image: немає ${STAMP_FILE} — образ зібрано не через npm run image:build" >&2; exit 1; }
+stamp() { sed -n "s/^$1=//p" "${STAMP_FILE}"; }
+sha256_file() {
+  node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"
+}
+[ "$(stamp id)" = "$(docker image inspect --format '{{.Id}}' "${IMAGE}")" ] \
+  || { echo "demo:image: ${IMAGE} зібрано не останнім npm run image:build (id не той, що в ${STAMP_FILE})" >&2; exit 1; }
+[ "$(stamp token-sha256)" = "$(sha256_file "${TOKEN_FILE}")" ] \
+  || { echo "demo:image: ${TOKEN_FILE} не той, яким збирали ${IMAGE} — npm run image:build" >&2; exit 1; }
 TOKEN="$(cat "${TOKEN_FILE}")"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/demo-image.XXXXXX")"
@@ -81,6 +97,7 @@ echo "size-mb=${size_mb}"
 echo "stages=${stages}"
 echo "shell-inside=$(shell_inside "${IMAGE}")"
 echo "runtime-uid=${runtime_uid}"
+echo "build-token-verified=1"
 echo "token-in-history=$(count_in_history "${IMAGE}" "${TOKEN}")"
 echo "token-in-config=$(count_in_config "${IMAGE}" "${TOKEN}")"
 echo "token-in-layers=$(count_in_layers "${IMAGE}" "${TOKEN}" "${WORK}/main")"

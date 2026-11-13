@@ -26,4 +26,12 @@ DOCKER_BUILDKIT=1 docker build \
   --tag "${IMAGE}" \
   .
 
+# Відбиток збірки: який образ і яким токеном зібрано. demo:image шукає в образі
+# рядок із .npm_token і без цієї звірки на перегенерованому файлі показав би
+# тихий нуль. Сам токен сюди не пишеться — лише його sha256; файл у .gitignore.
+STAMP_FILE="${IMAGE_STAMP_FILE:-.image-build}"
+token_sha="$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "${TOKEN_FILE}")"
+printf 'image=%s\nid=%s\ntoken-sha256=%s\n' \
+  "${IMAGE}" "$(docker image inspect --format '{{.Id}}' "${IMAGE}")" "${token_sha}" > "${STAMP_FILE}"
+
 echo "image=${IMAGE}"
