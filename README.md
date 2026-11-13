@@ -2958,6 +2958,12 @@ kind і Pulumi CLI я на машину не ставив. Якщо їх нем�
 export PATH="$PWD/scripts/bin:$PATH"
 ```
 
+Стек скрипти вибирають змінною `PULUMI_STACK` (за замовчуванням `kind`), а не
+станом `pulumi stack select`. Той стан лежить у `PULUMI_HOME`, а він у системного
+pulumi (`~/.pulumi`) і в контейнера (том `marketplace-pulumi-home`) різний. Якщо
+`npm run up` пройшов системним pulumi, а `pulumi preview` після `export PATH` —
+контейнерним, другий падав з `no stack selected`, так і не дійшовши до програми.
+
 ### Кластер
 
 Підіймав на **kind v0.32.0** (Kubernetes 1.36.1), один вузол. Docker Desktop має
@@ -3003,6 +3009,7 @@ Deployment значень немає.
 | `STORAGE_SECRET_KEY` | сховище (#11); у kind порожня | Secret API, якщо непорожня |
 | `PULUMI_CONFIG_PASSPHRASE` | сховище (#11): `secrets/pulumi_passphrase`, генерує `npm run db:up` | ключ шифрування стану Pulumi в `.pulumi/` |
 | `PULUMI_BACKEND_URL` | оточення; за замовчуванням `file://<репо>/.pulumi` | локальний бекенд стану, без `pulumi login` |
+| `PULUMI_STACK` | оточення; за замовчуванням `kind` (`scripts/infra.sh`, `scripts/lib/tools.sh`) | вибір стеку без стану в `PULUMI_HOME` |
 
 Два види «немає значення». Без змінної з першої групи (`DB_URL`, `DB_PASSWORD`,
 `REDIS_QUEUE_URL`, ключі JWT, перець) застосунок не стартує — програма падає й
@@ -3038,6 +3045,7 @@ size-mb=241
 stages=2
 shell-inside=0
 runtime-uid=65532
+build-token-verified=1
 token-in-history=0
 token-in-config=0
 token-in-layers=0
@@ -3074,6 +3082,14 @@ control-token-in-layers=1
 Історія — два рядки (`ARG` і `ENV`), конфіг — `ENV`, шари — шар із `COPY`. На
 справжньому образі ті самі лічильники дають нулі, і це вже не «нічого не знайшов,
 бо не вміє шукати».
+
+Другий спосіб отримати нуль, нічого не перевіривши, — шукати не той рядок.
+Якщо `.npm_token` перегенерувати після збірки, демо шукало б в образі новий
+токен, якого там і не могло бути. Тому `image:build` лишає відбиток
+`.image-build` (у `.gitignore`): id образу і sha256 токена, без самого токена.
+Демо звіряє обидва перед пошуком. Інший токен, образ, перезібраний в обхід
+`image:build`, або відсутній відбиток — це вихід з кодом 1 і назва причини.
+Пройдена звірка — це рядок `build-token-verified=1`.
 
 `npm ci --ignore-scripts`: для збірки потрібен лише tsc, а install-скрипти
 залежностей — найкоротший шлях supply-chain атаки. Те саме правило, що
@@ -3646,7 +3662,8 @@ npm run build && npm run edge    # кеш-шар окремим процесом
 Якщо kind і pulumi в системі немає, `npm run cluster:up` і `npm run up` самі
 запускають ті самі версії з контейнера `marketplace-tools:hw28`; для команд
 критеріїв, що викликають `pulumi` напряму, тоді потрібен ще
-`export PATH="$PWD/scripts/bin:$PATH"`. Postgres, Redis і міграції піднімає сама
+`export PATH="$PWD/scripts/bin:$PATH"`. Стек — `kind` зі змінної `PULUMI_STACK`,
+тож системний і контейнерний pulumi бачать його однаково. Postgres, Redis і міграції піднімає сама
 Pulumi-програма — `docker compose` тут не потрібен.
 
 ```bash
@@ -3852,6 +3869,8 @@ npm run destroy && npm run cluster:down
 | 2026-11-09 | `Pulumi.<stack>.yaml` не в git; конфіг стеку з типами й дефолтами — у `config:` файлу `Pulumi.yaml` | Файл стеку несе `encryptionsalt` під passphrase конкретної машини: грейдер зі своєю passphrase його б не розшифрував. А `rev` перемикає `demo:rollout` |
 | 2026-11-13 | Правило lifecycle зливається з наявними за ID, а не ставиться лише на бакет без lifecycle | Ревʼю: на бакеті з будь-яким чужим правилом незавершені multipart не скасовувались ніколи — крок мовчки пропускався. `Put…Lifecycle` замінює конфігурацію цілком, тож тепер read-modify-write; `demo:multipart` перевіряє це на бакеті з чужим правилом |
 | 2026-11-13 | Edge читає `no-cache` / `max-age=0` із запиту і перевіряє запис в origin за ETag | Ревʼю: клієнт не міг змусити ревалідацію, «жорстке» оновлення віддавало збережене. HeadObject замість умовного GET, бо SDK подає `304` як виняток |
+| 2026-11-13 | Стек Pulumi — зі змінної `PULUMI_STACK` (за замовчуванням `kind`), а не з `pulumi stack select` | Ревʼю: `npm run up` системним pulumi, потім `pulumi preview` з `scripts/bin` у `PATH` — `no stack selected`. Вибраний стек лежить у `PULUMI_HOME`, а він у системного pulumi і в контейнера різний |
+| 2026-11-13 | `demo:image` звіряє `.npm_token` з відбитком збірки `.image-build` (id образу + sha256 токена) | Ревʼю: перегенерований токен на старому образі давав `token-in-*=0` — тихий нуль без перевірки. Тепер це вихід 1 з причиною |
 
 ## Запуск
 
