@@ -54,8 +54,13 @@ tools_run() {
   [ -t 0 ] && [ -t 1 ] && args+=(-t)
 
   if [ "${tool}" = "pulumi" ]; then
-    # Плагін провайдера Kubernetes і вибраний стек живуть між запусками в томі.
-    args+=(-e PULUMI_HOME=/pulumi-home -v marketplace-pulumi-home:/pulumi-home)
+    # Плагін провайдера Kubernetes живе між запусками в томі. Вибраний стек — ні:
+    # `pulumi stack select` пише його в PULUMI_HOME, а в системного pulumi
+    # (ним `npm run up` користується, якщо він є) PULUMI_HOME свій — ~/.pulumi.
+    # Тоді `pulumi preview` через scripts/bin у PATH падав «no stack selected».
+    # PULUMI_STACK вибирає стек без збереженого стану, однаково для обох pulumi.
+    args+=(-e PULUMI_HOME=/pulumi-home -v marketplace-pulumi-home:/pulumi-home
+      -e "PULUMI_STACK=${PULUMI_STACK:-kind}")
     if [ -f "${TOOLS_INTERNAL_KUBECONFIG}" ] && docker network inspect kind >/dev/null 2>&1; then
       args+=(--network kind -e "KUBECONFIG=${TOOLS_INTERNAL_KUBECONFIG}")
     else

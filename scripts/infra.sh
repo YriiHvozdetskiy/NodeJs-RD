@@ -11,7 +11,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTION="${1:-up}"
-STACK="${PULUMI_STACK:-kind}"
+# Стек — зі змінної, а не зі стану PULUMI_HOME: так його бачить і pulumi, який
+# грейдер запускає напряму (`cd infra && pulumi preview`), — scripts/lib/tools.sh.
+export PULUMI_STACK="${PULUMI_STACK:-kind}"
 
 # pulumi із системи, а якщо його немає — Pulumi CLI 3.272.0 із контейнера (scripts/lib/tools.sh).
 source "${ROOT}/scripts/lib/tools.sh"
@@ -26,7 +28,7 @@ cd "${ROOT}/infra"
 
 # Свіжий клон стеку ще не має: --create робить його з passphrase-шифруванням
 # секретів (ключ — PULUMI_CONFIG_PASSPHRASE зі сховища).
-"${PULUMI}" stack select --create "${STACK}" --non-interactive >/dev/null
+"${PULUMI}" stack select --create "${PULUMI_STACK}" --non-interactive >/dev/null
 
 case "${ACTION}" in
   up)      "${PULUMI}" up --yes --non-interactive --skip-preview ;;
