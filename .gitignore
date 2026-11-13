@@ -168,3 +168,16 @@ dist-test/
 # в CI-джобі contract. Джерело правди — test/contract/consumer.pact.test.ts,
 # а спільна копія живе в Pact Broker, не в git.
 pacts/
+
+# ДЗ #28. Токен-приманка етапу збірки (секрет BuildKit) — у git його немає.
+.npm_token
+# Відбиток останньої збірки (id образу + sha256 токена) — demo:image звіряє з ним .npm_token.
+.image-build
+# Локальний файловий бекенд Pulumi (PULUMI_BACKEND_URL=file://…/.pulumi): стан стеку.
+.pulumi/
+# Файл стеку Pulumi містить encryptionsalt під passphrase конкретної машини і
+# поточну ревізію rollout-демо. Значення за замовчуванням — у infra/Pulumi.yaml.
+infra/Pulumi.*.yaml
+
+# kind (#28): внутрішній kubeconfig для Pulumi з контейнера (scripts/lib/tools.sh).
+.kind/

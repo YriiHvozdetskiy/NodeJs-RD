@@ -52,3 +52,17 @@ pacts
 jest.config.js
 tsconfig.test.json
 .github
+
+# ДЗ #28. Токен-приманка етапу збірки: у контекст він не потрапляє ніколи,
+# у RUN приходить лише як BuildKit-секрет (--secret id=npm_token).
+.npm_token
+.image-build
+
+# Кластер, Pulumi-програма, її стан і демо в образі не потрібні.
+# З docker/ у контекст іде лише npmrc — його bind-mount-ить RUN npm ci.
+infra
+k8s
+demo
+.pulumi
+docker/*
+!docker/npmrc

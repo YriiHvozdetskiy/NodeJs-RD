@@ -1,0 +1,5 @@
+# Конфіг npm для збірки образу. Монтується в RUN через bind, у шари не потрапляє.
+# Пакети скоупу @marketplace-private живуть у приватному реєстрі; токен до нього
+# npm підставляє зі змінної NPM_TOKEN, яку RUN читає з BuildKit-секрету.
+@marketplace-private:registry=https://npm.marketplace.invalid/
+//npm.marketplace.invalid/:_authToken=${NPM_TOKEN}

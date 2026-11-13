@@ -1,6 +1,7 @@
 # Локальна інфраструктура курсового проєкту: Postgres, PgBouncer перед ним,
 # Pact Broker для контрактних тестів, RabbitMQ для подій домену, два Redis
-# (кеш і черга) і (лише для restore-drill) чистий Postgres для відновлення. Застосунок на цьому етапі зручніше тримати на хості
+# (кеш і черга), S3-сумісне сховище файлів і (лише для restore-drill) чистий
+# Postgres для відновлення. Застосунок на цьому етапі зручніше тримати на хості
 # (`npm run start`), бо ротація перевіряється через uptime процесу, а не
 # контейнера.
 name: marketplace
@@ -212,6 +213,46 @@ services:
       retries: 15
     restart: unless-stopped
 
+  # S3-сумісне сховище файлів (#26): фото товарів, аватарки, дампи #15.
+  #
+  # RustFS, а не MinIO: 11.09.2026 образи minio/minio зникли з Docker Hub, а
+  # quay.io/minio/minio вимагає авторизації — свіжий клон стенд на MinIO не
+  # підняв би. RustFS говорить тим самим S3 API і на перевірках цього ДЗ
+  # відповідає як AWS: анонімний GET у приватний бакет — 403, протухлий і
+  # підмінений presigned — 403, частина < 5 МіБ у середині multipart —
+  # EntityTooSmall. Garage з лекції тут не годиться: протухлий URL він
+  # відхиляє кодом 400, а не 403.
+  #
+  # Тег 1.0.4 закріплено явно, але від зникнення реєстру pin не рятує — урок
+  # MinIO. Рятує лише своє дзеркало образу.
+  storage:
+    image: rustfs/rustfs:1.0.4
+    # Той самий прийом, що з PG_ADMIN_PASSWORD: свіжий клон і грейдер
+    # отримують дев-креденшел із цього файла, робоча машина — згенеровані
+    # secrets/storage_access_key і secrets/storage_secret_key (db-up.sh).
+    # Ключі root RustFS читає з оточення на кожному старті — вирівнювати
+    # після up нічого.
+    environment:
+      RUSTFS_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-marketplace}
+      RUSTFS_SECRET_KEY: ${STORAGE_SECRET_KEY:-marketplace-dev}
+    # Loopback, як і решта стенда. 22650 — S3 API, 22651 — веб-консоль.
+    # Не 9000: це типовий порт MinIO, і на машинах курсу він буває зайнятий.
+    ports:
+      - '127.0.0.1:22650:9000'
+      - '127.0.0.1:22651:9001'
+    volumes:
+      # Іменований том, а не tmpfs. Рядки таблиці files живуть у pgdata і
+      # переживають `down`; обʼєкти, на які вони вказують, мусять переживати
+      # його так само. Інакше після рестарту стенда в базі лишились би
+      # COMPLETED-файли, яких у сховищі вже немає.
+      - storagedata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS -o /dev/null http://127.0.0.1:9000/health']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
   # Чистий Postgres для restore-drill. Без профілю `drill` не стартує:
   # scripts/restore-drill.sh піднімає його сам і сам прибирає разом із томом.
   # Том даних навмисно анонімний: `rm -v` зносить його разом із контейнером,
@@ -242,4 +283,5 @@ volumes:
   pgdata:
   rabbitdata:
   redisqueuedata:
+  storagedata:
 

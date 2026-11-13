@@ -24,6 +24,23 @@ export const envSchema = z.object({
   /** Порт HTTP-сервера. */
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
 
+  /**
+   * Прогрів до `listen()`, мс (#28). Імітує те, що в справжнього сервісу займає
+   * секунди: міграції, прогрів пулу, кешу. Поки слухача немає, запит отримує
+   * «connection refused» — і саме це вікно видно під час rolling update без
+   * readinessProbe. Локально 0; у кластері розгортання ставить 4000.
+   */
+  WARMUP_MS: z.coerce.number().int().min(0).max(120_000).default(0),
+
+  /**
+   * Дренаж після SIGTERM, мс (#28): скільки процес ще відповідає, уже кажучи
+   * readinessProbe «не готовий», перш ніж закрити сокет. Цей час потрібен
+   * kube-proxy, щоб прибрати под з балансування. Має бути меншим за
+   * terminationGracePeriodSeconds, інакше SIGKILL прийде посеред дренажу.
+   * Локально 0: Ctrl+C і демо зупиняють процес одразу.
+   */
+  DRAIN_MS: z.coerce.number().int().min(0).max(60_000).default(0),
+
   /** Рівень логування. Поки читається лише на старті — логер приїде пізніше. */
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
@@ -94,6 +111,31 @@ export const envSchema = z.object({
 
   /** Файл із паролем обох Redis. Відносний — від кореня репозиторію. */
   REDIS_PASSWORD_FILE: z.string().min(1).default('./secrets/redis_password'),
+
+  /**
+   * S3 API сховища файлів (#26): `http://127.0.0.1:22650` для RustFS із compose.
+   * Порожньо — справжній AWS S3: SDK сам збудує адресу з регіону й бакета.
+   * Адреса — не секрет, тому тут, а не в сховищі.
+   */
+  STORAGE_ENDPOINT: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^https?$/ }).optional()),
+
+  /** Регіон підпису SigV4. Емулятору байдуже, AWS — ні: підпис містить регіон. */
+  STORAGE_REGION: z.string().min(1).default('us-east-1'),
+
+  /**
+   * Бакет файлів. Один на все: `uploads/` — приватні завантаження користувачів,
+   * `assets/` — публічні ассети, які роздає лише кеш-шар (src/edge.ts).
+   *
+   * Опційний з тієї ж причини, що BROKER_URL: без нього застосунок стартує, а
+   * маршрути файлів відповідають 503 з назвою змінної. Так ходять тести.
+   */
+  STORAGE_BUCKET: z.preprocess(
+    (v) => (v === '' ? undefined : v),
+    z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/, 'імʼя бакета S3: 3–63 символи з [a-z0-9.-]')
+      .optional(),
+  ),
 
   /**
    * З яких origin браузер може ходити в API, слухати SSE і підключати socket.io:
@@ -176,6 +218,18 @@ export const vaultSchema = z.object({
    * стійкість дає `npm run keys:init`, який кладе в сховище 32 випадкові байти.
    */
   REFRESH_TOKEN_PEPPER: z.string().min(8, 'щонайменше 8 символів'),
+  /**
+   * Ключі доступу до сховища файлів (#26) — з secrets/storage_access_key і
+   * secrets/storage_secret_key. Це право читати й переписувати кожен файл у
+   * бакеті, тому лише сховище і ніколи .env.
+   *
+   * Опційні свідомо: на AWS процес ходить у S3 під IAM-роллю, і SDK бере
+   * тимчасові креденшели сам (STS, ланцюжок провайдерів за замовчуванням).
+   * Довгоживуча пара ключів у проді — саме те, чого роль позбавляє.
+   * Обидві змінні разом або жодної.
+   */
+  STORAGE_ACCESS_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(3).optional()),
+  STORAGE_SECRET_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(8).optional()),
 });
 
 /** Повна схема процесу: оточення + секрети сховища. */
@@ -193,6 +247,9 @@ const fullSchema = envSchema.extend(vaultSchema.shape).superRefine((env, ctx) =>
   }
   if ((env.JWT_PREVIOUS_PUBLIC_KEY === undefined) !== (env.JWT_PREVIOUS_KID === undefined)) {
     ctx.addIssue({ code: 'custom', path: ['JWT_PREVIOUS_KID'], message: 'JWT_PREVIOUS_PUBLIC_KEY і JWT_PREVIOUS_KID задаються разом' });
+  }
+  if ((env.STORAGE_ACCESS_KEY === undefined) !== (env.STORAGE_SECRET_KEY === undefined)) {
+    ctx.addIssue({ code: 'custom', path: ['STORAGE_SECRET_KEY'], message: 'STORAGE_ACCESS_KEY і STORAGE_SECRET_KEY задаються разом' });
   }
   if (env.JWT_PREVIOUS_KID !== undefined && env.JWT_PREVIOUS_KID === env.JWT_KID) {
     ctx.addIssue({ code: 'custom', path: ['JWT_PREVIOUS_KID'], message: 'збігається з JWT_KID — після ротації kid має бути новий' });

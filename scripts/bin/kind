@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# kind v0.32.0 без установки — з контейнера marketplace-tools (scripts/lib/tools.sh).
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/tools.sh"
+tools_run kind "$@"

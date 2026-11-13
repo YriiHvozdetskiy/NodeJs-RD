@@ -33,6 +33,14 @@
 #
 #   bash scripts/with-secrets.sh dev npm run start
 #
+# З ДЗ #26 — сховище файлів. Адреса й бакет (STORAGE_ENDPOINT, STORAGE_BUCKET,
+# STORAGE_REGION) лежать у .env, як DB_URL. Ключі доступу STORAGE_ACCESS_KEY і
+# STORAGE_SECRET_KEY — у secrets/storage_access_key і secrets/storage_secret_key.
+# Ціна їхнього витоку вища, ніж у пароля БД: це право читати й переписувати
+# кожен файл у бакеті, і в журналі запитів сховища зловмисник виглядатиме як ми.
+#
+#   bash scripts/with-secrets.sh dev node dist/demo-upload.js
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -81,9 +89,45 @@ if [ "${SKIP_VAULT:-0}" = "1" ]; then
   exec "$@"
 fi
 
+# Оточення kind (#28): npm run up / destroy / demo:rollout. Значення їдуть у
+# Pulumi-програму (infra/), а вона кладе їх у K8s Secret — не в процес застосунку.
+#
+#   bash scripts/with-secrets.sh kind bash scripts/infra.sh up
+#
+# Адреси — топологія кластера, яку створює сама програма: сервіси marketplace-db
+# і marketplace-redis у namespace marketplace. Секрети — ті самі файли, що для dev:
+# пароль БД, пароль Redis, ключі JWT і перець, плюс ключ шифрування стану Pulumi.
+# Брокера, кешу й сховища файлів у kind немає — їхні змінні експортуються
+# порожніми: порожнє значення застосунок читає як «вимкнено», а відсутню змінну
+# програма вважає зламаним експортом і падає з її назвою (infra/vault.ts).
+if [ "${ENV_SLUG}" = "kind" ]; then
+  for f in db_password redis_password pulumi_passphrase jwt/dev/private.pem jwt/dev/public.pem jwt/dev/kid jwt/dev/refresh_pepper; do
+    [ -f "${ROOT}/secrets/${f}" ] || { echo "with-secrets: немає secrets/${f}. Спершу: npm run db:up" >&2; exit 1; }
+  done
+  export DB_URL="postgres://marketplace@marketplace-db:5432/marketplace"
+  DB_PASSWORD="$(cat "${ROOT}/secrets/db_password")"
+  REDIS_QUEUE_URL="redis://default:$(cat "${ROOT}/secrets/redis_password")@marketplace-redis:6379"
+  JWT_PRIVATE_KEY="$(base64 < "${ROOT}/secrets/jwt/dev/private.pem" | tr -d '\n')"
+  JWT_PUBLIC_KEY="$(base64 < "${ROOT}/secrets/jwt/dev/public.pem" | tr -d '\n')"
+  JWT_KID="$(cat "${ROOT}/secrets/jwt/dev/kid")"
+  REFRESH_TOKEN_PEPPER="$(cat "${ROOT}/secrets/jwt/dev/refresh_pepper")"
+  JWT_PREVIOUS_PUBLIC_KEY=""; JWT_PREVIOUS_KID=""
+  if [ -f "${ROOT}/secrets/jwt/dev/previous_public.pem" ]; then
+    JWT_PREVIOUS_PUBLIC_KEY="$(base64 < "${ROOT}/secrets/jwt/dev/previous_public.pem" | tr -d '\n')"
+    JWT_PREVIOUS_KID="$(cat "${ROOT}/secrets/jwt/dev/previous_kid")"
+  fi
+  PULUMI_CONFIG_PASSPHRASE="$(cat "${ROOT}/secrets/pulumi_passphrase")"
+  export DB_PASSWORD REDIS_QUEUE_URL JWT_PRIVATE_KEY JWT_PUBLIC_KEY JWT_KID REFRESH_TOKEN_PEPPER \
+         JWT_PREVIOUS_PUBLIC_KEY JWT_PREVIOUS_KID PULUMI_CONFIG_PASSPHRASE
+  export BROKER_URL="" REDIS_CACHE_URL="" \
+         STORAGE_ENDPOINT="" STORAGE_BUCKET="" STORAGE_ACCESS_KEY="" STORAGE_SECRET_KEY=""
+  export PULUMI_BACKEND_URL="${PULUMI_BACKEND_URL:-file://${ROOT}/.pulumi}"
+  exec "$@"
+fi
+
 case "${ENV_SLUG}" in
   dev) ;;
-  *) echo "with-secrets: невідоме оточення '${ENV_SLUG}' (є лише dev)" >&2; exit 2 ;;
+  *) echo "with-secrets: невідоме оточення '${ENV_SLUG}' (є dev і kind)" >&2; exit 2 ;;
 esac
 
 ENV_FILE="${ROOT}/.env"
@@ -190,6 +234,21 @@ if [ -f "${JWT_DIR}/private.pem" ]; then
     JWT_PREVIOUS_KID="$(cat "${JWT_DIR}/previous_kid")"
     export JWT_PREVIOUS_PUBLIC_KEY JWT_PREVIOUS_KID
   fi
+fi
+
+# Сховище файлів (#26). Адреси — з .env по одному ключу, як DB_URL вище.
+# Немає ключа в .env — немає змінної, і застосунок відповідає 503 на маршрутах
+# файлів, а демо падають із назвою змінної.
+for var in STORAGE_ENDPOINT STORAGE_BUCKET STORAGE_REGION; do
+  value="$(grep -E "^${var}=" "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+  [ -n "${value}" ] || continue
+  export "${var}=${value}"
+done
+STORAGE_DIR="${ROOT}/secrets"
+if [ -f "${STORAGE_DIR}/storage_access_key" ] && [ -f "${STORAGE_DIR}/storage_secret_key" ]; then
+  STORAGE_ACCESS_KEY="$(cat "${STORAGE_DIR}/storage_access_key")"
+  STORAGE_SECRET_KEY="$(cat "${STORAGE_DIR}/storage_secret_key")"
+  export STORAGE_ACCESS_KEY STORAGE_SECRET_KEY
 fi
 
 exec "$@"

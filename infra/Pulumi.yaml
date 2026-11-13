@@ -1,0 +1,38 @@
+name: marketplace
+description: Marketplace API у локальному kind-кластері (ДЗ #28)
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+# Стан — у локальному файловому бекенді, без pulumi login:
+#   PULUMI_BACKEND_URL=file://<корінь репо>/.pulumi
+# Конфіг стеку з типами й значеннями за замовчуванням. Файл Pulumi.<stack>.yaml
+# у git не потрапляє: там encryptionsalt під passphrase конкретної машини й
+# ревізія, яку перемикає demo:rollout.
+config:
+  kubeContext:
+    type: string
+    default: kind-marketplace
+    description: контекст kubeconfig; явно, щоб не задеплоїти в кластер, куди ходив востаннє
+  namespace:
+    type: string
+    default: marketplace
+  image:
+    type: string
+    default: marketplace-api:hw28
+    description: образ із npm run image:build, у кластері — після kind load
+  replicas:
+    type: integer
+    default: 3
+  nodePort:
+    type: integer
+    default: 30880
+    description: NodePort API; k8s/kind-config.yaml пробрасує його на 127.0.0.1:22880
+  profile:
+    type: string
+    default: good
+    description: good — нуль збоїв на rollout; bad — без проб і дренажу, для порівняння в demo:rollout
+  rev:
+    type: string
+    default: "1"
+    description: ревізія pod-шаблону; її зміна запускає rolling update
