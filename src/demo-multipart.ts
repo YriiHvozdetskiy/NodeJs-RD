@@ -4,7 +4,8 @@ import { DataSource } from 'typeorm';
 import { dataSourceOptions } from './data-source';
 import { call, cleanup, createUser, detailOf, login, tokensOf } from './auth/demo-kit';
 import { field, headStatus, purgeDemoFiles, runWorker, tempFile } from './files/demo-kit';
-import { ObjectStorage } from './files/object-storage';
+import type { LifecycleRule } from '@aws-sdk/client-s3';
+import { ABORT_INCOMPLETE_RULE_ID, ObjectStorage } from './files/object-storage';
 import { MULTIPART_THRESHOLD, partSizeFor } from './files/upload-policy';
 import { Summary } from './messaging/demo-kit';
 import { migrateSchema, startApi, type Api } from './redis/demo-kit';
@@ -21,8 +22,14 @@ import { migrateSchema, startApi, type Api } from './redis/demo-kit';
  *   HeadObject                                 → розмір збігається, ETag "…-3" і це не MD5
  *
  * Серце — resumed-parts=1. Рішення без ListParts заливає всі три.
+ *
+ * Наприкінці — lifecycle на бакеті, де вже є чуже правило: ensureBucket()
+ * додає своє і чуже не стирає (Put замінює конфігурацію цілком).
  */
 const DEMO = 'multipart';
+
+/** «Чуже» правило: так виглядало б правило з IaC, наприклад холодний клас для дампів. */
+const FOREIGN_RULE: LifecycleRule = { ID: 'demo-multipart-foreign', Status: 'Enabled', Filter: { Prefix: 'demo-lifecycle/' }, Expiration: { Days: 30 } };
 const MiB = 1024 * 1024;
 
 /** 5 + 5 + 1 МіБ: дві повні частини і хвіст. Остання частина може бути < 5 МіБ, решта — ні. */
@@ -121,8 +128,17 @@ async function main(): Promise<void> {
     const etagMultipart = suffix === String(partCount) && !etag.includes(md5) ? 1 : 0;
     summary.line('etag-multipart', etagMultipart);
     // Страховка на випадок, коли resume так і не прийде: сховище саме скасує хвіст.
+    // Бакет уже має конфігурацію з чужим правилом і без нашого — ensureBucket()
+    // мусить додати своє, а не пропустити крок і не стерти чуже.
+    const others = (await storage.lifecycleRules()).filter((rule) => rule.ID !== ABORT_INCOMPLETE_RULE_ID && rule.ID !== FOREIGN_RULE.ID);
+    await storage.putLifecycleRules([...others, FOREIGN_RULE]);
+    await storage.ensureBucket();
+    const rules = await storage.lifecycleRules();
+    const foreignKept = rules.some((rule) => rule.ID === FOREIGN_RULE.ID) ? 1 : 0;
+    summary.line('lifecycle-foreign-rule-kept', foreignKept);
     const abortDays = (await storage.abortIncompleteAfterDays()) ?? 0;
     summary.line('lifecycle-abort-incomplete-days', abortDays);
+    console.log(`   lifecycle: ${rules.map((rule) => rule.ID).join(', ')}`);
     console.log(`   ETag ${etag}  ·  MD5 файла ${md5}  — суфікс -${suffix ?? '?'} = кількість частин, а не хеш вмісту`);
 
     summary.expect('intent=200 і multipart на 3 частини', intent.status === 200 && partCount === 3);
@@ -134,7 +150,9 @@ async function main(): Promise<void> {
     summary.expect('size-match=1', sizeMatch === 1);
     summary.expect('etag-multipart=1 — ETag "…-3", не MD5', etagMultipart === 1);
     summary.expect('на бакеті є правило AbortIncompleteMultipartUpload', abortDays > 0);
+    summary.expect('lifecycle-foreign-rule-kept=1 — чуже правило пережило ensureBucket()', foreignKept === 1);
   } finally {
+    await dropForeignRule(storage).catch(() => undefined);
     await api?.close();
     await purgeDemoFiles(dataSource, storage, DEMO).catch(() => undefined);
     await cleanup(dataSource, DEMO).catch(() => undefined);
@@ -143,6 +161,13 @@ async function main(): Promise<void> {
     await video.remove();
   }
   summary.finish();
+}
+
+/** Прибрати «чуже» правило демо, лишивши решту. */
+async function dropForeignRule(storage: ObjectStorage): Promise<void> {
+  const rules = await storage.lifecycleRules();
+  if (!rules.some((rule) => rule.ID === FOREIGN_RULE.ID)) return;
+  await storage.putLifecycleRules(rules.filter((rule) => rule.ID !== FOREIGN_RULE.ID));
 }
 
 /** UploadId живе в базі, а не в процесі клієнта: процес №1 загинув разом зі своєю памʼяттю. */
