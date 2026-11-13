@@ -17,6 +17,9 @@ import { Summary } from './messaging/demo-kit';
  *
  * Контраст понад контракт: мутабельне імʼя app.css з тим самим заголовком.
  * Після перезапису edge упевнено віддає СТАРЕ — його довелось би інвалідувати.
+ * Клієнт із `Cache-Control: no-cache` змушує edge перепитати origin: змінений
+ * app.css приходить новим (MISS), незмінний ассет — з кешу після звірки ETag
+ * (REVALIDATED).
  */
 const PREFIX = 'assets/demo-cdn/';
 
@@ -30,8 +33,8 @@ interface EdgeReply {
   body: string;
 }
 
-async function get(url: string): Promise<EdgeReply> {
-  const res = await fetch(url);
+async function get(url: string, headers: Record<string, string> = {}): Promise<EdgeReply> {
+  const res = await fetch(url, { headers });
   return {
     status: res.status,
     cache: res.headers.get('x-cache') ?? '',
@@ -128,6 +131,20 @@ async function main(): Promise<void> {
     summary.line('mutable-name-stale', mutableStale);
     console.log('   app.css перезаписано у сховищі, а edge віддає стару версію: без хешу в імені тут потрібна інвалідація');
 
+    // ── 6. клієнт просить перевірки: Cache-Control: no-cache ─────────────
+    // Змінений обʼєкт: ETag в origin інший — edge бере нове тіло і кешує його.
+    const forced = await get(`${edge.url}/${mutable}`, { 'cache-control': 'no-cache' });
+    const noCacheFresh = forced.cache === 'MISS' && forced.body === V2.toString() ? 1 : 0;
+    summary.line('no-cache-fresh', noCacheFresh);
+    const after = await get(`${edge.url}/${mutable}`);
+    const noCacheRecached = after.cache === 'HIT' && after.body === V2.toString() ? 1 : 0;
+    summary.line('no-cache-recached', noCacheRecached);
+    // Незмінний обʼєкт: ETag той самий — тіло з кешу, origin віддав лише метадані.
+    const checked = await get(`${edge.url}/${key2}`, { 'cache-control': 'no-cache' });
+    const noCacheRevalidated = checked.cache === 'REVALIDATED' && checked.body === V2.toString() ? 1 : 0;
+    summary.line('no-cache-revalidated', noCacheRevalidated);
+    console.log(`   no-cache: змінений app.css → ${forced.cache}, далі ${after.cache}; незмінний ассет → ${checked.cache}`);
+
     summary.expect('direct=403 — бакет не читається повз кеш', direct.status === 403);
     summary.expect('edge-miss=200 — edge читає приватний бакет своїми ключами', miss.status === 200);
     summary.expect('edge-hit=200', hit.status === 200);
@@ -137,6 +154,9 @@ async function main(): Promise<void> {
     summary.expect('new-url=200', fresh.status === 200);
     summary.expect('content-changed=1', contentChanged === 1);
     summary.expect('мутабельне імʼя справді застаріває в кеші (контрольний прогін)', mutableStale === 1);
+    summary.expect('no-cache-fresh=1 — на no-cache edge іде в origin і бере нову версію', noCacheFresh === 1);
+    summary.expect('no-cache-recached=1 — нова версія лягла в кеш', noCacheRecached === 1);
+    summary.expect('no-cache-revalidated=1 — незмінний обʼєкт звірено за ETag, тіло з кешу', noCacheRevalidated === 1);
   } finally {
     await stopEdge(edge?.proc);
     await purgePrefix(storage, PREFIX).catch(() => undefined);
