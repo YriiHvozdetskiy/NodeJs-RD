@@ -10,7 +10,8 @@ import { ObjectStorage, type StoredObject } from './files/object-storage';
  * зі своїм підписом. Публіка бачить лише його.
  *
  * Що чесно однакове з CDN: shared cache у термінах RFC 9111 — свіжість бере
- * з `Cache-Control` обʼєкта, віддає `ETag`, відповідає 304 на умовний запит.
+ * з `Cache-Control` обʼєкта, віддає `ETag`, відповідає 304 на умовний запит,
+ * а на `Cache-Control: no-cache` від клієнта перепитує origin.
  * Що інше: одна точка присутності замість сотень, кеш у памʼяті процесу,
  * немає інвалідації через API. Остання не потрібна — див. src/files/assets.ts.
  *
@@ -33,6 +34,16 @@ interface Entry {
   expiresAt: number;
 }
 
+/** Директиви `Cache-Control` як мапа «імʼя → значення»: `max-age=60, public` → {max-age: '60', public: undefined}. */
+function directivesOf(cacheControl: string): Map<string, string | undefined> {
+  return new Map(
+    cacheControl.split(',').map((part) => {
+      const [name, value] = part.trim().toLowerCase().split('=');
+      return [name, value] as const;
+    }),
+  );
+}
+
 /**
  * Скільки секунд спільний кеш може тримати обʼєкт. Немає `Cache-Control` —
  * нуль: евристичного кешування (RFC 9111 §4.2.2) свідомо не робимо, бо
@@ -40,15 +51,23 @@ interface Entry {
  */
 export function sharedMaxAge(cacheControl: string | undefined): number {
   if (!cacheControl) return 0;
-  const directives = new Map(
-    cacheControl.split(',').map((part) => {
-      const [name, value] = part.trim().toLowerCase().split('=');
-      return [name, value] as const;
-    }),
-  );
+  const directives = directivesOf(cacheControl);
   if (directives.has('no-store') || directives.has('private')) return 0;
   const seconds = Number(directives.get('s-maxage') ?? directives.get('max-age'));
   return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
+/**
+ * Клієнт забороняє віддати збережене без перевірки в origin (RFC 9111
+ * §5.2.1.4): `Cache-Control: no-cache` або `max-age=0`. `Pragma: no-cache`
+ * діє лише тоді, коли `Cache-Control` у запиті немає (§5.4) — так шле
+ * старий HTTP/1.0-клієнт. Саме так браузер робить «жорстке» оновлення.
+ */
+export function mustRevalidate(headers: IncomingMessage['headers']): boolean {
+  const cacheControl = headers['cache-control'];
+  if (cacheControl === undefined) return headers.pragma?.toLowerCase().includes('no-cache') ?? false;
+  const directives = directivesOf(cacheControl);
+  return directives.has('no-cache') || directives.get('max-age') === '0';
 }
 
 /** LRU поверх Map: Map памʼятає порядок вставки, тож перший ключ — найдавніше прочитаний. */
@@ -75,7 +94,7 @@ class LruCache {
     }
   }
 
-  private drop(key: string): void {
+  drop(key: string): void {
     const old = this.entries.get(key);
     if (!old) return;
     this.entries.delete(key);
@@ -83,7 +102,10 @@ class LruCache {
   }
 }
 
-function send(req: IncomingMessage, res: ServerResponse, object: StoredObject, cache: 'HIT' | 'MISS', ageSec: number): void {
+/** HIT — зі свіжого кешу; REVALIDATED — з кешу після перевірки ETag в origin; MISS — тіло з origin. */
+type CacheStatus = 'HIT' | 'REVALIDATED' | 'MISS';
+
+function send(req: IncomingMessage, res: ServerResponse, object: StoredObject, cache: CacheStatus, ageSec: number): void {
   res.setHeader('X-Cache', cache);
   res.setHeader('Age', String(ageSec));
   res.setHeader('ETag', object.etag);
@@ -122,16 +144,39 @@ export function createEdge(storage: ObjectStorage): ReturnType<typeof createServ
 
       const now = Date.now();
       const cached = cache.get(key);
-      if (cached && now < cached.expiresAt) {
+      const revalidate = mustRevalidate(req.headers);
+      if (cached && now < cached.expiresAt && !revalidate) {
         return send(req, res, cached.object, 'HIT', Math.floor((now - cached.storedAt) / 1000));
+      }
+
+      // Запис є, але або протух, або клієнт просить перевірки: питаємо в origin
+      // лише метадані. ETag той самий — тіло з кешу, свіжість рахується заново.
+      // HEAD, а не GET з If-None-Match: SDK подає 304 як виняток, а тут це
+      // нормальна відповідь. Ціна — зайвий запит, коли обʼєкт таки змінився.
+      if (cached) {
+        const info = await storage.head(key);
+        if (!info) {
+          cache.drop(key);
+          return fail(res, 404, 'не знайдено');
+        }
+        if (info.etag === cached.object.etag) {
+          const ttl = sharedMaxAge(info.cacheControl);
+          cache.set(key, { object: cached.object, storedAt: now, expiresAt: now + ttl * 1000 });
+          return send(req, res, cached.object, 'REVALIDATED', 0);
+        }
       }
 
       // Промах: кеш іде в origin СВОЇМИ ключами. Це і є OAC.
       const object = await storage.get(key);
-      if (!object) return fail(res, 404, 'не знайдено');
+      if (!object) {
+        cache.drop(key);
+        return fail(res, 404, 'не знайдено');
+      }
       const ttl = sharedMaxAge(object.cacheControl);
       if (ttl > 0 && object.size <= MAX_ENTRY_BYTES) {
         cache.set(key, { object, storedAt: now, expiresAt: now + ttl * 1000 });
+      } else {
+        cache.drop(key);
       }
       send(req, res, object, 'MISS', 0);
     })().catch((err: unknown) => {

@@ -2701,14 +2701,18 @@ multipart ламається мовчки.
 
 **Незавершені завантаження тарифікуються**, хоча обʼєкта немає і в консолі
 його не видно. Тому `ensureBucket()` ставить на `uploads/` правило lifecycle
-`AbortIncompleteMultipartUpload: 7 днів`. Ставить лише тоді, коли в бакета ще
-немає жодної lifecycle-конфігурації: `PutBucketLifecycleConfiguration` замінює
-її цілком і стерла б чужі правила. Правило «видаляти все старше 30 днів» таких
-хвостів не чіпає — це різні дії.
+`AbortIncompleteMultipartUpload: 7 днів`. `PutBucketLifecycleConfiguration`
+замінює конфігурацію цілком, тому запис іде як read-modify-write. Сервіс читає
+правила, замінює або додає своє за ID `abort-incomplete-multipart` і записує
+весь список назад. Чужі правила лишаються, налаштування рівня конфігурації
+(`TransitionDefaultMinimumObjectSize`) теж. Умовного запису для lifecycle в S3
+немає: зміна, що проскочила між Get і Put, загубиться. Для кроку на старті
+сервісу це прийнятно. Правило «видаляти все старше 30 днів» таких хвостів не
+чіпає — це різні дії.
 
 ### CDN: локальний edge
 
-Обрана форма — **локальна**: `src/edge.ts`, 120 рядків коду на `node:http` без
+Обрана форма — **локальна**: `src/edge.ts`, 148 рядків коду на `node:http` без
 коментарів (`npm run edge` → `http://127.0.0.1:22660/assets/…`). Це та сама
 суть, що в OAC: до сховища ходить кеш, а не публіка. Бакет один і закритий для
 всіх, крім власника ключів. Edge тримає ключі сховища і бере обʼєкт клієнтом SDK
@@ -2718,7 +2722,14 @@ multipart ламається мовчки.
   префіксом або з символами поза `[A-Za-z0-9._-/]` — `404`.
 - Свіжість бере з `Cache-Control` обʼєкта. Немає заголовка, або є `private` чи
   `no-store` — не кешує нічого: політику свіжості задає origin, а не кеш.
-- Відповідає з `X-Cache: HIT|MISS`, `Age`, `ETag`; на `If-None-Match` — `304`.
+- Відповідає з `X-Cache: HIT|REVALIDATED|MISS`, `Age`, `ETag`; на
+  `If-None-Match` — `304`.
+- На `Cache-Control: no-cache` чи `max-age=0` у запиті (а без `Cache-Control` —
+  на `Pragma: no-cache`) збережене без перевірки не віддає (RFC 9111 §5.2.1.4).
+  Так само поводиться протухлий запис. Edge робить HeadObject в origin: ETag той
+  самий — тіло з кешу, `REVALIDATED`; інший — нове тіло, `MISS`. HEAD, а не GET
+  з `If-None-Match`, бо SDK подає `304` як виняток. Ціна — зайвий запит, коли
+  обʼєкт таки змінився.
 - Кеш у памʼяті процесу: LRU на 64 МіБ, обʼєкт понад 8 МіБ віддається, але не
   кешується.
 
@@ -2799,10 +2810,14 @@ v1, отримує v1. Інвалідацій — нуль. AWS у докуме�
   дає три частини. Процес №1 заливає дві й гине від `SIGKILL` — без `finally`
   і без Abort. HeadObject → `404`. Процес №2 знає лише `file_id`, питає
   `/parts`, бачить `1,2` і доливає одну. Commit робить Complete; розмір і ETag
-  `-3` збігаються.
+  `-3` збігаються. Наприкінці демо кладе на бакет конфігурацію з чужим
+  правилом і без свого, викликає `ensureBucket()` і перевіряє, що на бакеті
+  обидва правила (`lifecycle-foreign-rule-kept=1`).
 - **`demo:cdn`** — сховище закрите, роздача через кеш. Анонімний GET у сховище
   → `403`, через edge `MISS`, потім `HIT`, «деплой» нового вмісту під новим
-  імʼям, контраст із мутабельним `app.css`.
+  імʼям, контраст із мутабельним `app.css`. Потім клієнт шле
+  `Cache-Control: no-cache`: змінений `app.css` приходить новим (`MISS`) і лягає
+  в кеш, незмінний ассет edge звіряє за ETag (`REVALIDATED`).
 
 ### Числа трьох прогонів
 
@@ -2813,8 +2828,13 @@ v1, отримує v1. Інвалідацій — нуль. AWS у докуме�
 | Демо | Вивід (однаковий у прогонах 1, 2, 3) | Тривалість, с |
 | --- | --- | --- |
 | `demo:upload` | `intent=200` `key-from-server=1` `url-ttl-seconds=61` `double-tap-same-file=1` `tampered=403` `commit-without-bytes=409` `api-alive=0` `put-offline=200` `client-secret-vars=0` `commit=200` `committed-size-match=1` `download=302` `download-match=1` `fresh-before-expiry=200` `expired=403` | 8 · 8 · 7 |
-| `demo:multipart` ×2 | `intent=200` `part-size=5242880` `part-count=3` `sent-before-crash=2` `crashed-sigkill=1` `parts-on-server=2` `head-after-crash=404` `resumed-parts=1` `head-before-complete=404` `complete=200` `size-match=1` `etag-multipart=1` `lifecycle-abort-incomplete-days=7` | 3+3 · 3+3 · 4+3 |
-| `demo:cdn` | `direct=403` `edge-miss=200` `edge-hit=200` `cache-hit=1` `new-name=1` `new-url=200` `content-changed=1` `invalidations=0` `mutable-name-stale=1` | 2 · 2 · 2 |
+| `demo:multipart` ×2 | `intent=200` `part-size=5242880` `part-count=3` `sent-before-crash=2` `crashed-sigkill=1` `parts-on-server=2` `head-after-crash=404` `resumed-parts=1` `head-before-complete=404` `complete=200` `size-match=1` `etag-multipart=1` `lifecycle-foreign-rule-kept=1` `lifecycle-abort-incomplete-days=7` | 3+3 · 3+3 · 4+3 |
+| `demo:cdn` | `direct=403` `edge-miss=200` `edge-hit=200` `cache-hit=1` `new-name=1` `new-url=200` `content-changed=1` `invalidations=0` `mutable-name-stale=1` `no-cache-fresh=1` `no-cache-recached=1` `no-cache-revalidated=1` | 2 · 2 · 2 |
+
+Рядки `lifecycle-foreign-rule-kept`, `no-cache-fresh`, `no-cache-recached` і
+`no-cache-revalidated` додано 13.11.2026 після ревʼю. Їх перевірено одним
+прогоном `demo:cdn` і двома `demo:multipart` на робочій копії, решта рядків
+не змінилась.
 
 Стабільні також хеші ассетів (`628b4a4c` → `3c50f0a4`) і ETag multipart
 (`"4832bcdad9b52a3e7ace6761373d47ed-3"`): вміст демо детермінований. Плавають
@@ -3818,7 +3838,7 @@ npm run destroy && npm run cluster:down
 | 2026-11-09 | Відновлення через `GET /uploads/{id}/parts`, а не через ключі в клієнта | Клієнт не має ключів сховища і не повинен їх мати. ListParts робить сервер, підписує URL лише на відсутні частини, і гард #24 стоїть на кожному кроці |
 | 2026-11-09 | `intent` відповідає `200`, а не `201` | Файла ще немає, є лише дозвіл його покласти. Критерій теж читає `intent=200` |
 | 2026-11-09 | `expired=403` перевіряється на URL зі строком 3 с, підписаному тим самим `presignPut` | Строк intent для PNG із демо — 61 с; хвилина очікування в кожному прогоні нічого не додає до доказу |
-| 2026-11-09 | Бакет на емуляторі створює застосунок на старті й самі демо; lifecycle `AbortIncompleteMultipartUpload: 7` — лише на бакет без lifecycle | Грейдер не запускає init-кроку. На AWS бакет — IaC, і в ролі застосунку немає `s3:CreateBucket`. `Put…Lifecycle` замінює конфігурацію цілком, тож чужі правила не чіпаються |
+| 2026-11-09 | Бакет на емуляторі створює застосунок на старті й самі демо; lifecycle `AbortIncompleteMultipartUpload: 7` — ~~лише на бакет без lifecycle~~ → злиттям за ID (рядок 2026-11-13) | Грейдер не запускає init-кроку. На AWS бакет — IaC, і в ролі застосунку немає `s3:CreateBucket`. `Put…Lifecycle` замінює конфігурацію цілком, тож чужі правила не чіпаються |
 | 2026-11-09 | Production-образ — `docker/Dockerfile`: збірка на `node:24-slim`, запуск на `distroless/nodejs24-debian12:nonroot`, `USER 65532:65532`; кореневий односхідцевий `Dockerfile` видалено | Після RCE в образі немає чим скористатись: ні `sh`, ні `apt`. Числовий uid — бо kubelet при `runAsNonRoot` імена не резолвить. Два Dockerfile означали б два різні образи |
 | 2026-11-09 | Токен реєстру — лише `RUN --mount=type=secret`, `npmrc` — bind-mount; `npm ci --ignore-scripts` | `ARG` осідає в історії, `COPY` + `rm` — у байтах шару. `demo:image` міряє всі три канали й на контрольному дірявому образі бачить `2/1/1` |
 | 2026-11-09 | Поріг сканера `SCAN_MAX=12` у CI — ratchet | 12 виправних знахідок: 7 у `libssl3` бази distroless, 5 у `multer`/`body-parser` через Nest. Нульовий поріг червонів би через базу, на яку я не впливаю |
@@ -3830,6 +3850,8 @@ npm run destroy && npm run cluster:down
 | 2026-11-09 | PDB `maxUnavailable: 1`, не `minAvailable` | `minAvailable == replicas` блокує drain; з HPA, що зменшив deployment до двох, `minAvailable: 2` — те саме блокування |
 | 2026-11-09 | Генератор навантаження — 200 запитів/с, кожен — нове зʼєднання | Без обмеження (~1300/с) клієнтські порти зациклювались швидше за `TIME_WAIT` у подах: 6 таймаутів на 27 тис. запитів без жодного rollout. При 250/с — 0 на 22,5 тис. |
 | 2026-11-09 | `Pulumi.<stack>.yaml` не в git; конфіг стеку з типами й дефолтами — у `config:` файлу `Pulumi.yaml` | Файл стеку несе `encryptionsalt` під passphrase конкретної машини: грейдер зі своєю passphrase його б не розшифрував. А `rev` перемикає `demo:rollout` |
+| 2026-11-13 | Правило lifecycle зливається з наявними за ID, а не ставиться лише на бакет без lifecycle | Ревʼю: на бакеті з будь-яким чужим правилом незавершені multipart не скасовувались ніколи — крок мовчки пропускався. `Put…Lifecycle` замінює конфігурацію цілком, тож тепер read-modify-write; `demo:multipart` перевіряє це на бакеті з чужим правилом |
+| 2026-11-13 | Edge читає `no-cache` / `max-age=0` із запиту і перевіряє запис в origin за ETag | Ревʼю: клієнт не міг змусити ревалідацію, «жорстке» оновлення віддавало збережене. HeadObject замість умовного GET, бо SDK подає `304` як виняток |
 
 ## Запуск
 

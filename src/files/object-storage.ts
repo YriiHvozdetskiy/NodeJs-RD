@@ -7,11 +7,13 @@ import {
   GetBucketLifecycleConfigurationCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  type LifecycleRule,
   ListPartsCommand,
   PutBucketLifecycleConfigurationCommand,
   PutObjectCommand,
   S3Client,
   S3ServiceException,
+  type TransitionDefaultMinimumObjectSize,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -32,6 +34,9 @@ import { envSchema, vaultSchema } from '../config/env.schema';
  * встигне накопичитись.
  */
 const ABORT_INCOMPLETE_AFTER_DAYS = 7;
+
+/** ID нашого правила lifecycle: за ним злиття знаходить і оновлює саме його, не чіпаючи чужих. */
+export const ABORT_INCOMPLETE_RULE_ID = 'abort-incomplete-multipart';
 
 export interface StorageOptions {
   bucket: string;
@@ -274,45 +279,61 @@ export class ObjectStorage {
    * видно. Правило «видаляти старше N днів» таких хвостів не чіпає — потрібна
    * окрема дія AbortIncompleteMultipartUpload.
    *
-   * Лише якщо в бакета ще немає жодної lifecycle-конфігурації:
-   * PutBucketLifecycleConfiguration замінює її ЦІЛКОМ, і чужі правила
-   * (наприклад, Glacier для дампів #15) зникли б мовчки.
+   * PutBucketLifecycleConfiguration замінює конфігурацію ЦІЛКОМ. Тому це
+   * read-modify-write: прочитати правила, замінити чи додати своє за ID,
+   * записати весь список назад. Чужі правила (наприклад, Glacier для дампів
+   * #15) їдуть далі як є. Умовного запису для lifecycle в S3 немає: якщо
+   * між Get і Put хтось інший змінить правила, його зміна загубиться. На
+   * старті сервісу це прийнятно, бо правила бакета змінює IaC, а не люди руками.
    */
   private async ensureAbortIncompleteRule(): Promise<void> {
-    try {
-      await this.s3.send(new GetBucketLifecycleConfigurationCommand({ Bucket: this.bucket }));
-      return;
-    } catch (err) {
-      // NoSuchLifecycleConfiguration — 404: правил немає, можна ставити.
-      if (!isNotFound(err)) throw err;
-    }
+    const { rules, transitionDefaultMinimumObjectSize } = await this.lifecycle();
+    const current = rules.find((rule) => rule.ID === ABORT_INCOMPLETE_RULE_ID);
+    if (current?.Status === 'Enabled' && current.AbortIncompleteMultipartUpload?.DaysAfterInitiation === ABORT_INCOMPLETE_AFTER_DAYS) return;
+    const ours: LifecycleRule = {
+      ID: ABORT_INCOMPLETE_RULE_ID,
+      Status: 'Enabled',
+      Filter: { Prefix: 'uploads/' },
+      AbortIncompleteMultipartUpload: { DaysAfterInitiation: ABORT_INCOMPLETE_AFTER_DAYS },
+    };
     await this.s3.send(
       new PutBucketLifecycleConfigurationCommand({
         Bucket: this.bucket,
-        LifecycleConfiguration: {
-          Rules: [
-            {
-              ID: 'abort-incomplete-multipart',
-              Status: 'Enabled',
-              Filter: { Prefix: 'uploads/' },
-              AbortIncompleteMultipartUpload: { DaysAfterInitiation: ABORT_INCOMPLETE_AFTER_DAYS },
-            },
-          ],
-        },
+        // Налаштування рівня конфігурації теж частина «цілком»: без нього Put скинув би його на дефолт.
+        TransitionDefaultMinimumObjectSize: transitionDefaultMinimumObjectSize,
+        LifecycleConfiguration: { Rules: [...rules.filter((rule) => rule.ID !== ABORT_INCOMPLETE_RULE_ID), ours] },
       }),
     );
   }
 
-  /** Скільки днів живе незавершене завантаження за правилом бакета; правила немає — undefined. */
-  async abortIncompleteAfterDays(): Promise<number | undefined> {
+  /** Поточна lifecycle-конфігурація; її немає — порожній список (NoSuchLifecycleConfiguration — 404). */
+  private async lifecycle(): Promise<{ rules: LifecycleRule[]; transitionDefaultMinimumObjectSize?: TransitionDefaultMinimumObjectSize }> {
     try {
       const config = await this.s3.send(new GetBucketLifecycleConfigurationCommand({ Bucket: this.bucket }));
-      return config.Rules?.find((rule) => rule.Status === 'Enabled' && rule.AbortIncompleteMultipartUpload)?.AbortIncompleteMultipartUpload
-        ?.DaysAfterInitiation;
+      return { rules: config.Rules ?? [], transitionDefaultMinimumObjectSize: config.TransitionDefaultMinimumObjectSize };
     } catch (err) {
-      if (isNotFound(err)) return undefined;
+      if (isNotFound(err)) return { rules: [] };
       throw err;
     }
+  }
+
+  /** Правила lifecycle бакета як є. */
+  async lifecycleRules(): Promise<LifecycleRule[]> {
+    return (await this.lifecycle()).rules;
+  }
+
+  /**
+   * Записати правила lifecycle, замінивши конфігурацію ЦІЛКОМ. Порожній
+   * список видаляти не вміє: S3 вимагає хоча б одне правило.
+   */
+  async putLifecycleRules(rules: LifecycleRule[]): Promise<void> {
+    await this.s3.send(new PutBucketLifecycleConfigurationCommand({ Bucket: this.bucket, LifecycleConfiguration: { Rules: rules } }));
+  }
+
+  /** Скільки днів живе незавершене завантаження за правилом бакета; правила немає — undefined. */
+  async abortIncompleteAfterDays(): Promise<number | undefined> {
+    const rules = await this.lifecycleRules();
+    return rules.find((rule) => rule.Status === 'Enabled' && rule.AbortIncompleteMultipartUpload)?.AbortIncompleteMultipartUpload?.DaysAfterInitiation;
   }
 
   /**
