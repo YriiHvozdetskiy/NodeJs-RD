@@ -1,3 +1,6 @@
+// OpenTelemetry — ПЕРШИМ імпортом (#29): патчить http і pg у момент їхнього
+// завантаження, тож усе нижче вже вантажиться пропатченим.
+import { shutdownTraces } from './observability/otel';
 import 'reflect-metadata';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { NestFactory } from '@nestjs/core';
@@ -8,6 +11,11 @@ import { APP_OPTIONS, configureApp } from './app.setup';
 import type { Env } from './config/env.schema';
 import { DatabaseService } from './db/database.service';
 import { Lifecycle } from './health/lifecycle';
+import { loggerFor, setLogLevel } from './observability/logger';
+import { PinoNestLogger } from './observability/nest-logger';
+
+/** Кожен рядок процесу — JSON (#29), і рядки старту теж. */
+const log = loggerFor('main');
 
 /** Пауза між спробами першого зʼєднання з БД під час прогріву. */
 const DB_RETRY_MS = 500;
@@ -18,7 +26,9 @@ async function bootstrap(): Promise<void> {
   // стоїть в аргументі декоратора @Module. Тому зламане оточення вбиває процес
   // ще до входу сюди, а catch наприкінці файлу ловить те, що ламається пізніше:
   // зайнятий порт, недоступний файл спеки.
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, APP_OPTIONS);
+  // Логер Nest — pino (#29): «Mapped {/v1/orders, GET} route» і решта
+  // службових рядків теж ідуть JSON-ом, а не кольоровим текстом.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { ...APP_OPTIONS, logger: new PinoNestLogger() });
 
   // Префікс, валідатор спеки, фільтр помилок — src/app.setup.ts.
   // Ту саму функцію викликають E2E-тести й provider verification.
@@ -31,6 +41,9 @@ async function bootstrap(): Promise<void> {
   const port = config.get('PORT', { infer: true });
   const warmupMs = config.get('WARMUP_MS', { infer: true });
   const drainMs = config.get('DRAIN_MS', { infer: true });
+  // Логер створено до того, як ConfigModule прочитав .env: рівень звідти
+  // відомий лише тепер. Рядки старту вище писались із рівнем оточення.
+  setLogLevel(config.get('LOG_LEVEL', { infer: true }));
   const lifecycle = app.get(Lifecycle);
   const db = app.get(DatabaseService);
 
@@ -39,17 +52,18 @@ async function bootstrap(): Promise<void> {
   onTerminate(app, lifecycle, () => (listening ? drainMs : 0));
 
   if (warmupMs > 0) {
-    console.log(`[warmup] ${warmupMs} мс до listen() — слухача ще немає`);
+    log.info({ warmupMs }, 'warmup: listen() ще не викликано — слухача немає');
     await sleep(warmupMs);
   }
 
   await app.listen(port);
   listening = true;
-  console.log(`Marketplace API → http://localhost:${port}/v1`);
-  console.log(`health → /health (liveness) · /health/ready (readiness) · /health/db`);
-  console.log('Валідація запитів і відповідей проти openapi/openapi.yaml: увімкнена');
+  log.info(
+    { url: `http://localhost:${port}/v1`, health: ['/health', '/health/ready', '/health/db'], metrics: '/metrics' },
+    'Marketplace API слухає; запити й відповіді звіряються з openapi/openapi.yaml',
+  );
   if (config.get('DRIFT', { infer: true })) {
-    console.log('DRIFT=1 — сервер навмисно віддає totalCents замість total_cents');
+    log.warn('DRIFT=1 — сервер навмисно віддає totalCents замість total_cents');
   }
 
   // Готовий — це не «слухач стоїть», а «можу обслужити запит». Без бази жоден
@@ -61,10 +75,10 @@ async function bootstrap(): Promise<void> {
       try {
         await db.query('SELECT 1');
         lifecycle.markWarm();
-        console.log(`[ready] перше зʼєднання з БД — спроба ${attempt}; /health/ready = 200`);
+        log.info({ attempt }, 'ready: перше зʼєднання з БД; /health/ready = 200');
         return;
       } catch (err) {
-        if (attempt === 1) console.warn(`[warmup] БД ще недоступна: ${err instanceof Error ? err.message : String(err)}`);
+        if (attempt === 1) log.warn({ err }, 'warmup: БД ще недоступна');
         await sleep(DB_RETRY_MS);
       }
     }
@@ -91,18 +105,24 @@ function onTerminate(app: NestExpressApplication, lifecycle: Lifecycle, drainFor
     if (lifecycle.isDraining) return;
     lifecycle.startDraining();
     const drainMs = drainFor();
-    console.log(`[${signal}] readiness=503, дренаж ${drainMs} мс, потім close()`);
+    log.info({ signal, drainMs }, 'readiness=503, дренаж, потім close()');
     setTimeout(() => {
-      app.close().then(
-        () => {
-          console.log('[bye] сокет і пули закрито, вихід 0');
-          process.exit(0);
-        },
-        (err: unknown) => {
-          console.error(`[bye] close() впав: ${err instanceof Error ? err.message : String(err)}`);
-          process.exit(1);
-        },
-      );
+      // Після close() — flush спанів (#29): BatchSpanProcessor тримає останню
+      // пачку в памʼяті, і process.exit без shutdown загубив би саме спани
+      // останніх запитів — тих, що дренаж щойно дообслужив.
+      app
+        .close()
+        .then(() => shutdownTraces())
+        .then(
+          () => {
+            log.info('bye: сокет, пули й експортер спанів закрито, вихід 0');
+            process.exit(0);
+          },
+          (err: unknown) => {
+            log.error({ err }, 'bye: close() впав');
+            process.exit(1);
+          },
+        );
     }, drainMs);
   };
   process.once('SIGTERM', handler);
@@ -113,6 +133,6 @@ bootstrap().catch((err: unknown) => {
   // Зламаний конфіг має вбити процес ЗІ ЗРОЗУМІЛОЮ помилкою і ненульовим
   // кодом виходу — саме на це дивиться CI й оркестратор. Стектрейс тут не
   // потрібен: помилка не в коді, а в оточенні, і в ній уже названі змінні.
-  console.error(err instanceof Error ? err.message : String(err));
+  log.fatal(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

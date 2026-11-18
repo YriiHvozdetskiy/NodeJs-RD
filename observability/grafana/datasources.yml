@@ -1,0 +1,18 @@
+# Датасорси провіжаться файлом: перестворений контейнер Grafana знає їх одразу.
+# Адреси — імена сервісів у мережі compose, а не порти хоста.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: marketplace-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Інтервал скрейпа: Grafana не просить точок частіше, ніж вони є.
+      timeInterval: 2s
+  - name: Tempo
+    uid: marketplace-tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200

@@ -10,6 +10,7 @@ import { Reflector } from '@nestjs/core';
 import type { Request, Response } from 'express';
 import { HttpProblem } from '../common/http-problem';
 import type { UserRole } from '../entities/user.entity';
+import { bindUser } from '../observability/request-context';
 import { AccessDenylist, DenylistUnavailable } from './access-denylist';
 import { AccessTokens, InvalidAccessToken, type Principal } from './access-tokens';
 
@@ -105,6 +106,9 @@ export class AuthGuard implements CanActivate {
     }
 
     principals.set(req, principal);
+    // Особа — і в контекст запиту (#29): кожен рядок логу нижче, аж до
+    // репозиторію, отримає userId, хоча жоден шар його не передає.
+    bindUser(principal.userId);
     return true;
   }
 }

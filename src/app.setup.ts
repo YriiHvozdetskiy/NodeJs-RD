@@ -7,6 +7,7 @@ import { middleware as openApiValidator } from 'express-openapi-validator';
 import { CorsIoAdapter } from './common/cors-io.adapter';
 import { ProblemFilter } from './common/problem.filter';
 import type { Env } from './config/env.schema';
+import { metricsEndpoint, observeHttp } from './observability/http-observability';
 import { OrdersRateLimit } from './rate-limit/orders-rate-limit';
 import { SessionsService } from './sessions/sessions.service';
 
@@ -32,13 +33,24 @@ export const APP_OPTIONS: NestApplicationOptions = { bodyParser: false };
  * тестував би інший сервіс, ніж той, що в проді.
  */
 export function configureApp(app: NestExpressApplication): NestExpressApplication {
+  const config = app.get<ConfigService<Env, true>>(ConfigService);
+
+  // Спостережуваність (#29) — ПЕРШИМ middleware: контекст запиту в
+  // AsyncLocalStorage, RED-метрики й рядок логу доступу. Усе, що стоїть
+  // нижче, включно з відмовами CORS, rate-limit і валідатора, уже всередині
+  // контексту й уже порахуване.
+  app.use(observeHttp({ faultInjection: config.get('FAULT_INJECTION', { infer: true }) }));
+  // Prometheus тягне текст метрик звідси — раніше за валідатор спеки і роутер
+  // Nest з його гардами: ні в спеці, ні в токенах цьому маршруту не місце.
+  app.use('/metrics', metricsEndpoint());
+
   // CORS — до валідатора спеки: preflight `OPTIONS` відповідає middleware
   // `cors` і далі не йде. Валідатор такої операції в спеці не знайшов би й
   // відповів би помилкою замість дозволу.
   //
   // Один список на всі три входи браузера: REST, SSE-потік (EventSource з
   // іншого origin теж вимагає `Access-Control-Allow-Origin`) і socket.io.
-  const origins = app.get<ConfigService<Env, true>>(ConfigService).get('CORS_ORIGINS', { infer: true });
+  const origins = config.get('CORS_ORIGINS', { infer: true });
   app.enableCors({ origin: origins });
   app.useWebSocketAdapter(new CorsIoAdapter(app, origins));
 

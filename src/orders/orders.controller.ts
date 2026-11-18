@@ -28,6 +28,9 @@ import type { Env } from '../config/env.schema';
 import type { OrderStatus } from '../entities/order.entity';
 import type { Principal } from '../auth/access-tokens';
 import { CurrentPrincipal, Roles } from '../auth/guards';
+import { loggerFor } from '../observability/logger';
+
+const log = loggerFor('orders.controller');
 
 /**
  * Через скільки EventSource перепідключається після обриву. Без цього поля
@@ -78,9 +81,16 @@ export class OrdersController {
     return { ...page, items: page.items.map((order) => this.view(order)) };
   }
 
-  /** Чуже — 403 від сервісу, після того як замовлення прочитане (`findFor`). */
+  /**
+   * Чуже — 403 від сервісу, після того як замовлення прочитане (`findFor`).
+   *
+   * Маршрут трьох демо #29. Рядок логу тут, у сервісі й у репозиторії несе
+   * той самий trace_id і userId, хоча жоден шар не отримує ні `req`, ні
+   * корелятора аргументом: їх підставляє логер із контексту запиту.
+   */
   @Get(':orderId')
   async one(@CurrentPrincipal() principal: Principal, @Param('orderId', ParseIntPipe) orderId: number): Promise<unknown> {
+    log.info({ orderId }, 'order requested');
     return this.view(await this.orders.findFor(orderId, principal));
   }
 

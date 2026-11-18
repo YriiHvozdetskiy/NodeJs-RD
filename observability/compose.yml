@@ -1,0 +1,83 @@
+# Стенд спостережуваності (#29): Prometheus тягне /metrics, Tempo приймає спани
+# по OTLP, Grafana малює RED і відкриває трейси. Підключений до кореневого
+# docker-compose.yml через `include`, тож `docker compose up -d --wait` піднімає
+# його разом із базою, і окремої команди грейдеру не треба.
+#
+# Три окремі контейнери, а не один grafana/otel-lgtm: архітектура видна
+# (хто кого тягне і хто кому шле), і на старті це дешевше за памʼяттю. Мої
+# заміри — README, розділ Observability.
+#
+# Порти — 22900–22999, як вимагає умова: стенди попередніх ДЗ їх не займають.
+#   22901 Prometheus · 22902 Grafana · 22904 Tempo (API запитів) · 22918 OTLP/HTTP
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Локальний стенд: годинна історія. Довше тримати нема чого, а том не потрібен.
+      - --storage.tsdb.retention.time=1h
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - '127.0.0.1:22901:9090'
+    extra_hosts:
+      # Застосунок живе на хості, Prometheus — у контейнері. Без цього імені
+      # target не знайдеться, і панелі будуть порожні без жодної помилки.
+      - 'host.docker.internal:host-gateway'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:9090/-/ready']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ['-config.file=/etc/tempo.yml']
+    volumes:
+      - ./tempo.yml:/etc/tempo.yml:ro
+    ports:
+      - '127.0.0.1:22904:3200'   # API запитів: /api/traces/<trace_id>
+      - '127.0.0.1:22918:4318'   # OTLP/HTTP — сюди застосунок шле спани
+    healthcheck:
+      # /ready віддає 200 лише тоді, коли інгестер прийняв кільце, — раніше
+      # перший експорт спанів міг би піти в нікуди.
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3200/ready']
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      # Пароль адміна — як PG_ADMIN_PASSWORD у db: свіжий клон стартує з
+      # дев-дефолтом, а `npm run db:up` підставляє згенерований
+      # secrets/grafana_admin_password. Тому й тому немає: стан Grafana —
+      # лише провіжені файли, і пароль береться заново на кожному старті.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-marketplace-dev}
+      # Дивитись дашборд можна без логіну, змінювати — лише адміном.
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/marketplace/marketplace-red.json
+    volumes:
+      # Датасорси й дашборд — файлами. Накликане в UI не переживає перестворення
+      # контейнера, а файл у git переживає все.
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/marketplace.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/marketplace.yml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards/marketplace:ro
+    ports:
+      - '127.0.0.1:22902:3000'
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3000/api/health']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped

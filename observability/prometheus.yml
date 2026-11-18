@@ -1,0 +1,21 @@
+# Модель PULL: застосунок нічого нікуди не шле, Prometheus сам приходить по /metrics.
+#
+# scrape_interval 2 с — під локальні демо, які тривають секунди: з дефолтними
+# 15–60 с панель лишалась би порожньою, і це виглядало б як зламаний датасорс.
+# У проді так не ставлять — кожен скрейп коштує і застосунку, і сховищу.
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  # `npm run start:vault` — застосунок на PORT (3000 за замовчуванням).
+  - job_name: marketplace-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:3000']
+  # Застосунок, який піднімають demo:logs / demo:metrics / demo:trace (DEMO_PORT).
+  # Живе секунди, тож між прогонами цей target «down» — це нормально.
+  - job_name: marketplace-demo
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:22900']

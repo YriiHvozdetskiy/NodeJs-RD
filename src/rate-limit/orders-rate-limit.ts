@@ -68,6 +68,9 @@ export class OrdersRateLimit {
       // «можна вже», а вікно звільниться лише через частку секунди.
       const seconds = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
       res.setHeader('Retry-After', String(seconds));
+      // Роутер Nest цей запит не побачить, тож шаблон маршруту для лейбла
+      // `route` у RED (#29) називаємо самі. Шлях тут статичний — без id.
+      res.locals.route = '/v1/orders';
       res
         .status(429)
         .type('application/problem+json')

@@ -5,6 +5,9 @@ import type { UserRole } from '../entities/user.entity';
 import type { Principal } from './access-tokens';
 import { AuthService, type TokenPair } from './auth.service';
 import { CurrentPrincipal, Public } from './guards';
+import { loggerFor } from '../observability/logger';
+
+const log = loggerFor('auth.controller');
 
 /** Схема `Me` зі спеки. */
 interface MeView {
@@ -29,6 +32,10 @@ export class AuthController {
   @Post('login')
   @HttpCode(200)
   login(@Body() body: { email: string; password: string }): Promise<TokenPair> {
+    // Спроба входу — подія безпеки, і email у ній потрібен (перебір паролів
+    // видно саме за ним). Пароль у цьому ж обʼєкті ховає redact за шляхом
+    // `body.password` (src/observability/logger.ts): рядок є, пароля в ньому немає.
+    log.info({ body }, 'login attempt');
     return this.auth.login(body.email, body.password);
   }
 

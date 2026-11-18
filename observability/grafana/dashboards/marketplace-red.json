@@ -1,0 +1,79 @@
+{
+  "uid": "marketplace-red",
+  "title": "Marketplace API · RED",
+  "description": "Три питання RED по кожному маршруту: скільки запитів, яка частка 5xx, скільки чекає користувач.",
+  "tags": ["marketplace", "red"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "R — скільки запитів за секунду",
+      "description": "Rate: потік по маршрутах. route — шаблон (/v1/orders/:orderId), тож рядів стільки, скільки маршрутів, а не id.",
+      "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+      "gridPos": { "h": 9, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+          "expr": "sum by (route) (rate(http_requests_total[1m]))",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "E — яка частка запитів падає з 5xx",
+      "description": "Errors: частка відповідей 5xx серед усіх відповідей маршруту. 4xx сюди не входять — це помилка клієнта, а не сервісу.",
+      "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+      "gridPos": { "h": 9, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+          "expr": "sum by (route) (rate(http_requests_total{status=~\"5..\"}[1m])) / sum by (route) (rate(http_requests_total[1m]))",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "D — скільки чекає користувач (p50 / p95 / p99)",
+      "description": "Duration: перцентилі з гістограми. Точність — роздільність бакетів; верхній скінченний le = 10 с, вище за найгірший випадок (README, Observability).",
+      "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+          "expr": "histogram_quantile(0.5, sum by (le, route) (rate(http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50 {{route}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95 {{route}}"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "marketplace-prom" },
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99 {{route}}"
+        }
+      ]
+    }
+  ]
+}

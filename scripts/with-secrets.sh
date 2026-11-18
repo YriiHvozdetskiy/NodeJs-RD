@@ -41,6 +41,12 @@
 #
 #   bash scripts/with-secrets.sh dev node dist/demo-upload.js
 #
+# З ДЗ #29 — стенд спостережуваності. Адреси OTEL_EXPORTER_OTLP_ENDPOINT,
+# PROMETHEUS_URL, TRACE_API_URL і GRAFANA_URL лежать у .env, пароль адміна
+# Grafana — у secrets/grafana_admin_password (GRAFANA_PASSWORD).
+#
+#   bash scripts/with-secrets.sh dev node dist/demo-trace.js
+#
 # Міграції й seed ходять власником схеми (admin), а не app_user: з Postgres 15
 # у звичайної ролі немає CREATE на schema public, і DDL від app_user упав би
 # з permission denied. Застосунок, як і раніше, ходить app_user.
@@ -121,6 +127,10 @@ if [ "${ENV_SLUG}" = "kind" ]; then
          JWT_PREVIOUS_PUBLIC_KEY JWT_PREVIOUS_KID PULUMI_CONFIG_PASSPHRASE
   export BROKER_URL="" REDIS_CACHE_URL="" \
          STORAGE_ENDPOINT="" STORAGE_BUCKET="" STORAGE_ACCESS_KEY="" STORAGE_SECRET_KEY=""
+  # Стенд спостережуваності (#29) у kind не розгорнуто: колектора там немає,
+  # а адреси Prometheus/Tempo/Grafana і пароль Grafana потрібні лише демо на
+  # робочій машині. Порожньо = вимкнено (infra/vault.ts).
+  export OTEL_EXPORTER_OTLP_ENDPOINT="" PROMETHEUS_URL="" TRACE_API_URL="" GRAFANA_URL="" GRAFANA_PASSWORD=""
   export PULUMI_BACKEND_URL="${PULUMI_BACKEND_URL:-file://${ROOT}/.pulumi}"
   exec "$@"
 fi
@@ -249,6 +259,24 @@ if [ -f "${STORAGE_DIR}/storage_access_key" ] && [ -f "${STORAGE_DIR}/storage_se
   STORAGE_ACCESS_KEY="$(cat "${STORAGE_DIR}/storage_access_key")"
   STORAGE_SECRET_KEY="$(cat "${STORAGE_DIR}/storage_secret_key")"
   export STORAGE_ACCESS_KEY STORAGE_SECRET_KEY
+fi
+
+# Стенд спостережуваності (#29). Адреси — з .env по одному ключу, як сховище
+# файлів вище: куди застосунок шле спани (OTLP), де демо питають Prometheus,
+# Tempo і Grafana. OTEL_EXPORTER_OTLP_ENDPOINT мусить приїхати саме звідси, а
+# не з .env через ConfigModule: OTel читає її першим рядком процесу, раніше
+# за Nest. Немає ключа — немає змінної: спани без експорту, демо без стенда
+# падають із назвою змінної.
+for var in OTEL_EXPORTER_OTLP_ENDPOINT PROMETHEUS_URL TRACE_API_URL GRAFANA_URL; do
+  value="$(grep -E "^${var}=" "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)"
+  [ -n "${value}" ] || continue
+  export "${var}=${value}"
+done
+# Пароль адміна Grafana — секрет, тож із файла, а не з .env. Його генерує
+# `npm run db:up`, і той самий файл compose отримує як GRAFANA_PASSWORD.
+if [ -f "${ROOT}/secrets/grafana_admin_password" ]; then
+  GRAFANA_PASSWORD="$(cat "${ROOT}/secrets/grafana_admin_password")"
+  export GRAFANA_PASSWORD
 fi
 
 exec "$@"

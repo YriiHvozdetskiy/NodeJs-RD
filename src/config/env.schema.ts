@@ -41,8 +41,43 @@ export const envSchema = z.object({
    */
   DRAIN_MS: z.coerce.number().int().min(0).max(60_000).default(0),
 
-  /** Рівень логування. Поки читається лише на старті — логер приїде пізніше. */
+  /**
+   * Рівень логування pino (#29). Логер читає змінну сам, ще до цієї
+   * перевірки (src/observability/logger.ts): помилку конфігу теж треба
+   * записати JSON-рядком. Схема тут — щоб друкарська помилка валила старт.
+   */
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+
+  /**
+   * Куди слати спани (#29) — базова адреса OTLP/HTTP, без `/v1/traces`:
+   * `http://127.0.0.1:22918` для Tempo з compose. Порожньо — спани й
+   * кореляція в логах є, експорту немає (тести, kind). Читає її
+   * src/observability/otel.ts ДО старту Nest — бо OTel мусить завантажитись
+   * раніше за застосунок; тут вона для fail-fast на кривій адресі.
+   */
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^https?$/ }).optional()),
+
+  /**
+   * FAULT_INJECTION=1 — заголовок `X-Fault: error | slow` справді ламає або
+   * сповільнює запит до бази (src/observability/fault.ts). Вмикають лише демо
+   * #29, щоб отримати справжній 5xx і справжній повільний запит. Без цього
+   * прапорця заголовок не робить нічого — у проді його не ставлять.
+   */
+  FAULT_INJECTION: z
+    .enum(['0', '1'])
+    .default('0')
+    .transform((v) => v === '1'),
+
+  /**
+   * Адреси стенда спостережуваності для демо #29 — застосунок їх не читає.
+   * Prometheus (`http://127.0.0.1:22901`): demo:metrics перевіряє ним PromQL
+   * дашборда. API Tempo (`http://127.0.0.1:22904`): demo:trace забирає звідти
+   * трейс за trace_id. Grafana (`http://127.0.0.1:22902`): demo:metrics читає
+   * провіжений дашборд. Тут вони, бо `.env.example` звіряється з цією схемою.
+   */
+  PROMETHEUS_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^https?$/ }).optional()),
+  TRACE_API_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^https?$/ }).optional()),
+  GRAFANA_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^https?$/ }).optional()),
 
   /**
    * Куди підключатись до Postgres — БЕЗ пароля: `postgres://user@host:port/db`.
@@ -230,6 +265,12 @@ export const vaultSchema = z.object({
    */
   STORAGE_ACCESS_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(3).optional()),
   STORAGE_SECRET_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(8).optional()),
+  /**
+   * Пароль адміна Grafana (#29) — із secrets/grafana_admin_password. Застосунку
+   * він не потрібен; тут він для того, щоб check:env не пустив його в
+   * `.env.example`. Демо #29 читають ним провіжений дашборд через API.
+   */
+  GRAFANA_PASSWORD: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(8).optional()),
 });
 
 /** Повна схема процесу: оточення + секрети сховища. */

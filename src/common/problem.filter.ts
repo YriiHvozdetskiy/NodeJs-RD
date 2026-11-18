@@ -1,6 +1,10 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from '@nestjs/common';
+import { trace } from '@opentelemetry/api';
 import type { Request, Response } from 'express';
+import { loggerFor } from '../observability/logger';
 import { HttpProblem, type ProblemCode } from './http-problem';
+
+const log = loggerFor('http.problem');
 
 /**
  * Одна точка на ВСІ помилки — RFC 9457 problem+json.
@@ -82,6 +86,16 @@ export class ProblemFilter implements ExceptionFilter {
         pointer: e.path ?? '/',
         detail: e.message ?? 'не пройшло перевірку',
       }));
+    }
+
+    // 5xx — помилка сервісу, і її історія має бути в лозі й у трейсі (#29):
+    // рядок із trace_id і стеком, а на серверному спані — подія винятку.
+    // Статус ERROR спану ставить сам OTel за кодом відповіді; 4xx лишаються
+    // Unset — це помилка клієнта, а не наша.
+    if (status >= 500) {
+      const err = exception instanceof Error ? exception : new Error(this.detailOf(exception));
+      log.error({ err, status, url: req.originalUrl }, 'request failed');
+      trace.getActiveSpan()?.recordException(err);
     }
 
     res.status(status).type('application/problem+json').json(body);

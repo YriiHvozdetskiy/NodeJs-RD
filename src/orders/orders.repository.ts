@@ -2,6 +2,10 @@ import { Inject, Injectable } from '@nestjs/common';
 import { cursorAt, decodeCursor, toPage, type KeysetRow, type Page } from '../common/cursor';
 import { DB, type Queryable } from '../db/queryable';
 import type { OrderStatus } from '../entities/order.entity';
+import { faultPoint } from '../observability/fault';
+import { loggerFor } from '../observability/logger';
+
+const log = loggerFor('orders.repository');
 
 /** Позиція замовлення у формі схеми `OrderLine` зі спеки. */
 export interface OrderLine {
@@ -58,6 +62,9 @@ export class OrdersRepository {
    */
   async findWithBuyer(id: number): Promise<{ order: Order; buyerId: string } | null> {
     if (!Number.isSafeInteger(id) || id < 1) return null;
+    // Демо #29: замовлена заголовком відмова бази — рівно тут, у найглибшому
+    // шарі, справжнім запитом до Postgres. Без FAULT_INJECTION=1 — нічого.
+    await faultPoint(this.db);
     // GROUP BY o.id досить: id — первинний ключ, решта колонок orders від нього
     // функціонально залежні, і Postgres це знає.
     const { rows } = await this.db.query<OrderRow & { buyer_id: string }>(
@@ -70,6 +77,9 @@ export class OrdersRepository {
         GROUP BY o.id`,
       [id],
     );
+    // Після `await` на драйвері pg: колбек сокета бази повертає нас у той самий
+    // контекст запиту — trace_id і userId у цьому рядку ті самі, що в контролері.
+    log.info({ orderId: id, found: rows.length }, 'order loaded');
     return rows[0] ? { order: toOrder(rows[0]), buyerId: rows[0].buyer_id } : null;
   }
 

@@ -2,7 +2,7 @@
   "name": "marketplace-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder. ДЗ#22: transactional outbox + relay на SKIP LOCKED, ідемпотентний споживач (природний ключ + inbox), Idempotency-Key у транзакції замовлення. ДЗ#24: JWT ES256 + refresh-ротація з детекцією повтору, денилист у Redis, RBAC і власність. ДЗ#26: файли в S3-сумісному сховищі — presigned intent/commit, multipart із довантаженням через ListParts, приватний бакет за кеш-шаром, ассети з хешем в імені. ДЗ#28: production-образ distroless із BuildKit-секретом, скан із порогом, kind + Pulumi (Deployment, Secret, PDB, HPA), rolling update без жодної невдалої відповіді.",
+  "description": "Курсовий проєкт — Marketplace API. ДЗ#9: OpenAPI-контракт + runtime-валідація на кордоні. ДЗ#11: zod-схема env із fail-fast, секрети поза git і поза образом, ротація пароля БД без рестарту. ДЗ#12: схема Postgres, seed на 200k замовлень, 4 запити з EXPLAIN до/після, повнотекстовий пошук по каталогу. ДЗ#13: TypeORM entities + relations + міграції, ідемпотентний seed, N+1 до/після, звіт через QueryBuilder. ДЗ#22: transactional outbox + relay на SKIP LOCKED, ідемпотентний споживач (природний ключ + inbox), Idempotency-Key у транзакції замовлення. ДЗ#24: JWT ES256 + refresh-ротація з детекцією повтору, денилист у Redis, RBAC і власність. ДЗ#26: файли в S3-сумісному сховищі — presigned intent/commit, multipart із довантаженням через ListParts, приватний бакет за кеш-шаром, ассети з хешем в імені. ДЗ#28: production-образ distroless із BuildKit-секретом, скан із порогом, kind + Pulumi (Deployment, Secret, PDB, HPA), rolling update без жодної невдалої відповіді. ДЗ#29: структурні логи pino з trace_id активного спана й контекстом у AsyncLocalStorage, RED-метрики з шаблоном маршруту в лейблі, OpenTelemetry з W3C traceparent і спанами в Tempo, дашборд Grafana файлом.",
   "engines": {
     "node": ">=20"
   },
@@ -73,7 +73,10 @@
     "destroy": "bash scripts/with-secrets.sh kind bash scripts/infra.sh destroy",
     "demo:image": "bash demo/image.sh",
     "demo:rollout": "bash scripts/with-secrets.sh kind bash demo/rollout.sh",
-    "demo:pdb": "bash demo/pdb.sh"
+    "demo:pdb": "bash demo/pdb.sh",
+    "demo:logs": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-logs.js",
+    "demo:metrics": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-metrics.js",
+    "demo:trace": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-trace.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1161.0",
@@ -84,6 +87,13 @@
     "@nestjs/platform-express": "11.2.1",
     "@nestjs/platform-socket.io": "11.2.1",
     "@nestjs/websockets": "11.2.1",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/exporter-trace-otlp-http": "0.223.1",
+    "@opentelemetry/instrumentation": "0.223.1",
+    "@opentelemetry/instrumentation-http": "0.223.1",
+    "@opentelemetry/instrumentation-pg": "0.76.0",
+    "@opentelemetry/resources": "2.12.1",
+    "@opentelemetry/sdk-trace-node": "2.12.1",
     "amqplib": "2.0.1",
     "bullmq": "6.3.11",
     "express": "5.2.1",
@@ -91,6 +101,8 @@
     "ioredis": "5.11.1",
     "jose": "6.2.13",
     "pg": "8.23.0",
+    "pino": "10.4.0",
+    "prom-client": "15.1.3",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
     "socket.io": "4.8.3",

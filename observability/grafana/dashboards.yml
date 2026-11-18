@@ -1,0 +1,11 @@
+# Провайдер дашбордів: Grafana читає JSON із теки, змонтованої в compose.
+# allowUiUpdates: false — правка в UI не зберігається: джерело правди — файл у git.
+apiVersion: 1
+providers:
+  - name: marketplace
+    folder: Marketplace
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards/marketplace

@@ -3,6 +3,7 @@ import { rmSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { LoggerService } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import Redis, { type RedisOptions } from 'ioredis';
@@ -11,6 +12,7 @@ import { APP_OPTIONS, configureApp } from '../app.setup';
 import { dataSourceOptions } from '../data-source';
 import { cliDbConfig, requiredEnv } from '../db/cli-env';
 import { migrate } from '../messaging/demo-kit';
+import { setLogLevel } from '../observability/logger';
 import { untilReady } from './redis-connections';
 
 /**
@@ -77,8 +79,17 @@ export interface Api {
  *
  * Імпорт AppModule динамічний і ПІСЛЯ env: ConfigModule.forRoot() валідує
  * оточення в момент імпорту файла.
+ *
+ * Опції — для пода демо #29 (src/demo-obs-pod.ts): логер Nest на pino замість
+ * консолі, фіксований порт і адреса, яку бачить Prometheus із контейнера.
  */
-export async function startApi(): Promise<Api> {
+export interface StartApiOptions {
+  logger?: LoggerService;
+  port?: number;
+  host?: string;
+}
+
+export async function startApi(options: StartApiOptions = {}): Promise<Api> {
   const db = cliDbConfig();
   const passwordFile = await demoPasswordFile(db.password);
 
@@ -93,10 +104,17 @@ export async function startApi(): Promise<Api> {
     REDIS_CACHE_URL: requiredEnv('REDIS_CACHE_URL'),
     REDIS_QUEUE_URL: requiredEnv('REDIS_QUEUE_URL'),
   });
+  // Демо попередніх ДЗ друкують `ключ=значення` у той самий stdout. Логи
+  // застосунку там — лише попередження й помилки, як і логер Nest нижче;
+  // под демо #29 передає власний логер і рівень не чіпає.
+  if (!options.logger) setLogLevel('warn');
   const { AppModule } = await import('../app.module');
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, { ...APP_OPTIONS, logger: ['error', 'warn'] });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    ...APP_OPTIONS,
+    logger: options.logger ?? ['error', 'warn'],
+  });
   configureApp(app);
-  await app.listen(0, '127.0.0.1');
+  await app.listen(options.port ?? 0, options.host ?? '127.0.0.1');
   const url = await app.getUrl();
 
   return {
