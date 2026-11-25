@@ -1,0 +1,158 @@
+{
+  "roleArn": "arn:aws:iam::832316697084:role/hw31-ci-teardown",
+  "trustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {
+          "Federated": "arn:aws:iam::832316697084:oidc-provider/token.actions.githubusercontent.com"
+        },
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          },
+          "StringLike": {
+            "token.actions.githubusercontent.com:sub": [
+              "repo:YriiHvozdetskiy/NodeJs-RD:environment:teardown",
+              "repo:YriiHvozdetskiy@*/NodeJs-RD@*:environment:teardown"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "permissionPolicy": {
+    "name": "teardown-demo",
+    "document": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Action": [
+            "rds:DeleteDBInstance",
+            "rds:DeleteDBSubnetGroup"
+          ],
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:rds:*:832316697084:db:hw31-db*",
+            "arn:aws:rds:*:832316697084:subgrp:hw31-db-subnets-*"
+          ],
+          "Sid": "RdsDelete"
+        },
+        {
+          "Action": [
+            "elasticloadbalancing:DeleteLoadBalancer",
+            "elasticloadbalancing:DeleteListener",
+            "elasticloadbalancing:DeleteTargetGroup",
+            "elasticloadbalancing:DeregisterTargets"
+          ],
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:elasticloadbalancing:*:832316697084:loadbalancer/app/hw31-alb-*/*",
+            "arn:aws:elasticloadbalancing:*:832316697084:listener/app/hw31-alb-*/*",
+            "arn:aws:elasticloadbalancing:*:832316697084:targetgroup/hw31-tg-*/*"
+          ],
+          "Sid": "ElbDelete"
+        },
+        {
+          "Action": [
+            "lambda:DeleteFunction",
+            "lambda:GetFunction",
+            "lambda:RemovePermission",
+            "lambda:GetPolicy"
+          ],
+          "Effect": "Allow",
+          "Resource": "arn:aws:lambda:*:832316697084:function:hw31-target-*",
+          "Sid": "LambdaDelete"
+        },
+        {
+          "Action": [
+            "iam:DeleteRole",
+            "iam:GetRole",
+            "iam:ListRolePolicies",
+            "iam:ListAttachedRolePolicies",
+            "iam:ListInstanceProfilesForRole"
+          ],
+          "Effect": "Allow",
+          "Resource": "arn:aws:iam::832316697084:role/hw31-target-role-*",
+          "Sid": "IamDeleteTargetRole"
+        },
+        {
+          "Action": [
+            "ec2:DeleteNatGateway",
+            "ec2:ReleaseAddress",
+            "ec2:DisassociateAddress"
+          ],
+          "Effect": "Allow",
+          "Resource": "*",
+          "Sid": "Ec2DeleteNat"
+        },
+        {
+          "Action": [
+            "rds:DescribeDBInstances",
+            "rds:DescribeDBSubnetGroups",
+            "elasticloadbalancing:DescribeLoadBalancers",
+            "elasticloadbalancing:DescribeListeners",
+            "elasticloadbalancing:DescribeTargetGroups",
+            "elasticloadbalancing:DescribeTargetHealth",
+            "ec2:DescribeNatGateways",
+            "ec2:DescribeAddresses",
+            "ec2:DescribeNetworkInterfaces",
+            "tag:GetResources"
+          ],
+          "Effect": "Allow",
+          "Resource": "*",
+          "Sid": "ReadLeftovers"
+        }
+      ]
+    }
+  },
+  "role": {
+    "Path": "/",
+    "RoleName": "hw31-ci-teardown",
+    "RoleId": "AROA4DSPQ5H6JFMPIL3ME",
+    "Arn": "arn:aws:iam::832316697084:role/hw31-ci-teardown",
+    "CreateDate": "2026-11-25T18:44:52+00:00",
+    "AssumeRolePolicyDocument": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::832316697084:oidc-provider/token.actions.githubusercontent.com"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+            },
+            "StringLike": {
+              "token.actions.githubusercontent.com:sub": [
+                "repo:YriiHvozdetskiy/NodeJs-RD:environment:teardown",
+                "repo:YriiHvozdetskiy@*/NodeJs-RD@*:environment:teardown"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "Description": "GitHub Actions teardown.yml: destroys stack demo and checks it is empty",
+    "MaxSessionDuration": 3600,
+    "Tags": [
+      {
+        "Key": "Stack",
+        "Value": "base"
+      },
+      {
+        "Key": "ManagedBy",
+        "Value": "pulumi"
+      },
+      {
+        "Key": "Project",
+        "Value": "nodejs-pro-hw31"
+      }
+    ],
+    "RoleLastUsed": {}
+  }
+}

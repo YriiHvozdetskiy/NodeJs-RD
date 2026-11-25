@@ -1,0 +1,70 @@
+{
+  "allowed": [
+    {
+      "EvalActionName": "rds:DeleteDBInstance",
+      "EvalResourceName": "arn:aws:rds:eu-central-1:832316697084:db:hw31-db0000000",
+      "EvalDecision": "allowed",
+      "MatchedStatements": [
+        {
+          "SourcePolicyId": "role_hw31-ci-teardown_teardown-demo",
+          "SourcePolicyType": "IAM Policy",
+          "StartPosition": {
+            "Line": 1,
+            "Column": 38
+          },
+          "EndPosition": {
+            "Line": 1,
+            "Column": 242
+          }
+        }
+      ],
+      "MissingContextValues": [],
+      "EvalDecisionDetails": {},
+      "ResourceSpecificResults": [
+        {
+          "EvalResourceName": "arn:aws:rds:eu-central-1:832316697084:db:hw31-db0000000",
+          "EvalResourceDecision": "allowed",
+          "MatchedStatements": [
+            {
+              "SourcePolicyId": "role_hw31-ci-teardown_teardown-demo",
+              "SourcePolicyType": "IAM Policy",
+              "StartPosition": {
+                "Line": 1,
+                "Column": 38
+              },
+              "EndPosition": {
+                "Line": 1,
+                "Column": 242
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "denied": [
+    {
+      "EvalActionName": "rds:CreateDBInstance",
+      "EvalResourceName": "*",
+      "EvalDecision": "implicitDeny",
+      "MatchedStatements": [],
+      "MissingContextValues": []
+    }
+  ],
+  "foreignDb": [
+    {
+      "EvalActionName": "rds:DeleteDBInstance",
+      "EvalResourceName": "arn:aws:rds:eu-central-1:832316697084:db:marketplace-prod",
+      "EvalDecision": "implicitDeny",
+      "MatchedStatements": [],
+      "MissingContextValues": [],
+      "EvalDecisionDetails": {},
+      "ResourceSpecificResults": [
+        {
+          "EvalResourceName": "arn:aws:rds:eu-central-1:832316697084:db:marketplace-prod",
+          "EvalResourceDecision": "implicitDeny"
+        }
+      ]
+    }
+  ]
+}
