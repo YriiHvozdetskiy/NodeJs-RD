@@ -8,6 +8,9 @@ import type { OrderStatus } from '../entities/order.entity';
 import type { Principal } from '../auth/access-tokens';
 import { OrderEventsService } from './order-events.service';
 import { OrdersRepository, type Order } from './orders.repository';
+import { loggerFor } from '../observability/logger';
+
+const log = loggerFor('orders.service');
 
 export interface CreateOrderItem {
   product_id: number;
@@ -57,6 +60,7 @@ export class OrdersService {
    * компроміс на користь зрозумілої клієнту відмови (README, розділ «Auth»).
    */
   async findFor(id: number, principal: Principal): Promise<Order> {
+    log.info({ orderId: id, role: principal.role }, 'checking ownership');
     const found = await this.orders.findWithBuyer(id);
     if (!found) throw new HttpProblem(404, `замовлення ${id} не існує`, 'not-found');
     if (found.buyerId !== principal.userId && principal.role !== 'admin') {

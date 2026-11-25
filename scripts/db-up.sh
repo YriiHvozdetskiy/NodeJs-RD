@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Піднімає Postgres, PgBouncer, RabbitMQ, два Redis і сховище файлів і готує файли-секрети. Ідемпотентний: можна запускати скільки завгодно разів.
+# Піднімає Postgres, PgBouncer, RabbitMQ, два Redis, сховище файлів і стенд спостережуваності (#29) і готує файли-секрети. Ідемпотентний: можна запускати скільки завгодно разів.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -35,6 +35,9 @@ mkdir -p "$(dirname "${APP_SECRET_FILE}")"
 # Пари ES256 для dev і prod, їхні kid і перці refresh-токенів (#24). Наявні не
 # чіпаються: перегенерація ключа вбила б усі живі токени.
 node scripts/jwt-keys.mjs init
+# Пароль адміна Grafana (#29). Тому в Grafana немає, тож пароль береться із
+# GRAFANA_PASSWORD на кожному старті контейнера — вирівнювати після up нічого.
+[ -f ./secrets/grafana_admin_password ] || printf 'grafana-%s' "$(openssl rand -hex 16)" > ./secrets/grafana_admin_password
 
 PG_ADMIN_PASSWORD="$(cat "${ADMIN_SECRET_FILE}")"
 export PG_ADMIN_PASSWORD
@@ -45,6 +48,8 @@ export REDIS_PASSWORD
 STORAGE_ACCESS_KEY="$(cat ./secrets/storage_access_key)"
 STORAGE_SECRET_KEY="$(cat ./secrets/storage_secret_key)"
 export STORAGE_ACCESS_KEY STORAGE_SECRET_KEY
+GRAFANA_PASSWORD="$(cat ./secrets/grafana_admin_password)"
+export GRAFANA_PASSWORD
 # PgBouncer отримує userlist зі згенерованих паролів, а не дев-файл із репо.
 NO_RELOAD=1 bash scripts/pgbouncer-userlist.sh
 export PGBOUNCER_USERLIST=./secrets/pgbouncer_userlist.txt
@@ -71,7 +76,9 @@ docker compose exec -T rabbit rabbitmqctl -q change_password app "${RABBITMQ_PAS
 
 echo "Postgres готовий на 127.0.0.1:5432, PgBouncer — на 127.0.0.1:6432, Pact Broker — на 127.0.0.1:9292,"
 echo "RabbitMQ — на 127.0.0.1:5672 (UI: http://127.0.0.1:15672), Redis кешу — на 127.0.0.1:6379,"
-echo "Redis черги — на 127.0.0.1:6380, сховище файлів (S3 API) — на 127.0.0.1:22650 (консоль: http://127.0.0.1:22651);"
+echo "Redis черги — на 127.0.0.1:6380, сховище файлів (S3 API) — на 127.0.0.1:22650 (консоль: http://127.0.0.1:22651),"
+echo "Prometheus — на 127.0.0.1:22901, Grafana — на http://127.0.0.1:22902 (admin / secrets/grafana_admin_password),"
+echo "Tempo — на 127.0.0.1:22904 (OTLP/HTTP — 127.0.0.1:22918);"
 echo "паролі й ключі вирівняні з secrets/."
 echo "Далі:"
 echo "  npm run start:vault                 # застосунок на :3000; ключі підпису — з secrets/jwt/dev/"

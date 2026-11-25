@@ -12,6 +12,8 @@
  *                 overlap-ротація ключа). Порожній рядок — свідоме «вимкнено».
  *                 Відсутня змінна — зламаний експорт сховища, і це теж падіння:
  *                 інакше друкарська помилка в обгортці мовчки вимикала б фічу в проді.
+ *   TOOLING     — (#29) значення для демо на робочій машині: перевіряються, як
+ *                 SWITCHABLE, але в под не їдуть.
  *
  * Дефолтів тут немає жодного. `?? "changeme"` перетворив би «забули пароль»
  * на «задеплоїли з відомим паролем».
@@ -36,7 +38,19 @@ export const SWITCHABLE = [
   'STORAGE_BUCKET',
   'STORAGE_ACCESS_KEY',
   'STORAGE_SECRET_KEY',
+  // Куди слати спани (#29). У kind колектора немає — порожньо, і под пише
+  // trace_id у логи без експорту.
+  'OTEL_EXPORTER_OTLP_ENDPOINT',
 ] as const;
+
+/**
+ * Значення сховища для інструментів робочої машини (#29): адреси стенда
+ * спостережуваності й пароль Grafana. Застосунок їх не читає, тож у под вони
+ * не їдуть ніколи — пароль Grafana в Secret API був би зайвим місцем витоку.
+ * Але експорт сховища один на всі оточення, і відсутня змінна — так само
+ * зламаний експорт, як і для SWITCHABLE: програма падає з її назвою.
+ */
+export const TOOLING = ['PROMETHEUS_URL', 'TRACE_API_URL', 'GRAFANA_URL', 'GRAFANA_PASSWORD'] as const;
 
 export interface Vault {
   /**
@@ -61,7 +75,7 @@ export function readVault(env: NodeJS.ProcessEnv): Vault {
   for (const name of REQUIRED) {
     if (!env[name]) problems.push(`${name}: не задано — без неї застосунок не стартує`);
   }
-  for (const name of SWITCHABLE) {
+  for (const name of [...SWITCHABLE, ...TOOLING]) {
     if (env[name] === undefined) {
       problems.push(`${name}: не задано — порожній рядок вимикає фічу, відсутність означає зламаний експорт сховища`);
     }

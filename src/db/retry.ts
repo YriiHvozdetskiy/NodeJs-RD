@@ -1,4 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { loggerFor } from '../observability/logger';
 import { pgErrorField } from './sql';
 
 /**
@@ -39,8 +40,9 @@ export interface RetryOptions {
   onRetry?: (event: RetryEvent) => void;
 }
 
-const logRetry = (e: RetryEvent) =>
-  console.warn(`[retry] ${e.label}: ${e.code}, спроба ${e.attempt}/${e.maxAttempts} — повтор усієї транзакції через ${e.delayMs} мс`);
+// Рядок JSON із trace_id запиту (#29): видно, ЯКИЙ запит повторював транзакцію.
+const log = loggerFor('db.retry');
+const logRetry = (e: RetryEvent) => log.warn({ ...e }, 'повтор усієї транзакції');
 
 /**
  * Повторює `run` цілком — разом із BEGIN і всіма читаннями.

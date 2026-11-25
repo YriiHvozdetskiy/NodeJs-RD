@@ -1,0 +1,18 @@
+# Мінімальний Tempo: приймає OTLP/HTTP напряму від застосунку (без колектора
+# посередині) і тримає блоки на диску контейнера. Перестворили контейнер —
+# трейси зникли; для локального стенда це свідомо.
+server:
+  http_listen_port: 3200
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

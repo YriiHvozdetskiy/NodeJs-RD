@@ -6,6 +6,12 @@
 # контейнера.
 name: marketplace
 
+# Стенд спостережуваності (#29): Prometheus, Tempo, Grafana. Окремим файлом,
+# бо це інфраструктура іншого роду, але тим самим `docker compose up -d --wait`:
+# демо #29 без нього не мають куди слати спани й де шукати трейс.
+include:
+  - observability/compose.yml
+
 services:
   db:
     image: postgres:17-alpine
