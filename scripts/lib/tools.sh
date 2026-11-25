@@ -37,7 +37,9 @@ tools_image() {
 # Імена змінних, які читає infra/ — з самого infra/vault.ts, щоб список жив в одному місці.
 tools_env_names() {
   grep -oE "'[A-Z][A-Z0-9_]+'" "${TOOLS_ROOT}/infra/vault.ts" | tr -d "'" | sort -u
-  env | sed -nE 's/^((PULUMI|KIND)_[A-Za-z0-9_]*)=.*/\1/p'
+  # #31: ключ AWS, пароль майстра RDS і адреса бюджету читає Pulumi-програма infra/base|demo.
+  env | sed -nE 's/^((PULUMI|KIND|AWS|RDS)_[A-Za-z0-9_]*)=.*/\1/p'
+  env | sed -nE 's/^(BUDGET_EMAIL)=.*/\1/p'
 }
 
 # tools_run <kind|pulumi> [аргументи…]

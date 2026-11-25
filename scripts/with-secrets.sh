@@ -95,6 +95,36 @@ if [ "${SKIP_VAULT:-0}" = "1" ]; then
   exec "$@"
 fi
 
+# Оточення aws (#31): up:base, up:demo, destroy:*, demo:failover|alb|nat.
+#
+#   bash scripts/with-secrets.sh aws bash scripts/aws.sh up base
+#
+# Ключ оператора (IAM-користувач hw31-admin) — у secrets/aws_access_key_id і
+# secrets/aws_secret_access_key, токен Pulumi Cloud — у secrets/pulumi_access_token,
+# адреса листа бюджету — у secrets/budget_email. Пароль майстра RDS
+# (secrets/rds_master_password) створює scripts/aws.sh перед першим up:demo.
+# Регіону тут немає: він у Pulumi.<стек>.yaml, і скрипти читають його звідти.
+# AWS_PROFILE знімаємо: профіль із ~/.aws не має тихо підмінити ключ зі сховища
+# і завести стек в інший акаунт. Конвеєр цим шляхом не ходить — там OIDC-роль.
+if [ "${ENV_SLUG}" = "aws" ]; then
+  for f in aws_access_key_id aws_secret_access_key pulumi_access_token budget_email; do
+    [ -s "${ROOT}/secrets/${f}" ] || { echo "with-secrets: немає secrets/${f} (README → ## AWS → Запуск)" >&2; exit 1; }
+  done
+  unset AWS_PROFILE AWS_SESSION_TOKEN
+  AWS_ACCESS_KEY_ID="$(cat "${ROOT}/secrets/aws_access_key_id")"
+  AWS_SECRET_ACCESS_KEY="$(cat "${ROOT}/secrets/aws_secret_access_key")"
+  PULUMI_ACCESS_TOKEN="$(cat "${ROOT}/secrets/pulumi_access_token")"
+  BUDGET_EMAIL="$(cat "${ROOT}/secrets/budget_email")"
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY PULUMI_ACCESS_TOKEN BUDGET_EMAIL
+  if [ -s "${ROOT}/secrets/rds_master_password" ]; then
+    RDS_MASTER_PASSWORD="$(cat "${ROOT}/secrets/rds_master_password")"
+    export RDS_MASTER_PASSWORD
+  fi
+  # Стан — у Pulumi Cloud, а не file:// як на #28: воркер GitHub не бачить ноутбук.
+  export PULUMI_BACKEND_URL="https://api.pulumi.com"
+  exec "$@"
+fi
+
 # Оточення kind (#28): npm run up / destroy / demo:rollout. Значення їдуть у
 # Pulumi-програму (infra/), а вона кладе їх у K8s Secret — не в процес застосунку.
 #
@@ -137,7 +167,7 @@ fi
 
 case "${ENV_SLUG}" in
   dev) ;;
-  *) echo "with-secrets: невідоме оточення '${ENV_SLUG}' (є dev і kind)" >&2; exit 2 ;;
+  *) echo "with-secrets: невідоме оточення '${ENV_SLUG}' (є dev, kind і aws)" >&2; exit 2 ;;
 esac
 
 ENV_FILE="${ROOT}/.env"

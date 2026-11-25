@@ -1,0 +1,11 @@
+config:
+  aws:region: eu-central-1
+  aws:defaultTags:
+    tags:
+      Project: nodejs-pro-hw31
+      Stack: base
+      ManagedBy: pulumi
+  hw31:azs:
+    - eu-central-1a
+    - eu-central-1b
+  hw31:githubRepo: YriiHvozdetskiy/NodeJs-RD

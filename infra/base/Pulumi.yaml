@@ -1,0 +1,6 @@
+name: hw31-base
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: "ДЗ #31, стек base: бюджет, мережа, SG, OIDC-роль teardown. Нічого погодинного."
