@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# AWS CLI v2 без установки на машину (#31) — з офіційного образу amazon/aws-cli.
+# scripts/lib/tools.sh бере його лише тоді, коли `aws` у системі немає; у GitHub
+# Actions на ubuntu-24.04 CLI вже стоїть, і цей файл там не запускається.
+#
+# Креденшели їдуть у контейнер лише змінними, ІМЕНАМИ (-e NAME): значення не
+# стоїть в аргументах `docker run`, які видно в `ps`. ~/.aws не монтується, тож
+# профіль із машини не підміняє ключ зі сховища #11.
+set -euo pipefail
+IMAGE="${AWS_CLI_IMAGE:-amazon/aws-cli:2.41.0}"
+
+args=(--rm -i -e AWS_PAGER=)
+for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_DEFAULT_REGION; do
+  # ${!name+x} — «змінна задана», навіть якщо порожня.
+  if [ -n "${!name+x}" ]; then args+=(-e "${name}"); fi
+done
+
+exec docker run "${args[@]}" "${IMAGE}" "$@"

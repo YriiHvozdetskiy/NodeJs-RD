@@ -76,7 +76,19 @@
     "demo:pdb": "bash demo/pdb.sh",
     "demo:logs": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-logs.js",
     "demo:metrics": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-metrics.js",
-    "demo:trace": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-trace.js"
+    "demo:trace": "tsc -p tsconfig.json && bash scripts/with-secrets.sh dev node dist/demo-trace.js",
+    "up:base": "bash scripts/with-secrets.sh aws bash scripts/aws.sh up base",
+    "up:demo": "bash scripts/with-secrets.sh aws bash scripts/aws.sh up demo",
+    "destroy:demo": "bash scripts/with-secrets.sh aws bash scripts/aws.sh destroy demo",
+    "destroy:base": "bash scripts/with-secrets.sh aws bash scripts/aws.sh destroy base",
+    "preview:demo": "bash scripts/with-secrets.sh aws bash scripts/aws.sh preview demo",
+    "init:demo": "bash scripts/with-secrets.sh aws bash scripts/aws.sh init demo",
+    "evidence:base": "bash scripts/with-secrets.sh aws bash scripts/aws.sh evidence base",
+    "evidence:iam": "bash scripts/with-secrets.sh aws bash scripts/aws.sh evidence iam",
+    "aws:empty": "bash scripts/with-secrets.sh aws bash scripts/aws-empty.sh",
+    "demo:failover": "bash scripts/with-secrets.sh aws node demo/failover.mjs",
+    "demo:alb": "bash scripts/with-secrets.sh aws node demo/alb.mjs",
+    "demo:nat": "bash scripts/with-secrets.sh aws node demo/nat.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1161.0",

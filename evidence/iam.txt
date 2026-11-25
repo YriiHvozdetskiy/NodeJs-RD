@@ -1,0 +1,6 @@
+role-arn=arn:aws:iam::832316697084:role/hw31-ci-teardown
+sim-allowed-action=rds:DeleteDBInstance on db:hw31-db0000000
+sim-allowed=allowed
+sim-denied-action=rds:CreateDBInstance
+sim-denied=implicitDeny
+sim-denied-foreign-db=implicitDeny
