@@ -19,6 +19,9 @@ import { migrateSchema } from './redis/demo-kit';
  *   RED: 40 звичайних (200) + 5 повільних (200, ~1,2 с) + 15 зламаних (500)
  *   скрейп S2 → counter-delta, errors-delta — різниця S2 − S1;
  *              above-top-bucket — _count − _bucket{le=<верхній скінченний>}
+ *   стенд (якщо задано PROMETHEUS_URL і GRAFANA_URL): Prometheus скрейпить
+ *              саме цей под, кожна панель дашборда має ряд маршруту, Grafana
+ *              віддає провіжений дашборд
  *
  * Повільні й зламані — справжні запити до Postgres (`X-Fault`, src/observability/fault.ts).
  */
@@ -98,9 +101,12 @@ async function main(): Promise<void> {
     summary.line('slowest-ms', slowestMs);
 
     // ── Стенд: PromQL дашборда і сам дашборд ─────────────────────────────
-    const exprsValid = await checkDashboardExprs();
+    const prom = await checkPrometheus(sum(s2, 'process_start_time_seconds'));
     const panels = await grafanaPanels();
-    if (exprsValid !== undefined) summary.line('dashboard-exprs-valid', exprsValid.valid);
+    if (prom !== undefined) {
+      summary.line('prometheus-scraped-pod', prom.scraped ? 1 : 0);
+      summary.line('dashboard-exprs-with-data', prom.withData);
+    }
     if (panels !== undefined) summary.line('grafana-dashboard-panels', panels);
 
     summary.expect('sent-ok + sent-fail ≥ 50', sentOk + sentFail >= 50);
@@ -109,7 +115,10 @@ async function main(): Promise<void> {
     summary.expect(`sent-fail = ${FAILING} — кожна замовлена відмова дала 5xx`, sentFail === FAILING);
     summary.expect('above-top-bucket=0 — найгірший запит нижче верхнього скінченного le', aboveTop === 0);
     summary.expect('series-after = series-before — сто id не додали жодного ряду', seriesAfter === seriesBefore);
-    if (exprsValid !== undefined) summary.expect('PromQL панелей дашборда валідний для Prometheus', exprsValid.valid === exprsValid.total);
+    if (prom !== undefined) {
+      summary.expect('prometheus-scraped-pod=1 — Prometheus скрейпить саме цей процес', prom.scraped);
+      summary.expect(`dashboard-exprs-with-data=${prom.total} — кожна панель має ряд ${DEMO_ROUTE}`, prom.withData === prom.total);
+    }
     if (panels !== undefined) summary.expect('Grafana віддає провіжений дашборд із 3 панелями', panels === 3);
   } finally {
     await pod?.stop();
@@ -136,23 +145,94 @@ function dashboardExprs(): string[] {
   return exprs;
 }
 
-/**
- * Кожен PromQL дашборда — у Prometheus стенда. `status: success` означає, що
- * вираз розібрався і виконався; порожній результат тут нормальний (демо живе
- * секунди). Без PROMETHEUS_URL перевірки немає.
- */
-async function checkDashboardExprs(): Promise<{ valid: number; total: number } | undefined> {
-  const base = process.env.PROMETHEUS_URL;
-  if (!base) return undefined;
-  const exprs = dashboardExprs();
-  let valid = 0;
-  for (const expr of exprs) {
-    const reply = await request(`${base.replace(/\/+$/, '')}/api/v1/query?query=${encodeURIComponent(expr)}`);
-    const status = typeof reply.json === 'object' && reply.json !== null ? Reflect.get(reply.json, 'status') : undefined;
-    if (reply.status === 200 && status === 'success') valid += 1;
-    else console.log(`   ✗ PromQL не прийнято (${reply.status}): ${expr}`);
+const PROM_JOB = 'marketplace-demo';
+/** rate() потрібні дві точки ряду, скрейп — кожні 2 с; із запасом на старт таргета. */
+const PROM_WAIT_MS = 20_000;
+
+interface PromSeries {
+  labels: Record<string, string>;
+  value: number;
+}
+
+/** Миттєвий запит до Prometheus; `undefined` — вираз не прийнято. */
+async function promQuery(base: string, expr: string): Promise<PromSeries[] | undefined> {
+  const reply = await request(`${base}/api/v1/query?query=${encodeURIComponent(expr)}`);
+  const body = reply.json;
+  const status = typeof body === 'object' && body !== null ? Reflect.get(body, 'status') : undefined;
+  const data: unknown = typeof body === 'object' && body !== null ? Reflect.get(body, 'data') : undefined;
+  const result: unknown = typeof data === 'object' && data !== null ? Reflect.get(data, 'result') : undefined;
+  if (reply.status !== 200 || status !== 'success' || !Array.isArray(result)) return undefined;
+  const series: PromSeries[] = [];
+  for (const item of result) {
+    if (typeof item !== 'object' || item === null) continue;
+    const metric: unknown = Reflect.get(item, 'metric');
+    const value: unknown = Reflect.get(item, 'value');
+    if (!Array.isArray(value) || typeof value[1] !== 'string') continue;
+    const labels: Record<string, string> = {};
+    if (typeof metric === 'object' && metric !== null) {
+      for (const [key, label] of Object.entries(metric)) if (typeof label === 'string') labels[key] = label;
+    }
+    series.push({ labels, value: Number(value[1]) });
   }
-  return { valid, total: exprs.length };
+  return series;
+}
+
+async function poll(check: () => Promise<boolean>): Promise<boolean> {
+  const deadline = Date.now() + PROM_WAIT_MS;
+  for (;;) {
+    if (await check()) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+/**
+ * Дашборд проти Prometheus стенда — на даних ЦЬОГО пода. Без PROMETHEUS_URL
+ * перевірки немає.
+ *
+ * `status: success` каже лише, що вираз розібрався. З таргетом у down усі
+ * п'ять виразів відповідають success із порожнім результатом, і «валідний»
+ * нічого не доводить. Тому два кроки:
+ *   1. Prometheus скрейпить саме цей процес: `process_start_time_seconds` job
+ *      `marketplace-demo` у Prometheus — те саме число, що в /metrics пода.
+ *      Ні — друкуємо `up`, і таргет у down видно одразу.
+ *   2. Кожен вираз панелі повертає ряд для DEMO_ROUTE. Ряд 500 народжується
+ *      лише у фазі RED, а rate() потрібні дві його точки — тому опитування.
+ *      Без кроку 1 вирази не питаємо зовсім: у них немає фільтра job, і
+ *      вікно [1m] ще тримає точки попереднього прогону — панель «мала б дані»
+ *      при таргеті в down.
+ *
+ * Значення не перевіряється. Ряд, що народився між двома скрейпами, Prometheus
+ * рахує від першої точки, а не від нуля: rate може дати 0, а частка помилок і
+ * квантилі — NaN. Перевіряється, що панелі є що малювати.
+ */
+async function checkPrometheus(podStartTime: number): Promise<{ scraped: boolean; withData: number; total: number } | undefined> {
+  const raw = process.env.PROMETHEUS_URL;
+  if (!raw) return undefined;
+  const base = raw.replace(/\/+$/, '');
+  const job = `{job="${PROM_JOB}"}`;
+
+  const scraped = await poll(async () => (await promQuery(base, `process_start_time_seconds${job}`))?.some((s) => s.value === podStartTime) ?? false);
+  const exprs = dashboardExprs();
+  if (!scraped) {
+    const up = await promQuery(base, `up${job}`);
+    console.log(`   ✗ Prometheus не скрейпить под цього прогону: up${job} = ${up?.map((s) => s.value).join(',') || 'ряду немає'}`);
+    console.log('   ✗ панелі не перевірено: дані в Prometheus не з цього прогону');
+    return { scraped, withData: 0, total: exprs.length };
+  }
+
+  const hasRoute = async (expr: string): Promise<boolean> =>
+    (await promQuery(base, expr))?.some((s) => s.labels.route === DEMO_ROUTE) ?? false;
+  let withData = 0;
+  for (const expr of exprs) {
+    if (await poll(() => hasRoute(expr))) {
+      withData += 1;
+      continue;
+    }
+    const last = await promQuery(base, expr);
+    console.log(`   ✗ ${last === undefined ? 'PromQL не прийнято' : `немає ряду ${DEMO_ROUTE}`}: ${expr}`);
+  }
+  return { scraped, withData, total: exprs.length };
 }
 
 /**

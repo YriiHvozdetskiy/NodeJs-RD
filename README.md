@@ -3378,7 +3378,7 @@ compose-стенда (Postgres, PgBouncer, два Redis, RabbitMQ, Pact Broker, 
 | Змінна | Джерело | Хто читає | Локально |
 | --- | --- | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | сховище (#11): `.env` → `scripts/with-secrets.sh`; у kind порожня | застосунок, першим рядком процесу (`src/observability/otel.ts`); порожня — спани є, експорту немає | `http://127.0.0.1:22918` |
-| `PROMETHEUS_URL` | сховище (#11): `.env`; у kind порожня | `demo:metrics` — PromQL панелей дашборда | `http://127.0.0.1:22901` |
+| `PROMETHEUS_URL` | сховище (#11): `.env`; у kind порожня | `demo:metrics` — чи скрейпить Prometheus под і чи має кожна панель дашборда дані | `http://127.0.0.1:22901` |
 | `TRACE_API_URL` | сховище (#11): `.env`; у kind порожня | `demo:trace` — трейс за `trace_id` | `http://127.0.0.1:22904` |
 | `GRAFANA_URL` | сховище (#11): `.env`; у kind порожня | `demo:metrics` — провіжений дашборд через API | `http://127.0.0.1:22902` |
 | `GRAFANA_PASSWORD` | сховище (#11): `secrets/grafana_admin_password`, генерує `npm run db:up`; у kind порожня | compose — пароль адміна Grafana; `demo:metrics` — логін в API | — |
@@ -3503,7 +3503,7 @@ Middleware RED стоїть **першим** у `configureApp`, раніше з�
 
 Звичайні запити — 10–100 мс навіть під сотнею паралельних на пулі з десяти
 зʼєднань, тому густі бакети стоять саме там. Найгірший випадок — повільний запит
-до бази: 1244–1260 мс у трьох прогонах. Верхній скінченний `le` = 10 с — з
+до бази: 1239–1247 мс у трьох прогонах. Верхній скінченний `le` = 10 с — з
 восьмикратним запасом. `demo:metrics` рахує `above-top-bucket` як `_count` мінус
 `_bucket{le="10"}` маршруту: 0 у кожному прогоні.
 
@@ -3518,9 +3518,28 @@ Middleware RED стоїть **першим** у `configureApp`, раніше з�
 Вікно `[1m]`, а не `[5m]`: демо триває секунди, і п'ятихвилинне вікно розмазало б
 його в майже нуль. 4xx у панель E не входять: це помилка клієнта, а не сервісу.
 Histogram, а не Summary: квантилі Summary рахує кожен процес сам, і скласти їх
-між подами не можна. `demo:metrics` проганяє всі п'ять виразів дашборда через API
-Prometheus (`dashboard-exprs-valid=5`) і читає провіжений дашборд через API Grafana
-(`grafana-dashboard-panels=3`).
+між подами не можна.
+
+`demo:metrics` перевіряє дашборд на даних свого прогону, а не лише синтаксис.
+Відповідь `status: success` на PromQL з порожнім результатом нічого не доводить: так
+Prometheus відповідає і тоді, коли таргет у down. Тому перевірок дві.
+
+1. Prometheus скрейпить саме под цього прогону: його `process_start_time_seconds`
+   у Prometheus збігається з числом у `/metrics` пода (`prometheus-scraped-pod=1`).
+   Якщо ні, демо друкує `up{job="marketplace-demo"}`, і таргет у down видно одразу.
+2. Кожен із п'яти виразів панелей повертає ряд маршруту `GET /v1/orders/:orderId`
+   (`dashboard-exprs-with-data=5`). Демо опитує Prometheus до 20 с: `rate()` потрібні
+   дві точки ряду, а ряд 500 народжується лише у фазі RED. Без першої перевірки
+   вирази демо не запитує зовсім. У них немає фільтра `job`, а вікно `[1m]` ще тримає
+   точки попереднього прогону. Тому запуск із таргетом у down одразу після звичайного
+   показав би «дані є».
+
+Значення демо не перевіряє. Ряд, що народився між двома скрейпами, Prometheus рахує
+від першої точки, а не від нуля. Тому `rate` може дати 0, а частка помилок і
+квантилі — NaN. Провіжений дашборд демо читає через API Grafana
+(`grafana-dashboard-panels=3`). Под на іншому порту (`DEMO_PORT=22950`, Prometheus
+скрейпить 22900) дає `prometheus-scraped-pod=0`, `dashboard-exprs-with-data=0` і
+вихід 1.
 
 ### Трейси
 
@@ -3587,7 +3606,8 @@ problem+json → спан бази з ERROR → серверний спан з E
 - **`demo:metrics`** — прогрів одним 404 → скрейп → сто 404 зі ста різними id →
   скрейп: ряди `2 → 2`. Далі 40 звичайних + 5 повільних + 15 зламаних запитів →
   скрейп: `counter-delta` і `errors-delta` — різниця двох скрейпів, а не лічильник у
-  демо.
+  демо. Із `PROMETHEUS_URL` демо також перевіряє, що Prometheus скрейпить цей под і
+  кожна панель дашборда має ряд маршруту.
 - **`demo:trace`** — запит із `traceparent` і `X-Fault: error` → flush → `GET
   /api/traces/<trace_id>` у Tempo з опитуванням до 20 с. Рядки логу демо шукає за
   роллю (лог доступу, `http.problem`), а не за `trace_id`, і звіряє їхні `trace_id`
@@ -3599,7 +3619,7 @@ problem+json → спан бази з ERROR → серверний спан з E
 | Демо | Прогін 1 | Прогін 2 | Прогін 3 |
 | --- | --- | --- | --- |
 | `demo:logs` | non-json-lines=0 · layers=4 · distinct-trace-ids=1 · trace-id-matches-header=1 · burst=12 · burst-trace-ids=12 · burst-uneven=0 · secret-req-logged=1 · secret-in-logs=0 · foreign-headers-logged=0 | те саме | те саме |
-| `demo:metrics` | sent-ok=45 · sent-fail=15 · counter-delta=60 · errors-delta=15 · above-top-bucket=0 · series-before=2 · series-after=2 · slowest-ms=1249 | те саме, slowest-ms=1260 | те саме, slowest-ms=1244 |
+| `demo:metrics` | sent-ok=45 · sent-fail=15 · counter-delta=60 · errors-delta=15 · above-top-bucket=0 · series-before=2 · series-after=2 · prometheus-scraped-pod=1 · dashboard-exprs-with-data=5 · slowest-ms=1239 | те саме, slowest-ms=1246 | те саме, slowest-ms=1247 |
 | `demo:trace` | spans=3 · orphan-spans=0 · trace-matches-header=1 · trace-matches-log=1 · span-status-error=1 | те саме | те саме |
 
 Від прогону до прогону змінюються лише `slowest-ms` і самі id. Прогін усіх
@@ -4070,7 +4090,7 @@ export DATABASE_URL=postgres://admin:marketplace-dev@127.0.0.1:6432/marketplace
 export REDIS_CACHE_URL=redis://default:marketplace-dev@127.0.0.1:6379
 export REDIS_QUEUE_URL=redis://default:marketplace-dev@127.0.0.1:6380
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:22918   # куди застосунок шле спани
-export PROMETHEUS_URL=http://127.0.0.1:22901                # demo:metrics перевіряє PromQL дашборда
+export PROMETHEUS_URL=http://127.0.0.1:22901                # demo:metrics: Prometheus скрейпить под, панелі мають дані
 export TRACE_API_URL=http://127.0.0.1:22904                 # demo:trace забирає трейс за trace_id
 export GRAFANA_URL=http://127.0.0.1:22902                   # demo:metrics читає провіжений дашборд
 export GRAFANA_PASSWORD=marketplace-dev                     # дев-дефолт пароля адміна з observability/compose.yml
@@ -4100,13 +4120,15 @@ npm ci
 ```bash
 npm ci && npx tsc --noEmit
 npm run demo:logs      # non-json-lines=0 · layers=4 · distinct-trace-ids=1 · trace-id-matches-header=1 · burst=12 · burst-trace-ids=12 · burst-uneven=0 · secret-req-logged=1 · secret-in-logs=0 · foreign-headers-logged=0
-npm run demo:metrics   # sent-ok=45 · sent-fail=15 · counter-delta=60 · errors-delta=15 · above-top-bucket=0 · series-before=2 · series-after=2
+npm run demo:metrics   # sent-ok=45 · sent-fail=15 · counter-delta=60 · errors-delta=15 · above-top-bucket=0 · series-before=2 · series-after=2 · prometheus-scraped-pod=1 · dashboard-exprs-with-data=5
 npm run demo:trace     # spans=3 · orphan-spans=0 · trace-matches-header=1 · trace-matches-log=1 · span-status-error=1
 ```
 
 `demo:logs` триває ~2 с, `demo:metrics` ~3 с (п'ять повільних запитів по 1,2 с
 паралельно), `demo:trace` ~2 с. Дашборд — `http://127.0.0.1:22902/d/marketplace-red`;
-трейс, id якого друкує `demo:trace`, — Grafana → Explore → Tempo.
+трейс, id якого друкує `demo:trace`, — Grafana → Explore → Tempo. Якщо Prometheus у
+контейнері не дістає `host.docker.internal:22900`, `demo:metrics` за ~20 с падає з
+`prometheus-scraped-pod=0` і друкує `up{job="marketplace-demo"}`.
 
 ## Журнал рішень
 
@@ -4256,10 +4278,11 @@ npm run demo:trace     # spans=3 · orphan-spans=0 · trace-matches-header=1 · 
 | 2026-11-18 | Застосунок у демо — окремим процесом (`src/demo-obs-pod.ts`), stdout читає демо | `non-json-lines` і `secret-in-logs` рахуються по справжньому stdout від старту Nest до виходу, а процес демо без OTel не змішує свої запити в базу з трейсом |
 | 2026-11-18 | 5xx і повільний запит — `X-Fault: error\|slow` лише з `FAULT_INJECTION=1`, справжнім SQL у репозиторії | `throw` у контролері не дав би спана бази зі статусом ERROR і не показав би, ДЕ впав запит. Два замки: без прапорця процесу заголовок нічого не робить |
 | 2026-11-18 | RED-middleware першим у `configureApp`; запис на `close` через `AsyncResource.bind`; клієнт пішов — статус 499 | Нижче за rate-limit і валідатор 429 і 400 не рахувались би. `finish` не настає для обірваних запитів. Колбек події без `bind` виконується в контексті сокета, а не запиту |
-| 2026-11-18 | Бакети 5 мс … 10 с | Звичайні запити маршруту — 10–100 мс навіть під сотнею паралельних, найгірший (повільна база) — 1,24–1,26 с. Верхній `le` з восьмикратним запасом: `above-top-bucket=0` |
+| 2026-11-18 | Бакети 5 мс … 10 с | Звичайні запити маршруту — 10–100 мс навіть під сотнею паралельних, найгірший (повільна база) — 1,24–1,25 с. Верхній `le` з восьмикратним запасом: `above-top-bucket=0` |
 | 2026-11-18 | `/metrics` на порту API | Окремий порт — ще одна змінна, ще один слухач у main і поді. Компроміс записано в «Свідомо не зроблено» розділу Observability |
 | 2026-11-18 | Нові змінні сховища в kind: `OTEL_EXPORTER_OTLP_ENDPOINT` — у `SWITCHABLE`, адреси стенда й `GRAFANA_PASSWORD` — у новому `TOOLING` (`infra/vault.ts`), обгортка `kind` експортує їх порожніми | Критерій 5 ДЗ #28 бере з README кожен рядок зі «сховищем» і чекає, що розгортання без змінної падає з її назвою. Пароль Grafana в Secret API був би зайвим місцем витоку, тому `TOOLING` у под не їде |
 | 2026-11-25 | Лог доступу пише лише заголовки зі списку дозволених (`LOGGED_HEADERS`), а не `req.headers` під `redact` | Ревʼю: `X-Api-Key` і `Proxy-Authorization` йшли в лог відкритими — `redact` ховає лише шляхи, які хтось передбачив. `demo:logs` тепер шле третій маркер у цих заголовках і рахує `foreign-headers-logged` |
+| 2026-11-25 | `demo:metrics` вимагає, щоб Prometheus скрейпив под цього прогону і кожна панель мала ряд маршруту | Ревʼю: з таргетом у down демо давало `dashboard-exprs-valid=5` — Prometheus відповідає `success` і на порожній результат. Значення не перевіряється: новий ряд Prometheus рахує від першої точки, і `rate` законно буває 0 |
 
 ## Запуск
 
