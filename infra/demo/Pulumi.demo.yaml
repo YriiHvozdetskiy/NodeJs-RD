@@ -1,0 +1,8 @@
+config:
+  aws:region: eu-central-1
+  aws:defaultTags:
+    tags:
+      Project: nodejs-pro-hw31
+      Stack: demo
+      ManagedBy: pulumi
+  hw31:withNat: "false"

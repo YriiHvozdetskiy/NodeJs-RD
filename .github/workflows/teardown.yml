@@ -1,0 +1,69 @@
+# Знесення стеку demo (#31): щоночі о 02:00 UTC і на вимогу.
+#
+# Автентифікація — OIDC-роль hw31-ci-teardown зі стеку base. Довгоживучого ключа AWS
+# у конвеєрі немає взагалі: GitHub видає джобі JWT, AWS звіряє його з OIDC-провайдером
+# і віддає креденшели ролі на годину. Роль уміє лише знести demo і порахувати залишки.
+#
+# Порядок: destroy → шість перевірок (вони ж читають stack export). `pulumi stack rm`
+# тут немає навмисно: після нього export уже не існує, і першій перевірці нема що читати.
+# Стан — Pulumi Cloud: file://-бекенд із #28 лежить на ноутбуці, воркер його не бачить.
+name: teardown
+
+on:
+  schedule: [{ cron: '0 2 * * *' }]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # без цього GitHub не видасть джобі OIDC-токен
+  contents: read
+
+concurrency:
+  group: teardown
+  cancel-in-progress: false   # друге знесення поверх першого лише зловило б блокування стеку
+
+jobs:
+  teardown:
+    runs-on: ubuntu-24.04
+    # sub токена = repo:<owner>/<repo>:environment:teardown — під нього звужено trust policy.
+    # Environment дозволяє запуск лише з гілок, перелічених у Settings → Environments.
+    environment: teardown
+    timeout-minutes: 45   # Multi-AZ RDS зноситься до ~10 хв, ALB і NAT — хвилини
+    env:
+      AWS_REGION: eu-central-1   # = aws:region в infra/demo/Pulumi.demo.yaml
+      PULUMI_SKIP_UPDATE_CHECK: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: npm ci (infra/demo)
+        working-directory: infra/demo
+        run: npm ci --no-audit --no-fund
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          # ARN відкритим текстом: у лозі видно, якою роллю зроблено знесення.
+          role-to-assume: arn:aws:iam::832316697084:role/hw31-ci-teardown
+          role-session-name: teardown-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: хто я
+        run: aws sts get-caller-identity --query Arn --output text
+
+      # Без `command` дія лише ставить Pulumi CLI — та сама версія, що в infra/*/package.json.
+      - uses: pulumi/actions@96c7761824268174e0d2a4e8c7d75671eebd24a7 # v7.1.0
+        with:
+          pulumi-version: 3.272.0
+
+      - name: pulumi destroy
+        working-directory: infra/demo
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: pulumi destroy --yes --non-interactive --skip-preview --stack demo
+
+      - name: шість перевірок порожнечі
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: bash scripts/aws-empty.sh
