@@ -15,6 +15,7 @@ import {
   type LogLine,
   type TraceParent,
 } from './observability/demo-kit';
+import { LOGGED_HEADERS } from './observability/logger';
 import { migrateSchema } from './redis/demo-kit';
 
 /**
@@ -25,8 +26,10 @@ import { migrateSchema } from './redis/demo-kit';
  *     → рядків щонайменше з трьох шарів: контролер, сервіс, репозиторій;
  *   BURST паралельних однакових запитів, у кожного свій traceparent
  *     → груп за trace_id стільки ж, скільки запитів, і всі однакового розміру;
- *   запит із `Authorization: Bearer <маркер-1>` і логін із паролем <маркер-2>
- *     → рядки цих запитів у лозі є, маркерів у всьому stdout — нуль.
+ *   запит із `Authorization: Bearer <маркер-1>`, `X-Api-Key` і `Proxy-Authorization`
+ *   з <маркер-3> і логін із паролем <маркер-2>
+ *     → рядки цих запитів у лозі є, маркерів у всьому stdout — нуль;
+ *     → у рядках логу доступу немає жодного заголовка поза LOGGED_HEADERS.
  *
  * Якби «поточний запит» лежав у змінній модуля, паралельні запити
  * перезаписували б його один одному: групи вийшли б різного розміру, а
@@ -37,6 +40,13 @@ const BURST = 12;
 
 /** trace_id рядка або «none» — рядок, що загубив контекст, теж група, і вона видна. */
 const traceOf = (line: LogLine): string => str(line, 'trace_id') ?? 'none';
+
+/** Імена заголовків у `req.headers` рядка логу доступу. */
+function headerNamesOf(line: LogLine): string[] {
+  const req: unknown = line.json?.req;
+  const headers: unknown = typeof req === 'object' && req !== null ? Reflect.get(req, 'headers') : undefined;
+  return typeof headers === 'object' && headers !== null ? Object.keys(headers) : [];
+}
 
 async function main(): Promise<void> {
   const summary = new Summary();
@@ -100,10 +110,19 @@ async function main(): Promise<void> {
     // ── 3. Секрети не течуть ─────────────────────────────────────────────
     const tokenMarker = `tok${randomBytes(12).toString('hex')}`;
     const passwordMarker = `pw${randomBytes(12).toString('hex')}`;
+    // Третій маркер — у заголовках, яких REDACT_PATHS не знає. Їх у лозі немає
+    // не тому, що хтось передбачив їхні імена, а тому, що лог доступу пише
+    // лише заголовки зі списку дозволених.
+    const headerMarker = `hdr${randomBytes(12).toString('hex')}`;
     const withToken = traceparent();
     const withPassword = traceparent();
     const tokenReply = await request(orderUrl, {
-      headers: { authorization: `Bearer ${tokenMarker}`, traceparent: withToken.header },
+      headers: {
+        authorization: `Bearer ${tokenMarker}`,
+        'x-api-key': headerMarker,
+        'proxy-authorization': `Basic ${headerMarker}`,
+        traceparent: withToken.header,
+      },
     });
     const loginReply = await request(`${pod.url}/v1/auth/login`, {
       method: 'POST',
@@ -118,14 +137,21 @@ async function main(): Promise<void> {
     // Увесь stdout застосунку — від першого рядка Nest до виходу.
     const accessIds = new Set(pod.lines.filter(isAccessLine).map(traceOf));
     const secretReqLogged = accessIds.has(withToken.traceId) && accessIds.has(withPassword.traceId) ? 1 : 0;
-    const secretInLogs = pod.lines.filter((line) => line.raw.includes(tokenMarker) || line.raw.includes(passwordMarker)).length;
+    const markers = [tokenMarker, passwordMarker, headerMarker];
+    const secretInLogs = pod.lines.filter((line) => markers.some((marker) => line.raw.includes(marker))).length;
     const nonJson = pod.lines.filter((line) => line.json === null).length;
+    // Не лише маркери: жоден рядок логу доступу не несе заголовка поза списком.
+    const allowed = new Set<string>(LOGGED_HEADERS);
+    const foreignHeaders = new Set(
+      pod.lines.filter(isAccessLine).flatMap((line) => headerNamesOf(line).filter((name) => !allowed.has(name))),
+    );
     const redactedPassword = pod.lines.some((line) => str(line, 'trace_id') === withPassword.traceId && line.raw.includes('"password":"[REDACTED]"'))
       ? 1
       : 0;
 
     summary.line('secret-req-logged', secretReqLogged);
     summary.line('secret-in-logs', secretInLogs);
+    summary.line('foreign-headers-logged', foreignHeaders.size);
     summary.line('password-redacted-in-line', redactedPassword);
     summary.line('stdout-lines', pod.lines.length);
     summary.line('non-json-lines', nonJson);
@@ -138,7 +164,8 @@ async function main(): Promise<void> {
     summary.expect('burst-trace-ids = burst — кожен запит своя група', groups.size === burst.length);
     summary.expect('burst-uneven=0 — групи однакового розміру, рядки не змішались', uneven === 0);
     summary.expect('secret-req-logged=1 — рядки запитів із секретами в лозі є', secretReqLogged === 1);
-    summary.expect('secret-in-logs=0 — маркерів токена й пароля в лозі немає', secretInLogs === 0);
+    summary.expect('secret-in-logs=0 — маркерів токена, пароля й чужих заголовків у лозі немає', secretInLogs === 0);
+    summary.expect(`foreign-headers-logged=0 — лог доступу пише лише ${LOGGED_HEADERS.join(', ')}`, foreignHeaders.size === 0);
     summary.expect('non-json-lines=0 — кожен рядок stdout застосунку — JSON', nonJson === 0);
   } finally {
     await pod?.stop();

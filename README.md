@@ -3430,16 +3430,27 @@ Grafana — у `TOOLING` і в под не їдуть ніколи.
 
 | Шлях | Звідки |
 | --- | --- |
-| `req.headers.authorization`, `req.headers.cookie` | лог доступу пише заголовки запиту |
+| `req.headers.authorization`, `req.headers.cookie` | друга лінія: лог доступу ці заголовки не пише зовсім, шлях спрацює, якщо `{ req }` залогує інший код |
 | `body.password`, `body.refresh_token` | контролер логіну пише `{ body }` спроби входу |
 | `password`, `refresh_token`, `access_token` | ті самі ключі на першому рівні будь-якого обʼєкта |
 
-`body.credentials.password` цей список не сховає. Тому друге правило важливіше за
-перше: тіла запитів у лог доступу не потрапляють зовсім, а єдине тіло в лозі —
-спроба входу з відомою формою `{ email, password }`. У ньому лишається email —
-перебір паролів видно саме за ним. `demo:logs` шле `Authorization: Bearer <маркер>`
-і пароль із другим маркером, знаходить рядки обох запитів і не знаходить маркерів
-у жодному рядку stdout.
+`body.credentials.password` цей список не сховає, а `X-Api-Key` чи
+`Proxy-Authorization` — тим паче: про них список не знає. Тому два інші правила
+важливіші за нього.
+
+- Тіла запитів у лог доступу не потрапляють зовсім. Єдине тіло в лозі — спроба входу
+  з відомою формою `{ email, password }`. У ньому лишається email — перебір паролів
+  видно саме за ним.
+- Заголовки — лише зі списку дозволених (`LOGGED_HEADERS` у
+  `src/observability/logger.ts`): `user-agent`, `accept`, `content-type`,
+  `content-length`, `traceparent`, `x-fault`. Новий заголовок у лозі не зʼявиться,
+  доки його туди не допишуть. `userId`, `tenant` та `idempotencyKey` рядок і так
+  отримує з контексту.
+
+`demo:logs` шле `Authorization: Bearer <маркер>`, `X-Api-Key` і `Proxy-Authorization` з
+третім маркером і пароль із другим. Демо знаходить рядки обох запитів і не знаходить
+маркерів у жодному рядку stdout (`secret-in-logs=0`). Окремо воно рахує імена
+заголовків у рядках логу доступу поза списком дозволених: `foreign-headers-logged=0`.
 
 ### Метрики RED
 
@@ -3571,7 +3582,8 @@ problem+json → спан бази з ERROR → серверний спан з E
   `trace_id`, це `trace_id` із заголовка, шарів чотири, а рядок репозиторію має
   `userId`. Потім 12 однакових запитів паралельно, у кожного свій `traceparent`:
   рядки групуються за `trace_id`, груп 12, у кожній по 4 рядки. «Поточний запит» у
-  змінній модуля дав би групи різного розміру. Наприкінці — маркери токена й пароля.
+  змінній модуля дав би групи різного розміру. Наприкінці — маркери токена, пароля
+  й заголовків `X-Api-Key` та `Proxy-Authorization`.
 - **`demo:metrics`** — прогрів одним 404 → скрейп → сто 404 зі ста різними id →
   скрейп: ряди `2 → 2`. Далі 40 звичайних + 5 повільних + 15 зламаних запитів →
   скрейп: `counter-delta` і `errors-delta` — різниця двох скрейпів, а не лічильник у
@@ -3586,7 +3598,7 @@ problem+json → спан бази з ERROR → серверний спан з E
 
 | Демо | Прогін 1 | Прогін 2 | Прогін 3 |
 | --- | --- | --- | --- |
-| `demo:logs` | non-json-lines=0 · layers=4 · distinct-trace-ids=1 · trace-id-matches-header=1 · burst=12 · burst-trace-ids=12 · burst-uneven=0 · secret-req-logged=1 · secret-in-logs=0 | те саме | те саме |
+| `demo:logs` | non-json-lines=0 · layers=4 · distinct-trace-ids=1 · trace-id-matches-header=1 · burst=12 · burst-trace-ids=12 · burst-uneven=0 · secret-req-logged=1 · secret-in-logs=0 · foreign-headers-logged=0 | те саме | те саме |
 | `demo:metrics` | sent-ok=45 · sent-fail=15 · counter-delta=60 · errors-delta=15 · above-top-bucket=0 · series-before=2 · series-after=2 · slowest-ms=1249 | те саме, slowest-ms=1260 | те саме, slowest-ms=1244 |
 | `demo:trace` | spans=3 · orphan-spans=0 · trace-matches-header=1 · trace-matches-log=1 · span-status-error=1 | те саме | те саме |
 
@@ -4087,7 +4099,7 @@ npm ci
 
 ```bash
 npm ci && npx tsc --noEmit
-npm run demo:logs      # non-json-lines=0 · layers=4 · distinct-trace-ids=1 · trace-id-matches-header=1 · burst=12 · burst-trace-ids=12 · burst-uneven=0 · secret-req-logged=1 · secret-in-logs=0
+npm run demo:logs      # non-json-lines=0 · layers=4 · distinct-trace-ids=1 · trace-id-matches-header=1 · burst=12 · burst-trace-ids=12 · burst-uneven=0 · secret-req-logged=1 · secret-in-logs=0 · foreign-headers-logged=0
 npm run demo:metrics   # sent-ok=45 · sent-fail=15 · counter-delta=60 · errors-delta=15 · above-top-bucket=0 · series-before=2 · series-after=2
 npm run demo:trace     # spans=3 · orphan-spans=0 · trace-matches-header=1 · trace-matches-log=1 · span-status-error=1
 ```
@@ -4247,6 +4259,7 @@ npm run demo:trace     # spans=3 · orphan-spans=0 · trace-matches-header=1 · 
 | 2026-11-18 | Бакети 5 мс … 10 с | Звичайні запити маршруту — 10–100 мс навіть під сотнею паралельних, найгірший (повільна база) — 1,24–1,26 с. Верхній `le` з восьмикратним запасом: `above-top-bucket=0` |
 | 2026-11-18 | `/metrics` на порту API | Окремий порт — ще одна змінна, ще один слухач у main і поді. Компроміс записано в «Свідомо не зроблено» розділу Observability |
 | 2026-11-18 | Нові змінні сховища в kind: `OTEL_EXPORTER_OTLP_ENDPOINT` — у `SWITCHABLE`, адреси стенда й `GRAFANA_PASSWORD` — у новому `TOOLING` (`infra/vault.ts`), обгортка `kind` експортує їх порожніми | Критерій 5 ДЗ #28 бере з README кожен рядок зі «сховищем» і чекає, що розгортання без змінної падає з її назвою. Пароль Grafana в Secret API був би зайвим місцем витоку, тому `TOOLING` у под не їде |
+| 2026-11-25 | Лог доступу пише лише заголовки зі списку дозволених (`LOGGED_HEADERS`), а не `req.headers` під `redact` | Ревʼю: `X-Api-Key` і `Proxy-Authorization` йшли в лог відкритими — `redact` ховає лише шляхи, які хтось передбачив. `demo:logs` тепер шле третій маркер у цих заголовках і рахує `foreign-headers-logged` |
 
 ## Запуск
 

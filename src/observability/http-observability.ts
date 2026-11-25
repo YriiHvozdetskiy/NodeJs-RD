@@ -1,7 +1,7 @@
 import { AsyncResource } from 'node:async_hooks';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { parseFault } from './fault';
-import { loggerFor } from './logger';
+import { loggedHeaders, loggerFor } from './logger';
 import { httpDuration, httpRequests, metricsRegistry } from './metrics';
 import { runInRequestContext, type RequestContext } from './request-context';
 import { isOperationalPath, routeOf } from './route';
@@ -61,11 +61,12 @@ export function observeHttp(options: { faultInjection: boolean }): RequestHandle
           httpRequests.inc(labels);
           httpDuration.observe(labels, seconds);
 
-          // Заголовки — так, тіла — ні: тіло може нести пароль, refresh-токен,
-          // адресу доставки, і redact сховав би лише описані шляхи.
+          // Тіло — ні, заголовки — лише дозволені: тіло може нести пароль,
+          // refresh-токен, адресу доставки, заголовок — будь-який ключ API, а
+          // redact сховав би лише описані шляхи (src/observability/logger.ts).
           log.info(
             {
-              req: { method: req.method, url: req.originalUrl, headers: req.headers },
+              req: { method: req.method, url: req.originalUrl, headers: loggedHeaders(req.headers) },
               res: { statusCode: res.statusCode },
               route,
               duration_ms: Math.round(seconds * 1e4) / 10,
