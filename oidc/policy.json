@@ -1,0 +1,9 @@
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audience": "marketplace-deploy-gate",
+  "algorithms": ["RS256"],
+  "subjects": [
+    "repo:YriiHvozdetskiy@74105832/NodeJs-RD@1324383584:environment:staging",
+    "repo:YriiHvozdetskiy@74105832/NodeJs-RD@1324383584:environment:prod"
+  ]
+}
