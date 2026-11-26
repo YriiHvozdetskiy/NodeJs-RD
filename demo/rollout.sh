@@ -16,7 +16,9 @@
 #   4. навантаження триває, доки не зникнуть старі поди (дренаж), і щонайменше
 #      LOAD_MIN_SECONDS — щоб вимір не був порожнім;
 #   5. requests / ok / failed рахуються з файла. failed — усе, що не 200.
-# Скрипт завершується з кодом 0, лише якщо failed=0 і requests ≥ 5000.
+# Скрипт завершується з кодом 0, лише якщо failed=0 і requests ≥ ROLLOUT_MIN_REQUESTS
+# (5000; конвеєр #32 ставить 2000 — раннер слабший, і на ньому ж живе кластер).
+# failed=0 від порогу не залежить.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -28,7 +30,7 @@ PROFILE="${PROFILE:-good}"
 URL="${LOAD_URL:-http://127.0.0.1:22880/v1/products?limit=1}"
 RPS="${LOAD_RPS:-200}"
 MIN_SECONDS="${LOAD_MIN_SECONDS:-45}"
-MIN_REQUESTS=5000
+MIN_REQUESTS="${ROLLOUT_MIN_REQUESTS:-5000}"
 
 kc() { kubectl --context "${CTX}" -n "${NS}" "$@"; }
 now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }

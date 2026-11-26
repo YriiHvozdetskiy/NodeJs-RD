@@ -33,7 +33,7 @@ async function deliverOrderWebhook(data: OrderWebhookData): Promise<{ status: nu
     });
   } catch (err) {
     // Мережа чи таймаут — тимчасове, повторюємо.
-    throw new Error(`вебхук ${data.url}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`вебхук ${data.url}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
   }
   await res.body?.cancel();
   if (res.ok) return { status: res.status };

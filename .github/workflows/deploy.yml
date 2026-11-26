@@ -1,0 +1,118 @@
+# Деплой у prod (#32): після злиття PR у main або вручну — без жодної збірки.
+#
+#   resolve ── prod     digest із прогону PR → OIDC-гейт → kind → pulumi up → перевірка
+#
+# Build once, promote by digest: образ зібрала джоба build у ci.yml на PR, на
+# ньому пройшли гейти й demo:rollout. Тут цей digest лише знаходять
+# (scripts/ci/resolve-digest.sh) і передають у prod через outputs джоби resolve.
+# Тег не використовується ніде: його можна перевісити, digest — ні.
+#
+# prod, як і staging, — kind у раннері: кластера поза GitHub у проєкту немає.
+# Різниця між середовищами — у sub токена (environment:prod), стеку Pulumi і в
+# правилах Environment `prod` у налаштуваннях репо (README, розділ CI/CD).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: номер злитого PR, чий перевірений digest просуваємо в prod
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+# Деплої в prod — строго по черзі; скасувати напівзроблений up гірше, ніж дочекатись.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    name: resolve · digest, який перевірив PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read        # прогони й артефакти ci.yml
+      pull-requests: read  # який PR приніс коміт у main
+    outputs:
+      digest: ${{ steps.find.outputs.digest }}
+      image-repo: ${{ steps.find.outputs.image-repo }}
+      pr: ${{ steps.find.outputs.pr }}
+      source-run: ${{ steps.find.outputs.source-run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          PR: ${{ inputs.pr }}
+        run: bash scripts/ci/resolve-digest.sh
+
+  prod:
+    name: prod · OIDC gate → kind → up (digest з PR)
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # sub токена — repo:<owner>/<repo>:environment:prod; reviewers і гілки
+    # для цього Environment налаштовуються в Settings → Environments.
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PULUMI_STACK: prod
+      DEPLOY_IMAGE: ${{ needs.resolve.outputs.image-repo }}@${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: тека evidence
+        run: |
+          mkdir -p "${RUNNER_TEMP}/evidence"
+          echo "EVIDENCE=${RUNNER_TEMP}/evidence" >> "$GITHUB_ENV"
+      - name: OIDC-гейт — підпис по jwks_uri GitHub + умова oidc/policy.json
+        run: |
+          trap 'rm -f "${RUNNER_TEMP}/oidc.jwt"' EXIT
+          node scripts/oidc-token.mjs --policy oidc/policy.json --out "${RUNNER_TEMP}/oidc.jwt"
+          node scripts/oidc-gate.mjs --policy oidc/policy.json --token-file "${RUNNER_TEMP}/oidc.jwt" \
+            | tee "${EVIDENCE}/oidc.txt"
+      - run: npm ci --no-audit --no-fund
+      - uses: ./.github/actions/kind-stage
+        with:
+          image: ${{ env.DEPLOY_IMAGE }}
+          rev: ${{ github.sha }}
+      - name: pulumi up (стек prod)
+        run: npm run up
+      - name: у кластері — рівно той digest, що перевірив PR
+        env:
+          PROMOTED: ${{ needs.resolve.outputs.digest }}
+        run: |
+          kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "${EVIDENCE}/deployment.json"
+          kubectl --context kind-marketplace -n marketplace rollout status deploy/marketplace-api --timeout=300s
+          deployed="$(node -e 'const d=require(process.argv[1]);process.stdout.write(d.spec.template.spec.containers.find((c)=>c.name==="api").image.split("@")[1]??"")' "${EVIDENCE}/deployment.json")"
+          echo "promoted-digest=${PROMOTED}" | tee -a "${EVIDENCE}/prod.txt"
+          echo "deployed-digest=${deployed}" | tee -a "${EVIDENCE}/prod.txt"
+          [ "${deployed}" = "${PROMOTED}" ]
+      - name: smoke — API відповідає через NodePort
+        run: curl -sf --retry 30 --retry-all-errors --retry-delay 2 --max-time 5 -o /dev/null -w 'smoke-http=%{http_code}\n' 'http://127.0.0.1:22880/v1/products?limit=1'
+      - name: значення секретів у маніфесті
+        run: |
+          bash scripts/with-secrets.sh kind node scripts/ci/secret-count.mjs "manifest=${EVIDENCE}/deployment.json" \
+            | tee -a "${EVIDENCE}/prod.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: prod-evidence
+          path: ${{ env.EVIDENCE }}/

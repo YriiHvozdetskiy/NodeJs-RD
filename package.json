@@ -13,6 +13,8 @@
     "start:vault": "bash scripts/with-secrets.sh dev npm run start",
     "start:dev": "ts-node -P tsconfig.json src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint src test",
+    "arch": "depcruise --config .dependency-cruiser.cjs src",
     "lint:spec": "redocly lint openapi/openapi.yaml",
     "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
     "check:scope": "redocly bundle openapi/openapi.yaml -o spec.json && node scripts/check-scope.js",
@@ -88,7 +90,10 @@
     "aws:empty": "bash scripts/with-secrets.sh aws bash scripts/aws-empty.sh",
     "demo:failover": "bash scripts/with-secrets.sh aws node demo/failover.mjs",
     "demo:alb": "bash scripts/with-secrets.sh aws node demo/alb.mjs",
-    "demo:nat": "bash scripts/with-secrets.sh aws node demo/nat.mjs"
+    "demo:nat": "bash scripts/with-secrets.sh aws node demo/nat.mjs",
+    "demo:gates": "node scripts/demo-gates.mjs",
+    "demo:oidc": "node scripts/demo-oidc.mjs",
+    "gate:cost": "tsc -p tsconfig.json && node dist/gate-cost.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1161.0",
@@ -122,6 +127,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@nestjs/testing": "11.2.1",
     "@pact-foundation/pact": "17.1.4",
     "@redocly/cli": "2.46.0",
@@ -131,11 +137,14 @@
     "@types/node": "22.20.1",
     "@types/pg": "8.23.1",
     "@types/supertest": "7.2.1",
+    "dependency-cruiser": "18.8.0",
     "dotenv": "17.4.2",
+    "eslint": "10.15.0",
     "jest": "30.5.2",
     "socket.io-client": "4.8.3",
     "supertest": "7.2.2",
     "ts-node": "10.9.2",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.73.0"
   }
 }

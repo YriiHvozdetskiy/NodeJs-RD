@@ -57,7 +57,7 @@ export function encodeCursor(position: CursorPosition): string {
  * bigint там стали б помилкою Postgres, а не помилкою клієнта.
  */
 export function decodeCursor(raw: string): CursorPosition {
-  let parsed: unknown = null;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'));
   } catch {

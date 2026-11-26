@@ -52,7 +52,7 @@ export async function call(
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
   const text = await res.text();
-  let json: unknown = null;
+  let json: unknown;
   try {
     json = text ? JSON.parse(text) : null;
   } catch {
