@@ -279,8 +279,12 @@ jobs:
           image: ${{ env.DEPLOY_IMAGE }}
           rev: ${{ env.HEAD_SHA }}
 
-      - name: pulumi preview голови PR → plan.json
-        run: bash scripts/with-secrets.sh kind bash scripts/infra.sh plan > "${EVIDENCE}/plan.json"
+      # preview --json друкує `data` K8s Secret відкритим base64 (pulumi.secret це не
+      # ховає) — тож сирий план на диск не пишеться: фільтр стоїть у тому самому конвеєрі.
+      - name: pulumi preview голови PR → plan.json (значення Secret → [secret])
+        run: |
+          bash scripts/with-secrets.sh kind bash scripts/infra.sh plan \
+            | node scripts/ci/redact-plan.mjs > "${EVIDENCE}/plan.json"
       - name: pulumi preview бази PR → base-plan.json
         run: bash scripts/with-secrets.sh kind bash scripts/ci/base-plan.sh "${BASE_SHA}" "${RUNNER_TEMP}/base-plan.json"
 
