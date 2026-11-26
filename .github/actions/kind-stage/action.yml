@@ -1,0 +1,60 @@
+# Спільні кроки середовища в раннері (#32): kind + Pulumi CLI + сховище прогону +
+# конфіг стеку з образом за digest. Викликають ci.yml (staging, на PR) і
+# deploy.yml (prod, після злиття) — тому однаково налаштовані обидва середовища.
+#
+# Стек вибирає змінна PULUMI_STACK джоби (staging | prod); бекенд стану —
+# файловий у робочій теці раннера (scripts/with-secrets.sh kind), як на #28:
+# конвеєр не логіниться в акаунт Pulumi.
+name: kind-stage
+description: kind у раннері, сховище прогону і стек Pulumi з образом за digest
+
+inputs:
+  image:
+    description: образ ЗА DIGEST — ghcr.io/…@sha256:…; тег сюди не приймається
+    required: true
+  rev:
+    description: ревізія pod-шаблону (REV у поді) — з неї починається стек
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: образ за digest — і він справді є в реєстрі
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        # Тег рухомий, digest — ні. Деплой за тегом поставив би те, на що тег
+        # вказує ЗАРАЗ, а не те, що перевірили гейти.
+        [[ "${IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::образ не за digest: ${IMAGE}"; exit 1; }
+        docker buildx imagetools inspect "${IMAGE}" --format '{{.Manifest.Digest}}'
+
+    - name: kind v0.32.0 (sha256 звірено, та сама версія, що в docker/tools.Dockerfile)
+      shell: bash
+      run: |
+        curl -fsSL -o "${RUNNER_TEMP}/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.32.0/kind-linux-amd64
+        echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  ${RUNNER_TEMP}/kind" | sha256sum -c -
+        sudo install -m 0755 "${RUNNER_TEMP}/kind" /usr/local/bin/kind
+        kind version
+
+    # Без `command` дія лише ставить CLI — ту саму версію, що в infra/package.json.
+    - uses: pulumi/actions@96c7761824268174e0d2a4e8c7d75671eebd24a7 # v7.1.0
+      with:
+        pulumi-version: 3.272.0
+
+    - name: сховище прогону (значення генеруються тут і живуть до кінця джоби)
+      shell: bash
+      run: bash scripts/ci/vault.sh
+
+    - name: кластер kind — образ вузол тягне з реєстру сам
+      shell: bash
+      run: IMAGE_FROM_REGISTRY=1 npm run cluster:up
+
+    - name: стек Pulumi — образ за digest, ревізія pod-шаблону
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        REV: ${{ inputs.rev }}
+      run: |
+        bash scripts/with-secrets.sh kind bash scripts/infra.sh config image "${IMAGE}"
+        bash scripts/with-secrets.sh kind bash scripts/infra.sh config rev "${REV}"

@@ -13,8 +13,9 @@ on:
   schedule: [{ cron: '0 2 * * *' }]
   workflow_dispatch: {}
 
+# На рівні файла — лише читання коду. Право просити OIDC-токен має одна джоба
+# нижче, а не кожна, яку колись сюди допишуть (#32).
 permissions:
-  id-token: write   # без цього GitHub не видасть джобі OIDC-токен
   contents: read
 
 concurrency:
@@ -27,6 +28,9 @@ jobs:
     # sub токена = repo:<owner>/<repo>:environment:teardown — під нього звужено trust policy.
     # Environment дозволяє запуск лише з гілок, перелічених у Settings → Environments.
     environment: teardown
+    permissions:
+      contents: read
+      id-token: write   # без цього GitHub не видасть джобі OIDC-токен
     timeout-minutes: 45   # Multi-AZ RDS зноситься до ~10 хв, ALB і NAT — хвилини
     env:
       AWS_REGION: eu-central-1   # = aws:region в infra/demo/Pulumi.demo.yaml

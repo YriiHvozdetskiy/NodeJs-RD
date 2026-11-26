@@ -1,100 +1,362 @@
-# Драбинка довіри з ДЗ #16 у CI: integration і E2E проти Postgres у
-# testcontainers, далі контракт через Pact Broker із can-i-deploy як гейтом.
-# На лекції 32 ця ж джоба contract стане обовʼязковою перед деплоєм.
+# Конвеєр PR (#32): кожна джоба тут має право сказати «ні», і PR не зливається,
+# доки хоч одна червона. Порядок:
+#
+#   quality ──┐                       типи+лінт · контракт (oasdiff) · архітектура
+#   tests ────┤                       integration + e2e (#16)
+#   contract ─┤                       Pact + can-i-deploy (#16)
+#   build ────┼── scan ──┐            образ ОДИН раз → GHCR, digest в outputs · Trivy з порогом
+#             └──────────┴── staging  OIDC-гейт → kind → preview + гейт вартості → up → demo:rollout
+#                              └──── evidence (завжди)   артефакт pipeline-evidence
+#
+# Деплою в prod тут немає: він у deploy.yml, після злиття, і бере digest, який
+# зібрав і перевірив цей прогін. На pull_request біжить лише цей воркфлоу —
+# інакше «успішний прогін на голові PR» міг би виявитись чужим.
+#
+# Усі `uses:` запінено за SHA коміту, тег — у коментарі (звірено через GitHub
+# API 2026-11-26). Секретів хмари немає ніде: реєстр — GITHUB_TOKEN з
+# packages: write у джобі build, ID-токен — лише в джобі staging.
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    # labeled/unlabeled — щоб лейбл обходу гейта вартості перезапускав перевірку.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
+# За замовчуванням — лише читати код. Кожна джоба, якій треба більше, просить
+# своє сама; id-token: write тут, на рівні файла, роздав би право видавати
+# токени від імені репо всім джобам, включно з тими, що виконують код із PR.
 permissions:
   contents: read
 
-jobs:
-  # ДЗ #28: production-образ і сканування з порогом. Вердикт рахує сам
-  # scripts/scan.sh із JSON-звіту Trivy; поріг — ratchet «не гірше, ніж зараз»
-  # (README, розділ Kubernetes). Джоба червона, щойно знахідок CRITICAL+HIGH
-  # стало більше за SCAN_MAX.
-  image-scan:
-    name: image + scan gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      # Приватного реєстру немає — секрет етапу збірки тут приманка. Значення
-      # унікальне на прогін і в образ не потрапляє (перевіряє demo:image).
-      - name: секрет етапу збірки
-        run: printf 'ci-decoy-%s' "${{ github.run_id }}" > .npm_token
-      - run: npm run image:build
-      - run: npm run demo:image
-      - name: scan gate
-        run: SCAN_MAX=12 npm run scan
+# Два прогони одного PR не деплоять в один кластер одночасно: новий скасовує старий.
+concurrency:
+  group: ci-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
-  tests:
-    name: integration + e2e
-    runs-on: ubuntu-latest
+env:
+  # Той самий рядок, що в README: `cost-gate-bypass-label: cost-approved`.
+  COST_BYPASS_LABEL: cost-approved
+
+# Явний bash = `bash -eo pipefail`. Без нього раннер бере `bash -e` БЕЗ pipefail,
+# і `гейт | tee файл` повертав би код tee (0) — гейт казав би «ні», а крок зелений.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    name: gates · types, contract, architecture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Контракт порівнюється зі спекою КОМІТУ БАЗИ PR — потрібна історія.
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - run: npx tsc --noEmit
-      # Двічі поспіль — та сама перевірка ізоляції, що в acceptance criteria:
-      # другий прогін не має залежати від того, що лишив перший.
+      - run: npm ci --no-audit --no-fund
+
+      - name: сходинка 1 — типи й стиль (tsc --noEmit + eslint)
+        run: bash scripts/gates/types.sh
+
+      - name: сходинка 2 — контракт (oasdiff проти спеки бази PR)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git show "${BASE_SHA}:openapi/openapi.yaml" > "${RUNNER_TEMP}/base-openapi.yaml"
+          bash scripts/gates/contract.sh "${RUNNER_TEMP}/base-openapi.yaml" openapi/openapi.yaml
+
+      - name: сходинка 3 — архітектура (dependency-cruiser)
+        run: bash scripts/gates/arch.sh
+
+  tests:
+    name: integration + e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      # Двічі поспіль — перевірка ізоляції з #16: другий прогін не має залежати
+      # від того, що лишив перший.
       - run: npm run test:integration && npm run test:integration
       - run: npm run test:e2e
 
   contract:
     name: contract (Pact)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     env:
-      # Адреса й токен брокера — лише з secrets. Код читає process.env і більше нічого.
+      # Адреса й токен спільного брокера — лише з secrets; не задано — брокер
+      # піднімається в раннері (крок нижче).
       PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
       PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
-      # Версія обох сторін — коміт: один і той самий код не отримає двох версій,
-      # а різний — однієї.
-      PACT_CONSUMER_VERSION: ${{ github.sha }}
-      PACT_PROVIDER_VERSION: ${{ github.sha }}
-      PACT_BRANCH: ${{ github.head_ref || github.ref_name }}
+      PACT_CONSUMER_VERSION: ${{ github.event.pull_request.head.sha }}
+      PACT_PROVIDER_VERSION: ${{ github.event.pull_request.head.sha }}
+      PACT_BRANCH: ${{ github.head_ref }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-
-      # Без secrets.PACT_BROKER_URL (форк, репозиторій без спільного брокера)
-      # джоба піднімає брокер із docker-compose.yml у самому раннері.
+      - run: npm ci --no-audit --no-fund
       - name: Pact Broker у раннері (якщо secrets.PACT_BROKER_URL не задано)
         if: env.PACT_BROKER_URL == ''
         run: |
           docker compose up -d --wait pact-broker
           echo "PACT_BROKER_URL=http://127.0.0.1:9292" >> "$GITHUB_ENV"
           echo "PACT_BROKER_EPHEMERAL=1" >> "$GITHUB_ENV"
-
       - name: consumer-тест → pacts/*.json
         run: npm run test:contract
-
       - name: publish контракту в брокер
         run: bash scripts/pact-broker.sh publish
-
-      - name: provider verification (publishVerificationResult)
+      - name: provider verification
         run: npm run verify:provider
-
-      # Тег prod означає «ця версія провайдера зараз у проді». Зі спільним
-      # брокером його ставить лише main — у проді опиняється тільки main. У
-      # брокері раннера історії деплоїв немає, тож там prod — версія, яку щойно
-      # перевірили. На лекції 32 тег замінить record-deployment після деплою.
-      - name: тег prod на версію провайдера
-        if: env.PACT_BROKER_EPHEMERAL == '1' || github.ref == 'refs/heads/main'
+      # У брокері раннера історії деплоїв немає: prod там — версія, яку щойно перевірили.
+      - name: тег prod на версію провайдера (лише брокер раннера)
+        if: env.PACT_BROKER_EPHEMERAL == '1'
         run: bash scripts/pact-broker.sh tag-prod
-
-      # Гейт: валить джобу, якщо брокер не відповів "deployable": true.
       - name: can-i-deploy marketplace-web → prod
         run: bash scripts/pact-broker.sh can-i-deploy
+
+  build:
+    name: build once · push to GHCR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write # пуш у GHCR цим самим GITHUB_TOKEN — жодного ключа реєстру
+    outputs:
+      # Digest — з output кроку збірки, не з тега і не з `docker inspect` після.
+      digest: ${{ steps.build.outputs.digest }}
+      image-repo: ${{ steps.repo.outputs.image }}
+      # Тег цього прогону: :<github.sha> перепише будь-який наступний прогін того
+      # самого коміту (лейбл, перезапуск), а цей — ніхто.
+      image-ref: ${{ steps.repo.outputs.image }}:run-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: repo
+        # GHCR приймає лише малі літери, а owner/repo — у мішаному регістрі.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/marketplace-api" >> "$GITHUB_OUTPUT"
+      - name: build.log — рядок на кожен виклик збірки в цьому прогоні
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/evidence"
+          echo "build run=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} head=${HEAD_SHA} job=${GITHUB_JOB}" >> "${RUNNER_TEMP}/evidence/build.log"
+      # Приватного реєстру npm немає — секрет етапу збірки з #28 тут приманка.
+      # Значення унікальне на прогін і в образ не потрапляє (BuildKit secret).
+      - name: секрет етапу збірки
+        run: printf 'ci-decoy-%s-%s' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" > .npm_token
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Єдине місце збірки в усьому .github/workflows. Теги — для людини: github.sha
+      # (на pull_request це merge-коміт) і незмінний тег прогону; деплоїться digest.
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.repo.outputs.image }}:${{ github.sha }}
+            ${{ steps.repo.outputs.image }}:run-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
+          # Один маніфест без attestation-індексу: digest із output і digest, який
+          # покаже реєстр за тегом, — той самий рядок.
+          provenance: false
+          sbom: false
+          secret-files: npm_token=.npm_token
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "built-digest=${DIGEST}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-build
+          path: ${{ runner.temp }}/evidence/
+
+  scan:
+    name: gate · image scan (Trivy, SCAN_MAX)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Скануємо рівно той digest, що поїде далі, а не «образ з таким тегом».
+      - name: образ за digest
+        env:
+          IMAGE: ${{ needs.build.outputs.image-repo }}@${{ needs.build.outputs.digest }}
+        run: |
+          docker pull "${IMAGE}"
+          docker tag "${IMAGE}" marketplace-api:ci
+      - name: сходинка 4 — сканер із порогом (npm run scan, поріг з #28)
+        run: |
+          mkdir -p "${RUNNER_TEMP}/evidence"
+          set +e
+          IMAGE=marketplace-api:ci npm run scan
+          code=$?
+          set -e
+          echo "gate-scan-exit=${code}" > "${RUNNER_TEMP}/evidence/scan.txt"
+          exit "${code}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-scan
+          path: ${{ runner.temp }}/evidence/
+
+  staging:
+    name: staging · OIDC gate → kind → cost gate → up → demo:rollout
+    # pulumi up — лише після зелених гейтів: якість, тести, контракт, скан.
+    needs: [quality, tests, contract, build, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Environment задає sub ID-токена: repo:<owner>/<repo>:environment:staging —
+    # саме він стоїть в oidc/policy.json.
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write # єдина джоба PR, якій GitHub видасть ID-токен
+    env:
+      PULUMI_STACK: staging
+      DEPLOY_IMAGE: ${{ needs.build.outputs.image-repo }}@${{ needs.build.outputs.digest }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # план бази PR рахується з її коміту (git worktree)
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: тека evidence
+        run: |
+          mkdir -p "${RUNNER_TEMP}/evidence"
+          echo "EVIDENCE=${RUNNER_TEMP}/evidence" >> "$GITHUB_ENV"
+
+      # Першим кроком — до будь-якого коду з PR, що торкається кластера.
+      # Токен — у файл 0600 у тимчасовій теці раннера; у лог іде лише те, що
+      # гейт прочитав із ПЕРЕВІРЕНОГО токена: iss, aud, sub.
+      - name: OIDC-гейт — підпис по jwks_uri GitHub + умова oidc/policy.json
+        run: |
+          trap 'rm -f "${RUNNER_TEMP}/oidc.jwt"' EXIT
+          node scripts/oidc-token.mjs --policy oidc/policy.json --out "${RUNNER_TEMP}/oidc.jwt"
+          node scripts/oidc-gate.mjs --policy oidc/policy.json --token-file "${RUNNER_TEMP}/oidc.jwt" \
+            | tee "${EVIDENCE}/oidc.txt"
+
+      - run: npm ci --no-audit --no-fund
+
+      - uses: ./.github/actions/kind-stage
+        with:
+          image: ${{ env.DEPLOY_IMAGE }}
+          rev: ${{ env.HEAD_SHA }}
+
+      - name: pulumi preview голови PR → plan.json
+        run: bash scripts/with-secrets.sh kind bash scripts/infra.sh plan > "${EVIDENCE}/plan.json"
+      - name: pulumi preview бази PR → base-plan.json
+        run: bash scripts/with-secrets.sh kind bash scripts/ci/base-plan.sh "${BASE_SHA}" "${RUNNER_TEMP}/base-plan.json"
+
+      # Гейт порівнює ЗМІНУ: бюджет = вартість бази + max($10, 20 %). Обійти
+      # можна лише іменним лейблом PR, і обхід видно в лозі й в evidence.
+      # gate=error (план не прочитався) не обходиться нічим.
+      - name: гейт вартості (src/mapping.ts)
+        env:
+          PLAN_JSON: ${{ env.EVIDENCE }}/plan.json
+          COST_BASE_PLAN_JSON: ${{ runner.temp }}/base-plan.json
+          BYPASS: ${{ contains(github.event.pull_request.labels.*.name, env.COST_BYPASS_LABEL) }}
+        run: |
+          set +e
+          npm run -s gate:cost | tee "${EVIDENCE}/cost.txt"
+          code="${PIPESTATUS[0]}"
+          set -e
+          if [ "${code}" -eq 1 ] && [ "${BYPASS}" = "true" ]; then
+            echo "bypass=${COST_BYPASS_LABEL}" | tee -a "${EVIDENCE}/cost.txt"
+            echo "::warning title=cost gate::бюджет перевищено — PR пропущено лейблом ${COST_BYPASS_LABEL}"
+            exit 0
+          fi
+          exit "${code}"
+
+      - name: pulumi up (стек staging, образ за digest)
+        run: npm run up
+
+      - name: маніфест, що прийняв кластер → deployment.json
+        run: kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "${EVIDENCE}/deployment.json"
+
+      # Значення знає лише раннер — тож і рахує він. Більше нуля → червоно.
+      - name: значення секретів у маніфесті й плані
+        run: |
+          bash scripts/with-secrets.sh kind node scripts/ci/secret-count.mjs \
+            "manifest=${EVIDENCE}/deployment.json" "plan=${EVIDENCE}/plan.json" | tee "${EVIDENCE}/secret-count.txt"
+
+      # Той самий скрипт, що на #28: нова ревізія pod-шаблону під навантаженням,
+      # код КОЖНОЇ відповіді — у файл. failed≠0 або менше 2000 запитів → exit 1.
+      - name: demo:rollout — умова злиття
+        env:
+          ROLLOUT_MIN_REQUESTS: '2000'
+        run: npm run demo:rollout 2>&1 | tee "${EVIDENCE}/rollout.txt"
+
+      - name: стан кластера після падіння (діагностика, не гейт)
+        if: failure()
+        run: kubectl --context kind-marketplace -n marketplace get pods,deploy,jobs,events -o wide || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-staging
+          path: ${{ env.EVIDENCE }}/
+
+  evidence:
+    name: pipeline-evidence
+    # always(): артефакт потрібен саме на червоному прогоні — щоб було видно, де «ні».
+    if: always()
+    needs: [quality, tests, contract, build, scan, staging]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: evidence-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/parts
+      - name: evidence.txt
+        env:
+          RUN_ID: ${{ github.run_id }}
+          # На pull_request github.sha — merge-коміт; голова гілки PR — тут.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IMAGE_REF: ${{ needs.build.outputs.image-ref }}
+          BUILT_DIGEST: ${{ needs.build.outputs.digest }}
+        run: bash scripts/ci/evidence.sh "${RUNNER_TEMP}/parts" "${RUNNER_TEMP}/pipeline-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: pipeline-evidence
+          path: ${{ runner.temp }}/pipeline-evidence/

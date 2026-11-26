@@ -15,7 +15,13 @@ IMAGE="${IMAGE:-marketplace-api:hw28}"
 source scripts/lib/tools.sh
 KIND="$(tool_path kind)"
 command -v kubectl >/dev/null || { echo "cluster:up: немає kubectl (є в Docker Desktop)" >&2; exit 1; }
-docker image inspect "${IMAGE}" >/dev/null 2>&1 || { echo "cluster:up: немає образу ${IMAGE} — спершу npm run image:build" >&2; exit 1; }
+# IMAGE_FROM_REGISTRY=1 (конвеєр #32): образу на хості немає і не треба — Deployment
+# посилається на ghcr.io/…@sha256:…, і вузол kind тягне рівно цей digest із
+# реєстру сам. Саме ці байти збирала джоба build і сканувала джоба scan.
+FROM_REGISTRY="${IMAGE_FROM_REGISTRY:-0}"
+if [ "${FROM_REGISTRY}" != "1" ]; then
+  docker image inspect "${IMAGE}" >/dev/null 2>&1 || { echo "cluster:up: немає образу ${IMAGE} — спершу npm run image:build" >&2; exit 1; }
+fi
 
 # Пул адрес Docker: близько 31-ї bridge-мережі `kind create` падає з
 # «all predefined address pools have been fully subnetted» — і виглядає це як
@@ -36,7 +42,7 @@ else
 fi
 
 kubectl --context "kind-${CLUSTER}" wait --for=condition=Ready node --all --timeout=120s
-"${KIND}" load docker-image "${IMAGE}" --name "${CLUSTER}"
+[ "${FROM_REGISTRY}" = "1" ] || "${KIND}" load docker-image "${IMAGE}" --name "${CLUSTER}"
 
 # Kubeconfig для Pulumi, що працює в контейнері: API за іменем вузла в мережі kind.
 mkdir -p .kind

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Pulumi-програма infra/ (#28): up | destroy | preview | config <ключ> <значення>.
+# Pulumi-програма infra/ (#28): up | destroy | preview | plan | config <ключ> <значення>.
+#
+# plan (#32) — `pulumi preview --json` у stdout: вхід гейта вартості (npm run gate:cost).
+# Тому все інше, що скрипт друкує по дорозі (npm ci), іде в stderr — інакше
+# у JSON-файл плану потрапили б рядки npm.
+# INFRA_DIR (#32) — інша копія програми, напр. база PR у git worktree: конвеєр
+# рахує її план тим самим скриптом, щоб гейт порівнював зміну, а не суму.
 #
 # Секрети сюди приходять від обгортки сховища, а не з файлів:
 #   npm run up       = bash scripts/with-secrets.sh kind bash scripts/infra.sh up
@@ -23,8 +29,8 @@ export PULUMI_BACKEND_URL="${PULUMI_BACKEND_URL:-file://${ROOT}/.pulumi}"
 export PULUMI_SKIP_UPDATE_CHECK=true
 case "${PULUMI_BACKEND_URL}" in file://*) mkdir -p "${PULUMI_BACKEND_URL#file://}" ;; esac
 
-cd "${ROOT}/infra"
-[ -d node_modules ] || npm ci --no-audit --no-fund
+cd "${INFRA_DIR:-${ROOT}/infra}"
+[ -d node_modules ] || npm ci --no-audit --no-fund >&2
 
 # Свіжий клон стеку ще не має: --create робить його з passphrase-шифруванням
 # секретів (ключ — PULUMI_CONFIG_PASSPHRASE зі сховища).
@@ -33,9 +39,10 @@ cd "${ROOT}/infra"
 case "${ACTION}" in
   up)      "${PULUMI}" up --yes --non-interactive --skip-preview ;;
   preview) "${PULUMI}" preview --non-interactive ;;
+  plan)    "${PULUMI}" preview --json --non-interactive ;;
   # demo:rollout перемикає профіль і ревізію декларацією, а не kubectl: правка
   # руками забрала б поле у Pulumi (server-side apply пише власника кожного поля).
   config)  "${PULUMI}" config set "${2:?ключ}" "${3:?значення}" --non-interactive ;;
   destroy) "${PULUMI}" destroy --yes --non-interactive --skip-preview ;;
-  *) echo "infra: невідома дія '${ACTION}' (up | preview | destroy | config)" >&2; exit 2 ;;
+  *) echo "infra: невідома дія '${ACTION}' (up | preview | plan | destroy | config)" >&2; exit 2 ;;
 esac
