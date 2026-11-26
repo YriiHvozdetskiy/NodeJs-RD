@@ -57,7 +57,7 @@ export async function request(
   });
   const text = await res.text();
   const ms = performance.now() - started;
-  let json: unknown = null;
+  let json: unknown;
   try {
     json = text ? JSON.parse(text) : null;
   } catch {

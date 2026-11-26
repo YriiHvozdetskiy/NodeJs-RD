@@ -32,7 +32,7 @@ export async function openRedis(env: RedisEnv, name: string, options: RedisOptio
     await untilReady(client);
   } catch (err) {
     client.disconnect();
-    throw new Error(`${env}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`${env}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
   }
   return client;
 }

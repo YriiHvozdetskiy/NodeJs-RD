@@ -137,6 +137,7 @@ async function request(api: ManagementApi, method: 'GET' | 'PUT', pathname: stri
     throw new Error(
       `management API недоступний за ${api.base} (${cause}). ` +
         'Якщо порт 15672 перемаплено, задай BROKER_MANAGEMENT_URL=http://<host>:<port>/api',
+      { cause: err },
     );
   }
   if (!res.ok) throw new Error(`management API ${method} ${pathname} → ${res.status} ${await res.text()}`);
